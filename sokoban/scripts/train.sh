@@ -1,12 +1,12 @@
 #!/bin/bash
 # Train one arm of the Boxoban study.
 #   sokoban/scripts/train.sh <arm> <seed> [out_dir]
-#   arm: looped | iso_flops | iso_param | iso_loop
+#   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot
 # Optional environment variables:
 #   DISCOUNT_ACT=g      per-decision discount (default 0.999)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
-#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop (default 16)
+#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot (default 16)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
@@ -19,6 +19,8 @@
 #   iso_flops : 16 untied cores stacked (16x the parameters)                               ~1.8k env steps/s (~16 h)
 #   iso_param : one core applied once                                                      ~28k env steps/s (~1 h)
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
+#   cot       : implicit CoT (appends continuous thought tokens, causal, KV-cached), cap 16 passes, policy-KL halting (1e-3)
+#   iso_cot   : implicit CoT, always runs the full 16 passes (no halting)
 # Requires data/boxoban/*.npz (python data_scripts/build_boxoban_banks.py).
 # Usage:
 # MAX_THINK_ITERS=4 DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=1.0 sokoban/scripts/train.sh looped 1 exp/sokoban 2 &
@@ -38,6 +40,10 @@ case "$ARM" in
              [[ "$NUM_BLOCKS" != 16 ]] && RUN+="_b${NUM_BLOCKS}" ;;
   iso_param) ARM_FLAGS=(--architecture=single_block) ;;
   iso_loop)  ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=0.0)
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  cot)       ARM_FLAGS=(--architecture=fprm_cot --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=1e-3)
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  iso_cot)   ARM_FLAGS=(--architecture=fprm_cot --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=0.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
 esac

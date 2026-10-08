@@ -38,6 +38,7 @@ from utils.evaluation import Evaluator
 from envs.utils import make_env
 from models.fprm import FPRMConfig
 from models.fprm_thinker import FPRMThinkerActorValue
+from models.fprm_cot_thinker import FPRMCoTThinkerActorValue
 from models.transformer_baseline import TransformerActorValue
 
 
@@ -94,6 +95,7 @@ class Args:
 
     # model
     # 'fprm'         — looped FPRM with policy-KL adaptive halting
+    # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
     # 'multi_block'  — num_blocks FPRM cores without weight tying (~num_blocks x params)
     architecture: str = 'fprm'
@@ -258,6 +260,19 @@ def main(args: Args):
             halt_criterion=args.halt_criterion,
             halt_kl=args.halt_kl,
             halt_residual_thresh=args.halt_residual_thresh,
+            output_dim_1=action_size,
+            obs_channels=obs_channels,
+            action_head=action_head,
+        )
+    elif args.architecture == 'fprm_cot':
+        assert args.halt_criterion == 'kl', "fprm_cot supports only halt_criterion='kl'"
+        actor_critic_network = FPRMCoTThinkerActorValue(
+            m=env.m,
+            n=env.n,
+            config=fprm_config,
+            max_think_iters=args.max_think_iters,
+            min_think_iters=args.min_think_iters,
+            halt_kl=args.halt_kl,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,

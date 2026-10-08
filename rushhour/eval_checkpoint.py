@@ -8,6 +8,7 @@ Examples (repo root)
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/iso_flops_s1/checkpoints/<run>/params_101.pkl --arch multi_block --num_blocks 16
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl --max_iters 8   # test-time cap
+  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/cot_s1/checkpoints/<run>/params_101.pkl --arch fprm_cot
 """
 import argparse
 import json
@@ -23,14 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.rushhour_env import RushHourEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
+from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='looped: think-iteration cap at evaluation (training cap 16)')
+    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'multi_block', 'single_block'])
+    ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3)
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
@@ -47,6 +49,8 @@ def main():
     if args.arch == 'fprm':
         mod = FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                     halt_kl=args.halt_kl, **kw)
+    elif args.arch == 'fprm_cot':
+        mod = FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl, **kw)
     else:
         mod = TransformerActorValue(num_blocks=args.num_blocks if args.arch == 'multi_block' else 1,
                                     **kw)
@@ -92,8 +96,8 @@ def main():
         print(f'{args.ckpt} {split:10s} n={n_lv:5d} success {succ.mean():.3f} think {results[split]["think"]:.2f} '
               f'conv {results[split]["converged"]:.3f} len {length.mean():.1f}', flush=True)
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{os.path.splitext(os.path.basename(args.ckpt))[0]}'
-                                   + (f'_cap{args.max_iters}' if args.arch == 'fprm' and args.max_iters != 16 else '') + '.json')
-    json.dump(dict(ckpt=args.ckpt, arch=args.arch, max_iters=args.max_iters if args.arch == 'fprm' else None, results=results),
+                                   + (f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot') and args.max_iters != 16 else '') + '.json')
+    json.dump(dict(ckpt=args.ckpt, arch=args.arch, max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot') else None, results=results),
               open(out, 'w'), indent=1)
     print('wrote', out)
 
