@@ -11,7 +11,7 @@
 #   iso_param : one core applied once                                                      ~28k env steps/s (~1 h)
 # Requires data/boxoban/*.npz (python data_scripts/build_boxoban_banks.py).
 set -euo pipefail
-ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/sokoban}"
+ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/sokoban}"; DEVICE="${4:-0}";
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters=16 --halt_criterion=kl --halt_kl=1e-3) ;;
   iso_flops) ARM_FLAGS=(--architecture=multi_block --num_blocks=16) ;;
@@ -21,8 +21,10 @@ esac
 export WANDB_MODE=${WANDB_MODE:-disabled}
 cd "$(dirname "$0")/../.."
 mkdir -p "$OUT/${ARM}_s${SEED}"
-exec python -u ppo.py --env_id=sokoban-unfiltered_train-unfiltered_valid --seed="$SEED" --wandb_dir="$OUT/${ARM}_s${SEED}" \
+
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES="${DEVICE}" XLA_PYTHON_CLIENT_MEM_FRACTION=0.7 python -u ppo.py --env_id=sokoban-unfiltered_train-unfiltered_valid --seed="$SEED" --wandb_dir="$OUT/${ARM}_s${SEED}" \
   --fprm_num_layers=2 --max_grad_norm=1.0 \
-  --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4 \
+  --num_envs=128 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4 \
   --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256 \
   "${ARM_FLAGS[@]}" 2>&1 | tee -a "$OUT/${ARM}_s${SEED}/train.log"
