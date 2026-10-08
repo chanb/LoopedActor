@@ -81,6 +81,7 @@ class Args:
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
+    ramdp: bool = False                   # RAMDP return: discount by compute time c_t (think iterations), i.e. r_t * gamma^(c_t - 1) and bootstrap with gamma^c_t
     clipping_epsilon: float = 0.3
     normalize_advantage: bool = True
     # stabilization (all off by default)
@@ -145,20 +146,24 @@ def make_inference_fn(actor_critic_network):
 
         def policy(observations, goals, key_sample):
             inputs = jnp.concatenate([observations, goals], axis=-1)
-            policy_dist, value = actor_critic_network.apply(
+            (policy_dist, value), inter = actor_critic_network.apply(
                 params['policy'],
                 inputs,
                 params['normalizer'],
+                mutable=['intermediates'],
             )
+            # Compute time of this decision = number of think iterations (core calls).
+            compute_time = inter['intermediates']['fp_iterations'][0]
 
             if deterministic:
-                return policy_dist.mode(), {'value': value}
+                return policy_dist.mode(), {'value': value, 'compute_time': compute_time}
 
             actions = policy_dist.sample(seed=key_sample)
             log_prob = policy_dist.log_prob(actions)
             return actions, {
                 'log_prob': log_prob,
                 'value': value,
+                'compute_time': compute_time,
             }
 
         return policy
@@ -351,8 +356,10 @@ def main(args: Args):
         values: jnp.ndarray,
         bootstrap_value: jnp.ndarray,
         lambda_: float = 1.0,
-        discount: float = 0.99,
+        discount=0.99,
     ):
+        # `discount` is a scalar or a per-step [T, B] array (RAMDP: gamma^c_t).
+        discount = jnp.broadcast_to(discount, termination.shape)
         truncation_mask = 1 - truncation
         # Append bootstrapped value to get [v1, ..., v_t+1]
         values_t_plus_1 = jnp.concatenate(
@@ -365,14 +372,14 @@ def main(args: Args):
 
         def compute_vs_minus_v_xs(carry, target_t):
             lambda_, acc = carry
-            truncation_mask, delta, termination = target_t
+            truncation_mask, delta, termination, discount = target_t
             acc = delta + discount * (1 - termination) * truncation_mask * lambda_ * acc
             return (lambda_, acc), (acc)
 
         (_, _), (vs_minus_v_xs) = jax.lax.scan(
             compute_vs_minus_v_xs,
             (lambda_, acc),
-            (truncation_mask, deltas, termination),
+            (truncation_mask, deltas, termination, discount),
             length=int(truncation_mask.shape[0]),
             reverse=True,
         )
@@ -500,6 +507,14 @@ def main(args: Args):
         truncation = data.extras['state_extras']['truncation']
         termination = (1 - data.discount) * (1 - truncation)
 
+        discount = args.discount
+        if args.ramdp:
+            # RAMDP: a decision taking c_t think iterations spans c_t time units,
+            # so its reward is discounted by gamma^(c_t - 1) and the bootstrap by gamma^c_t.
+            compute_time = data.extras['policy_extras']['compute_time'].astype(jnp.float32)
+            rewards = rewards * args.discount ** (compute_time - 1)
+            discount = args.discount ** compute_time
+
         value_targets, advantages = compute_gae(
             truncation=truncation,
             termination=termination,
@@ -507,7 +522,7 @@ def main(args: Args):
             values=data.value,
             bootstrap_value=bootstrap_value,
             lambda_=args.gae_lambda,
-            discount=args.discount,
+            discount=discount,
         )
         if args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
