@@ -77,11 +77,14 @@ class Args:
     num_minibatches_per_rollout: int = 32
     num_epochs_per_rollout: int = 8
     learning_rate: float = 1e-4
-    discount: float = 0.99
+    # Return G = sum_t discount_act^t * discount_compute^(z_t + c_t - 1) * r_t with z_t = sum_{k<t} (c_k - 1),
+    # where c_t is the compute time (think iterations) of decision t. discount_compute = 1 is the
+    # standard per-env-step return; discount_compute = discount_act is the RAMDP return.
+    discount_act: float = 0.99
+    discount_compute: float = 1.0
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
-    ramdp: bool = False                   # RAMDP return: discount by compute time c_t (think iterations), i.e. r_t * gamma^(c_t - 1) and bootstrap with gamma^c_t
     clipping_epsilon: float = 0.3
     normalize_advantage: bool = True
     # stabilization (all off by default)
@@ -358,7 +361,7 @@ def main(args: Args):
         lambda_: float = 1.0,
         discount=0.99,
     ):
-        # `discount` is a scalar or a per-step [T, B] array (RAMDP: gamma^c_t).
+        # `discount` is a scalar or a per-step [T, B] array (discount_act * discount_compute^(c_t - 1)).
         discount = jnp.broadcast_to(discount, termination.shape)
         truncation_mask = 1 - truncation
         # Append bootstrapped value to get [v1, ..., v_t+1]
@@ -507,13 +510,14 @@ def main(args: Args):
         truncation = data.extras['state_extras']['truncation']
         termination = (1 - data.discount) * (1 - truncation)
 
-        discount = args.discount
-        if args.ramdp:
-            # RAMDP: a decision taking c_t think iterations spans c_t time units,
-            # so its reward is discounted by gamma^(c_t - 1) and the bootstrap by gamma^c_t.
-            compute_time = data.extras['policy_extras']['compute_time'].astype(jnp.float32)
-            rewards = rewards * args.discount ** (compute_time - 1)
-            discount = args.discount ** compute_time
+        # A decision taking c_t think iterations spends c_t - 1 extra compute steps before
+        # its reward: r_t is discounted by discount_compute^(c_t - 1), and the bootstrap by
+        # discount_act * discount_compute^(c_t - 1), so the cumulative discount at step t is
+        # discount_act^t * discount_compute^z_t.
+        compute_time = data.extras['policy_extras']['compute_time'].astype(jnp.float32)
+        compute_discount = args.discount_compute ** (compute_time - 1)
+        rewards = rewards * compute_discount
+        discount = args.discount_act * compute_discount
 
         value_targets, advantages = compute_gae(
             truncation=truncation,
