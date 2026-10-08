@@ -8,6 +8,8 @@
 #                       = DISCOUNT_ACT gives the RAMDP return)
 #   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop (default 16)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
+# The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
+# so seeds of the same setting are grouped together.
 # Non-default values are appended to the run directory name (e.g. looped_it8_gc0.999_s0).
 # All arms: PPO on the 900k unfiltered training levels, held-out evaluation on unfiltered_valid during
 # training (eval/test_* metrics), 1024 envs x 64 steps per rollout, 64 minibatches x 4 epochs, 100M env
@@ -43,13 +45,17 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 [[ "$DISCOUNT_ACT" != 0.999 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
 RUN+="_s${SEED}"
+# Every hyperparameter flag except the seed; hashed into the wandb group.
+HPARAM_FLAGS=(--env_id=sokoban-unfiltered_train-unfiltered_valid
+  --fprm_num_layers=2 --max_grad_norm=1.0
+  --num_envs=512 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4
+  --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
+  "${ARM_FLAGS[@]}")
+GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}")"
 export WANDB_MODE=${WANDB_MODE:-disabled}
 cd "$(dirname "$0")/../.."
 mkdir -p "$OUT/${RUN}"
 
 source .venv/bin/activate
-CUDA_VISIBLE_DEVICES="${DEVICE}" XLA_PYTHON_CLIENT_MEM_FRACTION=0.8 python -u ppo.py --env_id=sokoban-unfiltered_train-unfiltered_valid --seed="$SEED" --wandb_dir="$OUT/${RUN}" --track \
-  --fprm_num_layers=2 --max_grad_norm=1.0 \
-  --num_envs=512 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4 \
-  --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256 \
-  "${ARM_FLAGS[@]}" 2>&1 | tee -a "$OUT/${RUN}/train.log"
+CUDA_VISIBLE_DEVICES="${DEVICE}" XLA_PYTHON_CLIENT_MEM_FRACTION=0.8 python -u ppo.py --seed="$SEED" --wandb_dir="$OUT/${RUN}" --track --wandb_group="$GROUP" \
+  "${HPARAM_FLAGS[@]}" 2>&1 | tee -a "$OUT/${RUN}/train.log"
