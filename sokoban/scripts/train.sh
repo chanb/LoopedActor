@@ -48,7 +48,7 @@ RUN+="_s${SEED}"
 # Every hyperparameter flag except the seed; hashed into the wandb group.
 HPARAM_FLAGS=(--env_id=sokoban-unfiltered_train-unfiltered_valid
   --fprm_num_layers=2 --max_grad_norm=1.0
-  --num_envs=512 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4
+  --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4
   --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
   "${ARM_FLAGS[@]}")
 GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}")"

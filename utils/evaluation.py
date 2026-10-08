@@ -2,24 +2,49 @@ import time
 from typing import Callable
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from utils.wrapper import EvalWrapper
 
 
-def generate_unroll(env, env_state, policy, key, unroll_length):
-    """Step the env for unroll_length steps and return the final state."""
-    def body(i, carry):
-        env_state, key = carry
-        key, next_key = jax.random.split(key)
-        actions, _ = policy(env_state.obs, env_state.info["target_goal"], key)
-        next_env_state = env.step(env_state, actions)
-        return (next_env_state, next_key)
+def generate_unroll(env, env_state, policy, key, unroll_length,
+                    discount_act=1.0, discount_compute=1.0):
+    """Step the env for unroll_length steps.
 
-    final_state, _ = jax.lax.fori_loop(
-        0, unroll_length, body, (env_state, key)
+    Returns the final state and the per-env discounted returns of the first
+    episode, as a dict:
+      'discounted_return'         sum_t discount_act^t r_t (discounting per env step)
+      'compute_discounted_return' sum_t discount_act^t discount_compute^(z_t + c_t - 1) r_t,
+                                  z_t = sum_{k<t} (c_k - 1), with c_t the policy's compute time
+                                  (the return PPO optimizes; equal to the above when discount_compute = 1)
+    """
+    def body(i, carry):
+        env_state, key, returns, discounts = carry
+        key, next_key = jax.random.split(key)
+        actions, policy_extras = policy(env_state.obs, env_state.info["target_goal"], key)
+        next_env_state = env.step(env_state, actions)
+
+        # Only the first episode counts (EvalWrapper's active flag before this step).
+        active = env_state.info['eval_metrics'].active_episodes
+        compute_time = policy_extras['compute_time'].astype(jnp.float32)
+        compute_discount = discount_compute ** (compute_time - 1)
+        step_discounts = {
+            'discounted_return': (1.0, discount_act),
+            'compute_discounted_return': (compute_discount, discount_act * compute_discount),
+        }
+        for name, (reward_discount, next_discount) in step_discounts.items():
+            returns[name] = returns[name] + active * discounts[name] * reward_discount * next_env_state.reward
+            discounts[name] = discounts[name] * next_discount
+        return (next_env_state, next_key, returns, discounts)
+
+    zeros = jnp.zeros_like(env_state.reward)
+    names = ('discounted_return', 'compute_discounted_return')
+    final_state, _, returns, _ = jax.lax.fori_loop(
+        0, unroll_length, body,
+        (env_state, key, {k: zeros for k in names}, {k: zeros + 1.0 for k in names}),
     )
-    return final_state
+    return final_state, returns
 
 
 class Evaluator:
@@ -30,6 +55,8 @@ class Evaluator:
         num_eval_envs: int,
         episode_length: int,
         key: jax.Array,
+        discount_act: float = 1.0,
+        discount_compute: float = 1.0,
     ):
         self._key = key
         self._eval_walltime = 0.0
@@ -48,6 +75,8 @@ class Evaluator:
                     eval_policy_fn(policy_params),
                     key,
                     unroll_length=episode_length,
+                    discount_act=discount_act,
+                    discount_compute=discount_compute,
                 )
             return jax.jit(generate_unroll_logic)
 
@@ -69,9 +98,9 @@ class Evaluator:
         t = time.time()
 
         # 1. Trajectories for the train split (in-distribution)
-        train_state = self._generate_train_unroll(policy_params, train_key)
+        train_state, train_returns = self._generate_train_unroll(policy_params, train_key)
         # 2. Trajectories for the test split (out-of-distribution)
-        test_state = self._generate_test_unroll(policy_params, test_key)
+        test_state, test_returns = self._generate_test_unroll(policy_params, test_key)
 
         # Block to ensure execution finishes for timing
         test_state.info['eval_metrics'].active_episodes.block_until_ready()
@@ -79,7 +108,7 @@ class Evaluator:
 
         metrics = {}
 
-        for split_name, state in [("train", train_state), ("test", test_state)]:
+        for split_name, state, returns in [("train", train_state, train_returns), ("test", test_state, test_returns)]:
             eval_metrics = state.info['eval_metrics']
 
             for name, value in eval_metrics.episode_metrics.items():
@@ -89,6 +118,9 @@ class Evaluator:
                     metrics[f'eval/{split_name}_episode_{name}_rate'] = np.mean(value > 0)
 
             metrics[f'eval/{split_name}_avg_episode_length'] = np.mean(eval_metrics.episode_steps)
+
+            for name, value in returns.items():
+                metrics[f'eval/{split_name}_episode_{name}'] = np.mean(value)
 
         metrics['eval/epoch_eval_time'] = epoch_eval_time
         metrics['eval/sps'] = (self._steps_per_unroll * 2) / epoch_eval_time

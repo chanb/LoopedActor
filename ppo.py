@@ -293,6 +293,8 @@ def main(args: Args):
         num_eval_envs=args.num_eval_envs,
         episode_length=episode_length,
         key=key_eval,
+        discount_act=args.discount_act,
+        discount_compute=args.discount_compute,
     )
 
     def generate_unroll(env, env_state, policy, key, unroll_length, extra_fields):

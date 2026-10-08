@@ -114,13 +114,14 @@ class FPRMAttention(nn.Module):
 
     Matches the public Attention module (no RoPE, no QK norm) with
     logit scale 1 / (sqrt(head_dim) * softmax_temp), plus an explicit
-    token mask (invalid keys -> -inf; invalid query outputs zeroed).
+    token mask (invalid keys -> -inf; invalid query outputs zeroed) and an
+    optional [B, L, L] query-key `attn_mask` (e.g. causal), combined with it.
     """
 
     config: FPRMConfig
 
     @nn.compact
-    def __call__(self, x, token_mask):
+    def __call__(self, x, token_mask, attn_mask=None):
         cfg = self.config
         B, L, H = x.shape
         num_heads = cfg.num_heads
@@ -141,6 +142,8 @@ class FPRMAttention(nn.Module):
         scale = 1.0 / (math.sqrt(head_dim) * cfg.softmax_temp)
         logits = jnp.einsum('bqhd,bkhd->bhqk', query, key) * scale
         logits = jnp.where(token_mask[:, None, None, :], logits, -jnp.inf)
+        if attn_mask is not None:
+            logits = jnp.where(attn_mask[:, None], logits, -jnp.inf)
         probs = jax.nn.softmax(logits, axis=-1)
         out = jnp.einsum('bhqk,bkhd->bqhd', probs, value)
         out = out.reshape(B, L, H)
@@ -194,10 +197,10 @@ class FPRMBlock(nn.Module):
     config: FPRMConfig
 
     @nn.compact
-    def __call__(self, h, token_mask, alpha_1, beta_1):
+    def __call__(self, h, token_mask, alpha_1, beta_1, attn_mask=None):
         cfg = self.config
         out = FPRMAttention(cfg, name='self_attn')(
-            rms_norm(h, cfg.rms_norm_eps), token_mask
+            rms_norm(h, cfg.rms_norm_eps), token_mask, attn_mask
         )
         h = alpha_1 * h + beta_1 * out
         out = FPRMSwiGLU(cfg, name='mlp')(rms_norm(h, cfg.rms_norm_eps))
@@ -205,10 +208,10 @@ class FPRMBlock(nn.Module):
         return h
 
 
-def grid_conv_tokens(conv: nn.Module, z, grid_shape, prefix_len):
+def grid_conv_tokens(conv: nn.Module, z, grid_shape, prefix_len, suffix_len=0):
     """Apply a 2-D convolution to the grid tokens of a token sequence.
 
-    Splits the prefix tokens, reshapes the cell tokens to the explicit
+    Splits the prefix (and `suffix_len` trailing) tokens, reshapes the cell tokens to the explicit
     rectangular [B, R, C, H] grid, applies the convolution, and reassembles.
     Never infers the grid from sqrt(sequence_length): the public code does and
     therefore fails for rectangular boards. A 1-D convolution over flattened
@@ -216,17 +219,20 @@ def grid_conv_tokens(conv: nn.Module, z, grid_shape, prefix_len):
     """
     B, L, H = z.shape
     R, C = grid_shape
-    assert L == prefix_len + R * C, (L, prefix_len, R, C)
+    assert L == prefix_len + R * C + suffix_len, (L, prefix_len, R, C, suffix_len)
     prefix = z[:, :prefix_len]
-    grid = z[:, prefix_len:].reshape(B, R, C, H)
+    grid = z[:, prefix_len:prefix_len + R * C].reshape(B, R, C, H)
+    suffix = z[:, prefix_len + R * C:]
     grid = conv(grid)
-    return jnp.concatenate([prefix, grid.reshape(B, R * C, H)], axis=1)
+    return jnp.concatenate([prefix, grid.reshape(B, R * C, H), suffix], axis=1)
 
 
 class FPRMCore(nn.Module):
     """One recurrent FPRM core call: grid conv + input mixing + L blocks.
 
-    Maps (hidden_states [B, L, H], input_tokens [B, L, H]) -> [B, L, H].
+    Maps (hidden_states [B, L, H], input_tokens [B, L, H]) -> [B, L, H], where the
+    sequence is [prefix_len tokens, R*C cell tokens, suffix_len tokens] and the
+    optional [B, L, L] `attn_mask` restricts attention (e.g. causal).
     The whole module is reused at every recurrent iteration (weight tying
     across iterations); the `num_layers` blocks within one call have
     distinct parameters.
@@ -235,11 +241,12 @@ class FPRMCore(nn.Module):
     config: FPRMConfig
 
     @nn.compact
-    def __call__(self, z, input_tokens, token_mask, grid_shape, prefix_len=1):
+    def __call__(self, z, input_tokens, token_mask, grid_shape, prefix_len=1,
+                 suffix_len=0, attn_mask=None):
         cfg = self.config
         B, L, H = z.shape
         R, C = grid_shape
-        assert L == prefix_len + R * C, (L, prefix_len, R, C)
+        assert L == prefix_len + R * C + suffix_len, (L, prefix_len, R, C, suffix_len)
 
         # Rectangular depthwise grid convolution on the cell tokens.
         if cfg.use_grid_conv:
@@ -252,7 +259,7 @@ class FPRMCore(nn.Module):
                 kernel_init=pytorch_depthwise_conv_init,
                 name='grid_depthwise_conv',
             )
-            z = grid_conv_tokens(conv, z, grid_shape, prefix_len)
+            z = grid_conv_tokens(conv, z, grid_shape, prefix_len, suffix_len)
 
         if cfg.residual_scaling:
             # Input-independent residual scaling (public 'input-independent').
@@ -278,7 +285,7 @@ class FPRMCore(nn.Module):
         h = a2 * z + b2 * input_tokens
 
         for i in range(cfg.num_layers):
-            h = FPRMBlock(cfg, name=f'block_{i}')(h, token_mask, a1, b1)
+            h = FPRMBlock(cfg, name=f'block_{i}')(h, token_mask, a1, b1, attn_mask)
 
         return h
 
