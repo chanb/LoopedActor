@@ -17,7 +17,8 @@ class State:
 
 
 def make_env(args):
-    """Build the environment class and config from an env id (sokoban-<train>-<eval> | rushhour-<train>-<eval>)."""
+    """Build the environment class and config from an env id
+    (sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>)."""
     sok = re.fullmatch(r"sokoban-([a-z_]+)-([a-z_]+)", args.env_id)  # sokoban-<train_split>-<eval_split>
     if sok is not None:
         from envs.sokoban_env import SokobanEnv, default_config as sokoban_config
@@ -35,4 +36,25 @@ def make_env(args):
         config.episode_length = getattr(args, 'rushhour_episode_length', 150)
         config.shaping_weight = getattr(args, 'rushhour_shaping_weight', 1.0)
         return RushHourEnv, config
-    raise ValueError(f"Environment {args.env_id} not supported (expected sokoban-<train>-<eval> or rushhour-<train>-<eval>)")
+    lo = re.fullmatch(r"lightsout-(\d+)x(\d+)", args.env_id)  # lightsout-<m>x<n>, procedurally generated
+    if lo is not None:
+        from envs.lightsout_env import LightsOutEnv, default_config as lightsout_config
+        config = lightsout_config()
+        config.m, config.n = int(lo.group(1)), int(lo.group(2))
+        config.episode_length = getattr(args, 'lightsout_episode_length', 6)
+        config.difficulty_threshold = getattr(args, 'lightsout_difficulty_threshold', 0.5)
+        return LightsOutEnv, config
+    sp = re.fullmatch(r"slidingpuzzle-(\d+)x(\d+)", args.env_id)  # slidingpuzzle-<N>x<N>, procedurally generated
+    if sp is not None:
+        if sp.group(1) != sp.group(2):
+            raise ValueError(f"slidingpuzzle needs a square board, got {args.env_id}")
+        from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config as slidingpuzzle_config
+        config = slidingpuzzle_config()
+        config.grid_size = int(sp.group(1))
+        config.episode_length = getattr(args, 'slidingpuzzle_episode_length', 40)
+        config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
+        eval_moves = getattr(args, 'slidingpuzzle_eval_num_random_moves', 0)
+        config.eval_num_random_moves = eval_moves if eval_moves > 0 else config.num_random_moves
+        return SlidingPuzzleEnv, config
+    raise ValueError(f"Environment {args.env_id} not supported (expected sokoban-<train>-<eval>, "
+                     f"rushhour-<train>-<eval>, lightsout-<m>x<n> or slidingpuzzle-<N>x<N>)")

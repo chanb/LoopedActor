@@ -41,6 +41,7 @@ from models.fprm import (
     rms_norm,
     run_halted_scan,
 )
+from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
 
 PREFIX_LEN = 1  # [READOUT]
 
@@ -128,15 +129,24 @@ class FPRMThinkerActorValue(nn.Module):
     obs_channels: int = 0
     # 'per_cell': one logit per cell token (one action per cell); 'readout': Dense(output_dim_1) on the readout token (Sokoban moves).
     action_head: str = 'per_cell'
+    # Observation tokenization: 'cell' | 'flat' | 'conv' (see models/tokenizers.py).
+    tokenizer: str = 'cell'
+    tokenizer_conv_features: int = 64  # tokenizer='conv': conv output channels (= number of tokens)
 
     def setup(self):
+        check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         self.cell_projection = nn.Dense(self.config.d_model)
+        if self.tokenizer != 'cell':
+            self.obs_tokenizer = ObsTokenizer(
+                self.tokenizer, self.m, self.n, self.obs_channels, self.config.d_model,
+                self.tokenizer_conv_features,
+            )
         self.readout = self.param(
             'readout',
             nn.initializers.normal(stddev=0.02),
             (1, 1, self.config.d_model),
         )
-        self.core = FPRMCore(self.config)
+        self.core = FPRMCore(core_config(self.config, self.tokenizer))
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         # per_cell: shared per-cell logit head (no parameter depends on m * n); readout: logits from the readout token.
         if self.action_head == 'per_cell':
@@ -156,8 +166,15 @@ class FPRMThinkerActorValue(nn.Module):
         x_flat = x.reshape(-1, input_shape[-1])
         B = x_flat.shape[0]
 
-        cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
-        cell_tokens = self.cell_projection(cell_features)
+        if self.tokenizer == 'cell':
+            cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
+            cell_tokens = self.cell_projection(cell_features)
+        else:
+            cell_tokens = self.obs_tokenizer(x_flat)
+        grid_shape = token_grid_shape(
+            self.tokenizer, self.m, self.n, x_flat.shape[-1], self.tokenizer_conv_features
+        )
+        cfg = core_config(self.config, self.tokenizer)
         readout_token = jnp.broadcast_to(
             self.readout, (B, 1, self.config.d_model)
         )
@@ -182,7 +199,7 @@ class FPRMThinkerActorValue(nn.Module):
             value = value.reshape(input_shape[:-1] + (-1,))
             return logits, jnp.squeeze(value, axis=-1)
 
-        state = init_solver_state(self.latent_init, tokens, self.config)
+        state = init_solver_state(self.latent_init, tokens, cfg)
 
         # Force actor-head param creation before the lifted scan (the KL halt
         # fn closes over the raw kernel/bias arrays: it runs inside the scan,
@@ -224,8 +241,8 @@ class FPRMThinkerActorValue(nn.Module):
             state,
             tokens,
             token_mask,
-            grid_shape=(self.m, self.n),
-            config=self.config,
+            grid_shape=grid_shape,
+            config=cfg,
             max_iters=self.max_think_iters,
             min_iters=self.min_think_iters,
             fp_thresh=fp_thresh,

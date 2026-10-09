@@ -27,17 +27,23 @@ from envs.utils import State  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
+from models.fprm_perceiver import FPRMPerceiverActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
 def build_module(args):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers)
-    kw = dict(m=10, n=10, config=cfg, output_dim_1=4, obs_channels=4, action_head='readout')
+    kw = dict(m=10, n=10, config=cfg, output_dim_1=4, obs_channels=4, action_head='readout',
+              tokenizer=args.tokenizer, tokenizer_conv_features=args.tokenizer_conv_features)
     if args.arch == 'fprm':
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                      halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_cot':
-        return FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl, **kw)
+        return FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+                                        thought_norm=args.thought_norm, **kw)
+    if args.arch == 'fprm_perceiver':
+        return FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+                                       thought_norm=args.thought_norm, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
@@ -83,11 +89,14 @@ def evaluate(mod, policy_vars, norm, split, max_levels, T=120, B=512, trajectori
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot: think-iteration cap at evaluation (training cap 16)')
+    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'multi_block', 'single_block'])
+    ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3)
+    ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
+    ap.add_argument('--tokenizer', default='cell', choices=['cell', 'flat', 'conv'], help='the checkpoint\'s --tokenizer')
+    ap.add_argument('--tokenizer_conv_features', type=int, default=64, help='the checkpoint\'s --tokenizer_conv_features')
     ap.add_argument('--num_layers', type=int, default=2)
     ap.add_argument('--splits', nargs='+', default=['unfiltered_valid', 'unfiltered_test'])
     ap.add_argument('--max_levels', type=int, default=2000, help='levels per split (0 = whole bank)')
@@ -98,7 +107,7 @@ def main():
     with open(args.ckpt, 'rb') as f:
         policy_vars, norm = pickle.load(f)
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
-    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot') and args.max_iters != 16 else ''
+    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver') and args.max_iters != 16 else ''
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
     results = {}
     for split in args.splits:

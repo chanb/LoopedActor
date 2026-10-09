@@ -26,6 +26,7 @@ import jax.numpy as jnp
 
 from models.fprm import FPRMConfig, FPRMCore, make_latent_init, rms_norm
 from models.fprm_thinker import PREFIX_LEN, tokenize
+from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
 
 
 class TransformerActorValue(nn.Module):
@@ -39,9 +40,17 @@ class TransformerActorValue(nn.Module):
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
     action_head: str = 'per_cell'  # see FPRMThinkerActorValue
+    tokenizer: str = 'cell'        # see FPRMThinkerActorValue
+    tokenizer_conv_features: int = 64
 
     def setup(self):
+        check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         self.cell_projection = nn.Dense(self.config.d_model)
+        if self.tokenizer != 'cell':
+            self.obs_tokenizer = ObsTokenizer(
+                self.tokenizer, self.m, self.n, self.obs_channels, self.config.d_model,
+                self.tokenizer_conv_features,
+            )
         self.readout = self.param(
             'readout',
             nn.initializers.normal(stddev=0.02),
@@ -49,7 +58,7 @@ class TransformerActorValue(nn.Module):
         )
         # Distinct parameters per core call (no weight tying across blocks).
         self.cores = [
-            FPRMCore(self.config, name=f'core_{i}')
+            FPRMCore(core_config(self.config, self.tokenizer), name=f'core_{i}')
             for i in range(self.num_blocks)
         ]
         assert self.action_head in ('per_cell', 'readout'), self.action_head
@@ -70,8 +79,14 @@ class TransformerActorValue(nn.Module):
         x_flat = x.reshape(-1, input_shape[-1])
         B = x_flat.shape[0]
 
-        cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
-        cell_tokens = self.cell_projection(cell_features)
+        if self.tokenizer == 'cell':
+            cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
+            cell_tokens = self.cell_projection(cell_features)
+        else:
+            cell_tokens = self.obs_tokenizer(x_flat)
+        grid_shape = token_grid_shape(
+            self.tokenizer, self.m, self.n, x_flat.shape[-1], self.tokenizer_conv_features
+        )
         readout_token = jnp.broadcast_to(
             self.readout, (B, 1, self.config.d_model)
         )
@@ -99,7 +114,7 @@ class TransformerActorValue(nn.Module):
             self.latent_init[None, None, :].astype(tokens.dtype), tokens.shape
         )
         for core in self.cores:
-            z = core(z, tokens, token_mask, (self.m, self.n), PREFIX_LEN)
+            z = core(z, tokens, token_mask, grid_shape, PREFIX_LEN)
         logits, value = readout(z)
         self.sow('intermediates', 'logits', logits)
         self.sow('intermediates', 'value', value)

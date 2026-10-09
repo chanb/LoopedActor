@@ -7,7 +7,7 @@ continuous chain-of-thought):
 
     sequence:  [CELL_00, ..., CELL_(m-1,n-1), BOT, THOUGHT_1, ..., THOUGHT_{i-1}]
     pass i:    z_i = core(z0, sequence)          (causal over BOT / thoughts)
-               THOUGHT_i = z_i[last position]
+               THOUGHT_i = z_i[last position]          (rms_norm'ed if `thought_norm`)
 
 Attention is prefix-causal: the cell tokens attend to each other
 bidirectionally, while BOT and every thought attend to the cells and to the
@@ -61,6 +61,7 @@ from models.fprm import (
     rms_norm,
 )
 from models.fprm_thinker import tokenize
+from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, num_tokens, token_grid_shape
 
 
 # ---------------------------------------------------------------------------
@@ -194,18 +195,28 @@ class FPRMCoTThinkerActorValue(nn.Module):
     obs_channels: int = 0          # see FPRMThinkerActorValue
     action_head: str = 'per_cell'  # see FPRMThinkerActorValue
     remat: bool = True             # rematerialize each pass in the backward pass
+    # RMS-normalize each thought before appending it (no parameters), matching the scale of the
+    # normalized readout instead of feeding back the raw core output.
+    thought_norm: bool = False
+    tokenizer: str = 'cell'        # see FPRMThinkerActorValue
+    tokenizer_conv_features: int = 64
 
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
+        check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
+        if self.tokenizer != 'cell':
+            self.obs_tokenizer = ObsTokenizer(
+                self.tokenizer, self.m, self.n, self.obs_channels, H, self.tokenizer_conv_features,
+            )
         # Beginning-of-thought token: the last position of the first pass.
         self.bot = self.param(
             'bot', nn.initializers.normal(stddev=0.02), (1, 1, H)
         )
         # Parameters only; evaluated functionally with KV caching.
-        self.core = FPRMCore(self.config)
+        self.core = FPRMCore(core_config(self.config, self.tokenizer))
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
             # One query per logit slot (k = output_dim_1 // (m*n)), matched against every cell latent.
@@ -224,17 +235,26 @@ class FPRMCoTThinkerActorValue(nn.Module):
         if normalizer_params is not None:
             x = (x - normalizer_params.mean) / (normalizer_params.std)
 
-        cfg = self.config
+        cfg = core_config(self.config, self.tokenizer)
         input_shape = x.shape
         x_flat = x.reshape(-1, input_shape[-1])
         B = x_flat.shape[0]
         H = cfg.d_model
         S = self.max_think_iters - 1  # thought slots (the last pass's output is never read back)
-        num_cells = self.m * self.n
+        # Input tokens (cells for tokenizer='cell'), bidirectional before BOT.
+        num_cells = num_tokens(
+            self.tokenizer, self.m, self.n, x_flat.shape[-1], self.tokenizer_conv_features
+        )
+        grid_shape = token_grid_shape(
+            self.tokenizer, self.m, self.n, x_flat.shape[-1], self.tokenizer_conv_features
+        )
         per_cell = self.action_head == 'per_cell'
 
-        cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
-        cell_tokens = self.cell_projection(cell_features)
+        if self.tokenizer == 'cell':
+            cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
+            cell_tokens = self.cell_projection(cell_features)
+        else:
+            cell_tokens = self.obs_tokenizer(x_flat)
         tokens = jnp.concatenate(
             [cell_tokens, jnp.broadcast_to(self.bot, (B, 1, H))], axis=1
         )  # [B, num_cells + 1, H]
@@ -244,7 +264,7 @@ class FPRMCoTThinkerActorValue(nn.Module):
 
         if self.is_initializing():
             # Create the core / head parameters (the forward pass below is functional).
-            self.core(z0, tokens, jnp.ones(tokens.shape[:2], bool), (self.m, self.n),
+            self.core(z0, tokens, jnp.ones(tokens.shape[:2], bool), grid_shape,
                       prefix_len=0, suffix_len=1)
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
@@ -253,7 +273,7 @@ class FPRMCoTThinkerActorValue(nn.Module):
 
         # Pass 1: [cells, BOT]; keeps every layer's keys/values.
         z, prefix_cache = _core_prefill(
-            core_p, z0, tokens, (self.m, self.n), num_cells, cfg
+            core_p, z0, tokens, grid_shape, num_cells, cfg
         )
         # Cell latents never see the thoughts: decoded once for the per-cell head.
         cell_latents = rms_norm(z[:, :num_cells], eps=cfg.rms_norm_eps)
@@ -340,8 +360,9 @@ class FPRMCoTThinkerActorValue(nn.Module):
 
             def body(carry, slot):
                 st, (buf_k, buf_v) = carry
+                thought = rms_norm(st.token, eps=cfg.rms_norm_eps) if self.thought_norm else st.token
                 z_last, buf_k, buf_v = _core_decode(
-                    core_p, z0_token, st.token, prefix_cache, buf_k, buf_v, slot, cfg
+                    core_p, z0_token, thought, prefix_cache, buf_k, buf_v, slot, cfg
                 )
                 return (update(st, z_last), (buf_k, buf_v)), None
 

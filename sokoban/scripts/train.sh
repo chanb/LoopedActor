@@ -1,13 +1,18 @@
 #!/bin/bash
 # Train one arm of the Boxoban study.
 #   sokoban/scripts/train.sh <arm> <seed> [out_dir]
-#   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot
+#   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver
 # Optional environment variables:
 #   DISCOUNT_ACT=g      per-decision discount (default 0.999)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
-#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot (default 16)
+#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot / perceiver / iso_perceiver (default 16)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
+#   THOUGHT_NORM=1      cot / iso_cot / perceiver / iso_perceiver: RMS-normalize each thought / latent before feeding it back (default 0)
+#   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
+#                         cell = one token per grid cell, flat = one token per observation value,
+#                         conv = 3x3 conv, one token per output channel
+#   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
 # Non-default values are appended to the run directory name (e.g. looped_it8_gc0.999_s0).
@@ -21,6 +26,9 @@
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
 #   cot       : implicit CoT (appends continuous thought tokens, causal, KV-cached), cap 16 passes, policy-KL halting (1e-3)
 #   iso_cot   : implicit CoT, always runs the full 16 passes (no halting)
+#   perceiver : Perceiver AR-style latent CoT (latents from <BOT> attend to the cell tokens + earlier latents at every
+#               layer; cells never processed), cap 16 passes, policy-KL halting (1e-3)
+#   iso_perceiver : Perceiver AR-style latent CoT, always runs the full 16 passes (no halting)
 # Requires data/boxoban/*.npz (python data_scripts/build_boxoban_banks.py).
 # Usage:
 # MAX_THINK_ITERS=4 DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=1.0 sokoban/scripts/train.sh looped 1 exp/sokoban 2 &
@@ -31,7 +39,8 @@
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/sokoban}"; DEVICE="${4:-0}";
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.999}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
-MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"
+MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
+TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=1e-3)
@@ -45,7 +54,25 @@ case "$ARM" in
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_cot)   ARM_FLAGS=(--architecture=fprm_cot --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=0.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  perceiver) ARM_FLAGS=(--architecture=fprm_perceiver --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=1e-3)
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  iso_perceiver) ARM_FLAGS=(--architecture=fprm_perceiver --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=0.0)
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
+esac
+case "$THOUGHT_NORM" in
+  0) ;;
+  1) [[ "$ARM" == cot || "$ARM" == iso_cot || "$ARM" == perceiver || "$ARM" == iso_perceiver ]] \
+       || { echo "THOUGHT_NORM=1 needs arm cot, iso_cot, perceiver or iso_perceiver"; exit 1; }
+     ARM_FLAGS+=(--cot_thought_norm); RUN+="_tn" ;;
+  *) echo "THOUGHT_NORM must be 0 or 1, got $THOUGHT_NORM"; exit 1 ;;
+esac
+case "$TOKENIZER" in
+  cell) ;;
+  flat) ARM_FLAGS+=(--tokenizer=flat); RUN+="_tkflat" ;;
+  conv) ARM_FLAGS+=(--tokenizer=conv --tokenizer_conv_features="$TOKENIZER_CONV_FEATURES")
+        RUN+="_tkconv${TOKENIZER_CONV_FEATURES}" ;;
+  *) echo "TOKENIZER must be cell, flat or conv, got $TOKENIZER"; exit 1 ;;
 esac
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.999 ]] && RUN+="_ga${DISCOUNT_ACT}"

@@ -39,6 +39,7 @@ from envs.utils import make_env
 from models.fprm import FPRMConfig
 from models.fprm_thinker import FPRMThinkerActorValue
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue
+from models.fprm_perceiver import FPRMPerceiverActorValue
 from models.transformer_baseline import TransformerActorValue
 
 
@@ -63,7 +64,7 @@ class Args:
     save_checkpoint: bool = True
 
     # environment
-    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval>
+    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>
     num_envs: int = 2048
     num_eval_envs: int = 128
     sokoban_max_train_levels: int = 0     # sokoban-*: cap on training levels (0 = whole split)
@@ -71,6 +72,11 @@ class Args:
     rushhour_max_train_levels: int = 0    # rushhour-*: cap on training levels (0 = whole split)
     rushhour_episode_length: int = 150    # rushhour-*: steps per episode
     rushhour_shaping_weight: float = 1.0  # rushhour-*: potential-based shaping weight (0 = sparse solve reward only)
+    lightsout_episode_length: int = 6     # lightsout-*: steps per episode
+    lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
+    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode
+    slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
+    slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
     # algorithm
     num_timesteps: int = 50000000
@@ -96,10 +102,15 @@ class Args:
     # model
     # 'fprm'         — looped FPRM with policy-KL adaptive halting
     # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
+    # 'fprm_perceiver' — Perceiver AR-style latent CoT: latents (from <BOT>) attend to the cell tokens + earlier latents at every layer
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
     # 'multi_block'  — num_blocks FPRM cores without weight tying (~num_blocks x params)
     architecture: str = 'fprm'
     num_blocks: int = 8                   # blocks of the multi_block baseline
+    # observation tokenization (all architectures): 'cell' = one token per grid cell from its channels +
+    # geometry; 'flat' = one token per observation dimension; 'conv' = 3x3 conv, one token per output channel
+    tokenizer: str = 'cell'
+    tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
 
     # FPRM thinker
@@ -111,6 +122,7 @@ class Args:
     halt_criterion: str = 'kl'            # 'kl' (policy-KL halting) | 'latent_residual' (original FPRM-paper rule: latent max-token residual)
     halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts < this
     halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh)
+    cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver: RMS-normalize each thought / latent before feeding it back
 
 
 @flax.struct.dataclass
@@ -263,6 +275,8 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
+            tokenizer=args.tokenizer,
+            tokenizer_conv_features=args.tokenizer_conv_features,
         )
     elif args.architecture == 'fprm_cot':
         assert args.halt_criterion == 'kl', "fprm_cot supports only halt_criterion='kl'"
@@ -276,6 +290,25 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
+            tokenizer=args.tokenizer,
+            tokenizer_conv_features=args.tokenizer_conv_features,
+            thought_norm=args.cot_thought_norm,
+        )
+    elif args.architecture == 'fprm_perceiver':
+        assert args.halt_criterion == 'kl', "fprm_perceiver supports only halt_criterion='kl'"
+        actor_critic_network = FPRMPerceiverActorValue(
+            m=env.m,
+            n=env.n,
+            config=fprm_config,
+            max_think_iters=args.max_think_iters,
+            min_think_iters=args.min_think_iters,
+            halt_kl=args.halt_kl,
+            output_dim_1=action_size,
+            obs_channels=obs_channels,
+            action_head=action_head,
+            tokenizer=args.tokenizer,
+            tokenizer_conv_features=args.tokenizer_conv_features,
+            thought_norm=args.cot_thought_norm,
         )
     elif args.architecture in ('single_block', 'multi_block'):
         actor_critic_network = TransformerActorValue(
@@ -286,6 +319,8 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
+            tokenizer=args.tokenizer,
+            tokenizer_conv_features=args.tokenizer_conv_features,
         )
     else:
         raise ValueError(f"Unknown architecture: {args.architecture}")

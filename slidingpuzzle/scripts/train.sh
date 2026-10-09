@@ -1,21 +1,31 @@
 #!/bin/bash
-# Train one arm of the Rush Hour study.
-#   rushhour/scripts/train.sh <arm> <seed> [out_dir] [device]
+# Train one arm of the sliding puzzle study.
+#   slidingpuzzle/scripts/train.sh <arm> <seed> [out_dir] [device]
 #   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver
 # Optional environment variables:
-#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot / perceiver / iso_perceiver (default 16)
-#   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
-#   THOUGHT_NORM=1      cot / iso_cot / perceiver / iso_perceiver: RMS-normalize each thought / latent before feeding it back (default 0)
+#   GRID=N              board size N x N (default 3 = 8-puzzle)
+#   EPISODE_LENGTH=N    steps per episode (default 40)
+#   NUM_RANDOM_MOVES=K  training scramble length (random walk of the blank; default 100)
+#   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
+#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot / perceiver / iso_perceiver (default 16)
+#   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
+#   THOUGHT_NORM=1      cot / iso_cot / perceiver / iso_perceiver: RMS-normalize each thought / latent before feeding it back (default 0)
+#   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
+#                         cell = one token per board cell, flat = one token per observation value,
+#                         conv = 3x3 conv, one token per output channel
+#   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
-# Non-default values are appended to the run directory name (e.g. looped_it8_gc0.99_s0).
-# All arms: PPO on the easy_train bank (Fogleman puzzles with <= 15 moves), in-training evaluation on easy_valid
-# (eval/test_* metrics), 1024 envs x 64 steps per rollout, 64 minibatches x 4 epochs, 100M env steps, 2-layer d=128
-# core, plane tokenizer (7 planes per cell), per-cell action head (2 logits per cell = 72 actions), global grad-norm
-# clip 1.0, potential-based reward shaping (weight 1.0), loss on the final readout for every arm.
+# Non-default values are appended to the run directory name (e.g. looped_it8_g4_s0).
+# All arms: PPO on procedurally generated scrambles (slidingpuzzle-<N>x<N>: random walk of the blank from the
+# solved board; training scrambles of NUM_RANDOM_MOVES, in-training evaluation (eval/test_* metrics) on
+# EVAL_NUM_RANDOM_MOVES), sparse reward (1 on solve), 1024 envs x 64 steps per rollout, 64 minibatches x 4
+# epochs, 100M env steps, 2-layer d=128 core, per-cell one-hot tile tokens, readout action head (move the blank
+# up / right / down / left), global grad-norm clip 1.0, loss on the final readout for every arm.
+# Defaults follow the Stoix sliding tile sweeps (3x3, time limit 40, 100 / 200 scramble moves).
 #   looped    : weight-tied core, cap 16 think iterations, policy-KL halting (1e-3)
 #   iso_flops : 16 untied cores stacked (16x the parameters)
 #   iso_param : one core applied once
@@ -25,15 +35,17 @@
 #   perceiver : Perceiver AR-style latent CoT (latents from <BOT> attend to the cell tokens + earlier latents at every
 #               layer; cells never processed), cap 16 passes, policy-KL halting (1e-3)
 #   iso_perceiver : Perceiver AR-style latent CoT, always runs the full 16 passes (no halting)
-# Requires data/rushhour/{easy_train,easy_valid,easy_test}.npz (python data_scripts/build_rushhour_banks.py --src rush.txt).
 # Usage:
-# MAX_THINK_ITERS=4 rushhour/scripts/train.sh looped 1 exp/rushhour 2 &
-# MAX_THINK_ITERS=4 DISCOUNT_COMPUTE=0.99 rushhour/scripts/train.sh looped 1 exp/rushhour 3 &
+# MAX_THINK_ITERS=4 slidingpuzzle/scripts/train.sh looped 1 exp/slidingpuzzle 0 &
+# GRID=4 NUM_RANDOM_MOVES=200 EVAL_NUM_RANDOM_MOVES=400 EPISODE_LENGTH=80 slidingpuzzle/scripts/train.sh looped 1 exp/slidingpuzzle 1 &
 #
 set -euo pipefail
-ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/rushhour}"; DEVICE="${4:-0}";
+ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
+GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"
+NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
+TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=1e-3)
@@ -60,12 +72,25 @@ case "$THOUGHT_NORM" in
      ARM_FLAGS+=(--cot_thought_norm); RUN+="_tn" ;;
   *) echo "THOUGHT_NORM must be 0 or 1, got $THOUGHT_NORM"; exit 1 ;;
 esac
+case "$TOKENIZER" in
+  cell) ;;
+  flat) ARM_FLAGS+=(--tokenizer=flat); RUN+="_tkflat" ;;
+  conv) ARM_FLAGS+=(--tokenizer=conv --tokenizer_conv_features="$TOKENIZER_CONV_FEATURES")
+        RUN+="_tkconv${TOKENIZER_CONV_FEATURES}" ;;
+  *) echo "TOKENIZER must be cell, flat or conv, got $TOKENIZER"; exit 1 ;;
+esac
+[[ "$GRID" =~ ^[0-9]+$ ]] || { echo "GRID must be an integer N (board N x N), got $GRID"; exit 1; }
+[[ "$GRID" != 3 ]] && RUN+="_g${GRID}"
+[[ "$EPISODE_LENGTH" != 40 ]] && RUN+="_el${EPISODE_LENGTH}"
+[[ "$NUM_RANDOM_MOVES" != 100 ]] && RUN+="_rm${NUM_RANDOM_MOVES}"
+[[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
 RUN+="_s${SEED}"
 # Every hyperparameter flag except the seed; hashed into the wandb group.
-HPARAM_FLAGS=(--env_id=rushhour-easy_train-easy_valid
+HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH"
+  --slidingpuzzle_num_random_moves="$NUM_RANDOM_MOVES" --slidingpuzzle_eval_num_random_moves="$EVAL_NUM_RANDOM_MOVES"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4
   --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
