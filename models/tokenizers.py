@@ -24,7 +24,7 @@ import dataclasses
 import flax.linen as nn
 import jax.numpy as jnp
 
-from models.fprm import FPRMConfig
+from models.fprm import FPRMConfig, pytorch_depthwise_conv_init
 
 TOKENIZERS = ('cell', 'flat', 'conv')
 
@@ -51,6 +51,26 @@ def token_grid_shape(tokenizer, m, n, obs_dim, conv_features):
     if tokenizer == 'cell':
         return (m, n)
     return (1, num_tokens(tokenizer, m, n, obs_dim, conv_features))
+
+
+class InputGridConv(nn.Module):
+    """Residual depthwise 3x3 convolution over [B, m*n, d] cell tokens (row-major): cells + DWConv(cells).
+
+    The FPRM core's grid convolution acts on the latent z, which carries the board only from the second core call
+    on, so models that pass the cells through the core at most once (fprm_cot, fprm_perceiver) get no
+    data-dependent local mixing from it. This applies the same kind of convolution to the cell embeddings
+    themselves, once per decision, so every cell token sees its 3x3 neighbourhood."""
+
+    m: int
+    n: int
+
+    @nn.compact
+    def __call__(self, cells):
+        B, L, H = cells.shape
+        assert L == self.m * self.n, (L, self.m, self.n)
+        conv = nn.Conv(H, (3, 3), padding='SAME', feature_group_count=H, use_bias=False,
+                       kernel_init=pytorch_depthwise_conv_init, name='conv')
+        return cells + conv(cells.reshape(B, self.m, self.n, H)).reshape(B, L, H)
 
 
 class ObsTokenizer(nn.Module):

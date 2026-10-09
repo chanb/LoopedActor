@@ -61,7 +61,7 @@ from models.fprm import (
     rms_norm,
 )
 from models.fprm_thinker import tokenize
-from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, num_tokens, token_grid_shape
+from models.tokenizers import InputGridConv, ObsTokenizer, check_tokenizer, core_config, num_tokens, token_grid_shape
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +200,16 @@ class FPRMCoTThinkerActorValue(nn.Module):
     thought_norm: bool = False
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
+    # Residual depthwise 3x3 conv over the cell embeddings (tokenizer='cell'; see models/tokenizers.InputGridConv).
+    input_grid_conv: bool = False
 
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
+        if self.input_grid_conv:
+            assert self.tokenizer == 'cell', "input_grid_conv needs tokenizer='cell' (one token per grid cell)"
+            self.input_conv = InputGridConv(self.m, self.n)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
         if self.tokenizer != 'cell':
@@ -255,6 +260,8 @@ class FPRMCoTThinkerActorValue(nn.Module):
             cell_tokens = self.cell_projection(cell_features)
         else:
             cell_tokens = self.obs_tokenizer(x_flat)
+        if self.input_grid_conv:
+            cell_tokens = self.input_conv(cell_tokens)
         tokens = jnp.concatenate(
             [cell_tokens, jnp.broadcast_to(self.bot, (B, 1, H))], axis=1
         )  # [B, num_cells + 1, H]

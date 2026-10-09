@@ -36,6 +36,7 @@ def main():
     ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3)
     ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
+    ap.add_argument('--input_grid_conv', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --input_grid_conv')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -53,10 +54,10 @@ def main():
                                     halt_kl=args.halt_kl, **kw)
     elif args.arch == 'fprm_cot':
         mod = FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                       thought_norm=args.thought_norm, **kw)
+                                       thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, **kw)
     elif args.arch == 'fprm_perceiver':
         mod = FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                      thought_norm=args.thought_norm, **kw)
+                                      thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, **kw)
     else:
         mod = TransformerActorValue(num_blocks=args.num_blocks if args.arch == 'multi_block' else 1,
                                     **kw)

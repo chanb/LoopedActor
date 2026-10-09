@@ -57,7 +57,7 @@ from models.fprm import (
 )
 from models.fprm_cot_thinker import _core_decode, _qkv, _residual_scales
 from models.fprm_thinker import tokenize
-from models.tokenizers import ObsTokenizer, check_tokenizer
+from models.tokenizers import InputGridConv, ObsTokenizer, check_tokenizer
 
 
 @flax.struct.dataclass
@@ -102,6 +102,8 @@ class FPRMPerceiverActorValue(nn.Module):
     thought_norm: bool = False     # rms_norm each generated latent before adding the modal embedding
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
+    # Residual depthwise 3x3 conv over the cell embeddings (tokenizer='cell'; see models/tokenizers.InputGridConv).
+    input_grid_conv: bool = False
 
     @property
     def core_config(self) -> FPRMConfig:
@@ -111,6 +113,9 @@ class FPRMPerceiverActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
+        if self.input_grid_conv:
+            assert self.tokenizer == 'cell', "input_grid_conv needs tokenizer='cell' (one token per grid cell)"
+            self.input_conv = InputGridConv(self.m, self.n)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
         if self.tokenizer != 'cell':
@@ -147,6 +152,8 @@ class FPRMPerceiverActorValue(nn.Module):
             cells = self.cell_projection(tokenize(x_flat, self.m, self.n, self.obs_channels))
         else:
             cells = self.obs_tokenizer(x_flat)  # [B, P, H]
+        if self.input_grid_conv:
+            cells = self.input_conv(cells)
         z0 = self.latent_init.astype(cells.dtype)
 
         if self.is_initializing():

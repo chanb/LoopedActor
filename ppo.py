@@ -122,6 +122,7 @@ class Args:
     halt_criterion: str = 'kl'            # 'kl' (policy-KL halting) | 'latent_residual' (original FPRM-paper rule: latent max-token residual)
     halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts < this
     halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh)
+    input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver: RMS-normalize each thought / latent before feeding it back
 
 
@@ -293,6 +294,7 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
+            input_grid_conv=args.input_grid_conv,
         )
     elif args.architecture == 'fprm_perceiver':
         assert args.halt_criterion == 'kl', "fprm_perceiver supports only halt_criterion='kl'"
@@ -309,6 +311,7 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
+            input_grid_conv=args.input_grid_conv,
         )
     elif args.architecture in ('single_block', 'multi_block'):
         actor_critic_network = TransformerActorValue(
