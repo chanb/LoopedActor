@@ -20,11 +20,15 @@ head needs per-cell tokens, so it requires 'cell'.
 """
 
 import dataclasses
+import math
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
-from models.fprm import FPRMConfig, pytorch_depthwise_conv_init
+from typing import Optional
+
+from models.fprm import FPRMConfig, FPRMSwiGLU, pytorch_depthwise_conv_init, rms_norm
 
 TOKENIZERS = ('cell', 'flat', 'conv')
 
@@ -59,18 +63,88 @@ class InputGridConv(nn.Module):
     The FPRM core's grid convolution acts on the latent z, which carries the board only from the second core call
     on, so models that pass the cells through the core at most once (fprm_cot, fprm_perceiver) get no
     data-dependent local mixing from it. This applies the same kind of convolution to the cell embeddings
-    themselves, once per decision, so every cell token sees its 3x3 neighbourhood."""
+    themselves, once per decision, so every cell token sees its 3x3 neighbourhood.
+
+    `residual_scaling` replaces the plain residual by the FPRM core's style of scaled residual, a learnable per-channel
+    convex combination a * cells + (1 - a) * DWConv(cells) with a = sigmoid(alpha_logit) initialized at `alpha_init`
+    (the core's alpha_1_init) - keeps repeated application (fprm_perceiver's step_grid_conv) bounded.
+
+    `depth` D > 1 replaces the single linear conv by D ConvNeXt-style blocks (`ConvNeXtBlock`: depthwise 3x3 conv,
+    rms_norm, the FPRM core's SwiGLU MLP, scaled residual), which adds channel mixing and a nonlinearity per layer;
+    the receptive field grows one hop per block. Needs `config` (MLP width, residual scaling). D = 1 is the single
+    linear depthwise conv above."""
 
     m: int
     n: int
+    residual_scaling: bool = False
+    alpha_init: float = 0.75
+    depth: int = 1
+    config: Optional[FPRMConfig] = None
+    remat: bool = True  # depth > 1: rematerialize each block of the scan in the backward pass
 
     @nn.compact
     def __call__(self, cells):
         B, L, H = cells.shape
         assert L == self.m * self.n, (L, self.m, self.n)
+        assert self.depth >= 1, self.depth
+        if self.depth > 1:
+            assert self.config is not None, 'InputGridConv(depth > 1) needs the FPRM config'
+            # Scan over the D blocks (untied weights stacked on a leading axis under 'blocks'), each rematerialized in
+            # the backward pass when `remat`: activation memory of one block instead of D.
+            step = nn.remat(_ConvNeXtStep, prevent_cse=False) if self.remat else _ConvNeXtStep
+            blocks = nn.scan(step, variable_axes={'params': 0}, split_rngs={'params': True}, length=self.depth)
+            cells, _ = blocks(self.m, self.n, self.config, name='blocks')(cells, None)
+            return cells
         conv = nn.Conv(H, (3, 3), padding='SAME', feature_group_count=H, use_bias=False,
                        kernel_init=pytorch_depthwise_conv_init, name='conv')
-        return cells + conv(cells.reshape(B, self.m, self.n, H)).reshape(B, L, H)
+        out = conv(cells.reshape(B, self.m, self.n, H)).reshape(B, L, H)
+        if not self.residual_scaling:
+            return cells + out
+        alpha_logit = self.param(
+            'alpha_logit', nn.initializers.constant(math.log(self.alpha_init / (1.0 - self.alpha_init))), (H,)
+        )
+        return scaled_residual(alpha_logit, cells, out)
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style block over [B, m*n, d] cell tokens: h <- a * h + (1 - a) * SwiGLU(rms_norm(DWConv3x3(h))), with
+    the FPRM core's SwiGLU MLP and its style of per-channel scaled residual (a = sigmoid(alpha_logit), initialized at
+    config.alpha_1_init; plain h + branch if config.residual_scaling is off)."""
+
+    m: int
+    n: int
+    config: FPRMConfig
+
+    @nn.compact
+    def __call__(self, h):
+        B, L, H = h.shape
+        conv = nn.Conv(H, (3, 3), padding='SAME', feature_group_count=H, use_bias=False,
+                       kernel_init=pytorch_depthwise_conv_init, name='dwconv')
+        y = conv(h.reshape(B, self.m, self.n, H)).reshape(B, L, H)
+        y = FPRMSwiGLU(self.config, name='mlp')(rms_norm(y, self.config.rms_norm_eps))
+        if not self.config.residual_scaling:
+            return h + y
+        a0 = self.config.alpha_1_init
+        alpha_logit = self.param('alpha_logit', nn.initializers.constant(math.log(a0 / (1.0 - a0))), (H,))
+        return scaled_residual(alpha_logit, h, y)
+
+
+class _ConvNeXtStep(nn.Module):
+    """ConvNeXtBlock as an nn.scan body (carry = cells)."""
+
+    m: int
+    n: int
+    config: FPRMConfig
+
+    @nn.compact
+    def __call__(self, cells, _):
+        return ConvNeXtBlock(self.m, self.n, self.config, name='block')(cells), None
+
+
+def scaled_residual(alpha_logit, x, fx):
+    """a * x + (1 - a) * f(x), a = sigmoid(alpha_logit) per channel."""
+    a = jax.nn.sigmoid(alpha_logit).astype(x.dtype)
+    return a * x + (1.0 - a) * fx
 
 
 class ObsTokenizer(nn.Module):

@@ -90,6 +90,9 @@ def _qkv(params, x, cfg: FPRMConfig):
 
 
 def _swiglu(params, x):
+    """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU or GELU depending on which parameters exist."""
+    if 'up_proj' in params:  # mlp_type='gelu'
+        return jax.nn.gelu(x @ params['up_proj']['kernel']) @ params['down_proj']['kernel']
     gate, up = jnp.split(x @ params['gate_up_proj']['kernel'], 2, axis=-1)
     return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel']
 
@@ -202,6 +205,8 @@ class FPRMCoTThinkerActorValue(nn.Module):
     tokenizer_conv_features: int = 64
     # Residual depthwise 3x3 conv over the cell embeddings (tokenizer='cell'; see models/tokenizers.InputGridConv).
     input_grid_conv: bool = False
+    # input_grid_conv depth: 1 = a single linear depthwise conv; D > 1 = D ConvNeXt-style blocks (models/tokenizers.py).
+    input_grid_conv_depth: int = 1
 
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
@@ -209,7 +214,8 @@ class FPRMCoTThinkerActorValue(nn.Module):
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         if self.input_grid_conv:
             assert self.tokenizer == 'cell', "input_grid_conv needs tokenizer='cell' (one token per grid cell)"
-            self.input_conv = InputGridConv(self.m, self.n)
+            self.input_conv = InputGridConv(self.m, self.n, depth=self.input_grid_conv_depth, config=self.config,
+                                            remat=self.remat)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
         if self.tokenizer != 'cell':

@@ -53,6 +53,12 @@ class FPRMConfig:
     num_heads: int = 4
     num_layers: int = 1
     expansion: float = 4.0
+    # MLP of every block: 'swiglu' (silu(gate) * up, hidden = expansion * d * 2/3) or 'gelu' (hidden = expansion * d),
+    # the hidden width rounded up to a multiple of mlp_round_to. The defaults (swiglu, 256) reproduce the public FPRM
+    # implementation; at d_model = 128 they round 341 up to 512 (1.5x the intended MLP size) - mlp_round_to = 64
+    # gives 384, 1 gives the intended 341.
+    mlp_type: str = 'swiglu'
+    mlp_round_to: int = 256
     softmax_temp: float = 1.0
     rms_norm_eps: float = 1e-5
 
@@ -159,8 +165,17 @@ class FPRMAttention(nn.Module):
         return out
 
 
+def mlp_hidden_dim(cfg: FPRMConfig) -> int:
+    """Hidden width of the block MLP (see FPRMConfig.mlp_type / mlp_round_to)."""
+    assert cfg.mlp_type in ('swiglu', 'gelu'), cfg.mlp_type
+    assert cfg.mlp_round_to >= 1, cfg.mlp_round_to
+    width = cfg.expansion * cfg.d_model * (2 / 3 if cfg.mlp_type == 'swiglu' else 1)
+    return round_up_to_multiple(round(width), cfg.mlp_round_to)
+
+
 class FPRMSwiGLU(nn.Module):
-    """SwiGLU MLP matching the public implementation."""
+    """The block MLP: SwiGLU matching the public implementation (default), or a GELU MLP (config.mlp_type).
+    Parameters: SwiGLU 'gate_up_proj' + 'down_proj'; GELU 'up_proj' + 'down_proj'."""
 
     config: FPRMConfig
 
@@ -168,7 +183,12 @@ class FPRMSwiGLU(nn.Module):
     def __call__(self, x):
         cfg = self.config
         H = cfg.d_model
-        inter = round_up_to_multiple(round(cfg.expansion * H * 2 / 3), 256)
+        inter = mlp_hidden_dim(cfg)
+
+        if cfg.mlp_type == 'gelu':
+            y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), name='up_proj')(x)
+            y = jax.nn.gelu(y)
+            return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), name='down_proj')(y)
 
         gate_up = nn.Dense(
             2 * inter,
