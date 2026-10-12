@@ -12,15 +12,18 @@ def generate_unroll(env, env_state, policy, key, unroll_length,
                     discount_act=1.0, discount_compute=1.0):
     """Step the env for unroll_length steps.
 
-    Returns the final state and the per-env discounted returns of the first
+    Returns the final state, the per-env discounted returns of the first
     episode, as a dict:
       'discounted_return'         sum_t discount_act^t r_t (discounting per env step)
       'compute_discounted_return' sum_t discount_act^t discount_compute^(z_t + c_t - 1) r_t,
                                   z_t = sum_{k<t} (c_k - 1), with c_t the policy's compute time
                                   (the return PPO optimizes; equal to the above when discount_compute = 1)
+    and the per-env think iterations of the first episode, as a dict:
+      'think_iters'   sum_t c_t over the episode's decisions
+      'decisions'     number of decisions in the episode
     """
     def body(i, carry):
-        env_state, key, returns, discounts = carry
+        env_state, key, returns, discounts, think = carry
         key, next_key = jax.random.split(key)
         actions, policy_extras = policy(env_state.obs, env_state.info["target_goal"], key)
         next_env_state = env.step(env_state, actions)
@@ -29,6 +32,8 @@ def generate_unroll(env, env_state, policy, key, unroll_length,
         active = env_state.info['eval_metrics'].active_episodes
         compute_time = policy_extras['compute_time'].astype(jnp.float32)
         compute_discount = discount_compute ** (compute_time - 1)
+        think = {'think_iters': think['think_iters'] + active * compute_time,
+                 'decisions': think['decisions'] + active}
         step_discounts = {
             'discounted_return': (1.0, discount_act),
             'compute_discounted_return': (compute_discount, discount_act * compute_discount),
@@ -36,15 +41,16 @@ def generate_unroll(env, env_state, policy, key, unroll_length,
         for name, (reward_discount, next_discount) in step_discounts.items():
             returns[name] = returns[name] + active * discounts[name] * reward_discount * next_env_state.reward
             discounts[name] = discounts[name] * next_discount
-        return (next_env_state, next_key, returns, discounts)
+        return (next_env_state, next_key, returns, discounts, think)
 
     zeros = jnp.zeros_like(env_state.reward)
     names = ('discounted_return', 'compute_discounted_return')
-    final_state, _, returns, _ = jax.lax.fori_loop(
+    final_state, _, returns, _, think = jax.lax.fori_loop(
         0, unroll_length, body,
-        (env_state, key, {k: zeros for k in names}, {k: zeros + 1.0 for k in names}),
+        (env_state, key, {k: zeros for k in names}, {k: zeros + 1.0 for k in names},
+         {'think_iters': zeros, 'decisions': zeros}),
     )
-    return final_state, returns
+    return final_state, returns, think
 
 
 class Evaluator:
@@ -98,9 +104,9 @@ class Evaluator:
         t = time.time()
 
         # 1. Trajectories for the train split (in-distribution)
-        train_state, train_returns = self._generate_train_unroll(policy_params, train_key)
+        train_state, train_returns, train_think = self._generate_train_unroll(policy_params, train_key)
         # 2. Trajectories for the test split (out-of-distribution)
-        test_state, test_returns = self._generate_test_unroll(policy_params, test_key)
+        test_state, test_returns, test_think = self._generate_test_unroll(policy_params, test_key)
 
         # Block to ensure execution finishes for timing
         test_state.info['eval_metrics'].active_episodes.block_until_ready()
@@ -108,7 +114,8 @@ class Evaluator:
 
         metrics = {}
 
-        for split_name, state, returns in [("train", train_state, train_returns), ("test", test_state, test_returns)]:
+        for split_name, state, returns, think in [("train", train_state, train_returns, train_think),
+                                                  ("test", test_state, test_returns, test_think)]:
             eval_metrics = state.info['eval_metrics']
 
             for name, value in eval_metrics.episode_metrics.items():
@@ -121,6 +128,11 @@ class Evaluator:
 
             for name, value in returns.items():
                 metrics[f'eval/{split_name}_episode_{name}'] = np.mean(value)
+
+            # Think iterations of the deterministic policy: mean per decision (over all decisions of the first
+            # episodes, as training/think_iters), and mean total per episode.
+            metrics[f'eval/{split_name}_think_iters'] = float(np.sum(think['think_iters']) / max(np.sum(think['decisions']), 1.0))
+            metrics[f'eval/{split_name}_episode_think_iters'] = np.mean(think['think_iters'])
 
         metrics['eval/epoch_eval_time'] = epoch_eval_time
         metrics['eval/sps'] = (self._steps_per_unroll * 2) / epoch_eval_time

@@ -92,3 +92,8 @@ def normalize(batch: jnp.ndarray, state: RunningStatisticsState) -> jnp.ndarray:
 def denormalize(batch: jnp.ndarray, state: RunningStatisticsState) -> jnp.ndarray:
     """Denormalizes data using running statistics."""
     return batch * state.std + state.mean
+
+
+def is_identity(state: RunningStatisticsState) -> bool:
+	"""True for a never-updated state (mean 0, std 1): the checkpoint of a run without observation normalization."""
+	return bool(state.count == 0) and bool(jnp.all(state.mean == 0)) and bool(jnp.all(state.std == 1))

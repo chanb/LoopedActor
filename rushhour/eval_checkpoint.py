@@ -23,6 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.rushhour_env import RushHourEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
+from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
 from models.fprm_perceiver import FPRMPerceiverActorValue  # noqa: E402
@@ -84,6 +85,8 @@ def main():
                                     **kw)
     with open(args.ckpt, 'rb') as f:
         policy_vars, norm = pickle.load(f)
+    if running_statistics.is_identity(norm):
+        norm = None  # trained without observation normalization (--normalize_observations off)
 
     @jax.jit
     def act(obs):

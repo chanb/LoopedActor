@@ -17,17 +17,12 @@ iterations that were executed. Every study compares the same three arms:
 | **iso_flops** | 16 untied cores stacked, no halting | 16x | fixed, 16 |
 | **iso_param** | the core applied once | 1x | fixed, 1 |
 
-- **OGBench** (`ogbench/`): offline goal-conditioned RL (GCIQL) on four
-  manipulation environments (`cube_double`, `cube_triple`, `puzzle_3x3`,
-  `scene`); only the actor changes, value and critic stay the standard MLPs.
-  Seeds 0-4.
 - **Boxoban** (`sokoban/`): online PPO on Boxoban levels, trained and
   evaluated on the unfiltered generator (`unfiltered_train` / `_valid` / `_test`). Seeds 1-3.
 - **Rush Hour** (`rushhour/`): online PPO on Fogleman's 6x6 Rush Hour puzzles
   with at most 15 moves (`easy_train` / `easy_valid` / `easy_test`). Seeds 1-3.
 
-The PPO studies share `ppo.py`, `models/`, `envs/` and `utils/`; the OGBench
-study is self-contained under `ogbench/`. Each study's README gives the exact
+The PPO studies share `ppo.py`, `models/`, `envs/` and `utils/`. Each study's README gives the exact
 training and evaluation commands and the numbers reported in the paper.
 
 ## Layout
@@ -49,24 +44,21 @@ tests/                      environment tests (Boxoban)
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt            # PPO studies
-pip install -r ogbench/requirements.txt    # OGBench study (adds ogbench, mujoco)
 pip install -U "jax[cuda12]==0.10.2"       # GPU build of JAX (training; evaluation also runs on CPU, slowly)
 python -m pytest -q tests/                 # Boxoban environment tests
-(cd ogbench && python -m pytest -q tests/)  # OGBench tokenizer / halting / untied-stack tests, ~3 min on CPU
 ```
 
-All reported runs used Python 3.11, JAX 0.10.2, Flax 0.12.8 on a single
-NVIDIA H100 or B200 per run (`MUJOCO_GL=egl` for OGBench).
+All reported runs used Python 3.11, JAX 0.10.2, Flax 0.12.8..
 
 ## Reproducing the tables
 
-1. Build the data (`data_scripts/`, see the study READMEs; OGBench datasets download automatically).
+1. Build the data (`data_scripts/`, see the study READMEs).
 2. Train with `<study>/scripts/train.sh <arm> <seed>`; every run is seeded and
    writes its checkpoints and evaluation curves. Training is deterministic up
    to XLA's GPU non-determinism (re-running a seed reproduces the reported
    number within the seed-to-seed spread).
 3. Evaluate the final checkpoint of each run with `sokoban/eval_checkpoint.py`,
-   `rushhour/eval_checkpoint.py` or `ogbench/eval_checkpoint.py` (commands and
+   or `rushhour/eval_checkpoint.py` (commands and
    the numbers to expect in each README; a few minutes per checkpoint on one GPU).
 
 All hyperparameters live in the train scripts and in the `Args` / `get_config`

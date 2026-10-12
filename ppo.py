@@ -96,6 +96,8 @@ class Args:
     gae_lambda: float = 0.95
     clipping_epsilon: float = 0.3
     normalize_advantage: bool = True
+    normalize_observations: bool = False  # running mean/std normalization of the observations (per input feature, so tied to the
+                                          # board size); off: the models see raw observations and checkpoints store an identity normalizer
     # stabilization (all off by default)
     max_grad_norm: float = 0.0            # 0 = no gradient clipping
     target_kl: float = 0.0                # 0 = no KL early stop; else skip remaining minibatch updates in a rollout once approx_kl exceeds this
@@ -441,11 +443,15 @@ def main(args: Args):
         )
         return final_env_state, data
 
+    def obs_normalizer(training_state):
+        """The normalizer passed to the network (None = raw observations)."""
+        return training_state.normalizer_params if args.normalize_observations else None
+
     @jax.jit
     def data_collect_step(training_state, env_state, key_generate_rollout):
         policy = make_policy({
             'policy': training_state.params,
-            'normalizer': training_state.normalizer_params,
+            'normalizer': obs_normalizer(training_state),
         })
 
         env_state, data = generate_unroll(
@@ -457,11 +463,14 @@ def main(args: Args):
             extra_fields=('truncation',),
         )
 
-        # Update normalization params.
-        normalizer_params = running_statistics.update(
-            training_state.normalizer_params,
-            data.observation,
-        )
+        # Update normalization params (left at the identity init when observations are not normalized).
+        if args.normalize_observations:
+            normalizer_params = running_statistics.update(
+                training_state.normalizer_params,
+                data.observation,
+            )
+        else:
+            normalizer_params = training_state.normalizer_params
 
         training_state = training_state.replace(
             normalizer_params=normalizer_params,
@@ -587,7 +596,7 @@ def main(args: Args):
                         return loss * scale, aux
 
                     (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
-                        training_state.params, training_state.normalizer_params, data, key_loss
+                        training_state.params, obs_normalizer(training_state), data, key_loss
                     )
                     grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
                     finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
@@ -595,7 +604,7 @@ def main(args: Args):
                     grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
                 else:
                     (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                        training_state.params, training_state.normalizer_params, data, key_loss
+                        training_state.params, obs_normalizer(training_state), data, key_loss
                     )
                 grad_norm = optax.global_norm(grads)  # pre-clip
                 metrics['grad_norm'] = grad_norm
@@ -652,7 +661,7 @@ def main(args: Args):
         # calculate gae
         terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
         _, bootstrap_value = actor_critic_network.apply(
-            training_state.params, terminal_obs, training_state.normalizer_params
+            training_state.params, terminal_obs, obs_normalizer(training_state)
         )
 
         rewards = data.reward * args.reward_scaling
@@ -744,7 +753,7 @@ def main(args: Args):
             }
 
             metrics = evaluator.run_evaluation(
-                policy_params={'policy': training_state.params, 'normalizer': training_state.normalizer_params},
+                policy_params={'policy': training_state.params, 'normalizer': obs_normalizer(training_state)},
                 training_metrics=metrics,
             )
 
