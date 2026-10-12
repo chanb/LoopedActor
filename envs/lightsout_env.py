@@ -39,6 +39,7 @@ def default_config() -> config_dict.ConfigDict:
         m=3,
         n=3,
         episode_length=6,
+        eval_episode_length=6,  # held-out (eval_reset) episodes; set by make_env (envs/utils.py)
         difficulty_threshold=0.5,  # train dist in [1, threshold), eval dist in [threshold, m*n)
         step_penalty=0.0,          # 0 = sparse reward (Stoix)
         solve_reward=1.0,

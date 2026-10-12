@@ -74,7 +74,8 @@ class Args:
     rushhour_max_train_levels: int = 0    # rushhour-*: cap on training levels (0 = whole split)
     rushhour_episode_length: int = 150    # rushhour-*: steps per episode
     rushhour_shaping_weight: float = 1.0  # rushhour-*: potential-based shaping weight (0 = sparse solve reward only)
-    lightsout_episode_length: int = 6     # lightsout-*: steps per episode
+    lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
+    lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
     slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
@@ -265,6 +266,10 @@ def main(args: Args):
     env = wrap_env(env_class(config=env_config), env_config.episode_length)
     eval_env = wrap_env(env_class(config=env_config), env_config.episode_length, train=False)
     episode_length = env_config.episode_length
+    # Held-out evaluation episodes may get a longer budget (lightsout: their goals need more presses).
+    test_episode_length = env_config.get('eval_episode_length', episode_length)
+    test_eval_env = (wrap_env(env_class(config=env_config), test_episode_length, train=False)
+                     if test_episode_length != episode_length else eval_env)
 
     # Initialize checkpoint folder
     if args.save_checkpoint:
@@ -410,6 +415,8 @@ def main(args: Args):
         functools.partial(make_policy, deterministic=True),
         num_eval_envs=args.num_eval_envs,
         episode_length=episode_length,
+        test_eval_env=test_eval_env,
+        test_episode_length=test_episode_length,
         key=key_eval,
         discount_act=args.discount_act,
         discount_compute=args.discount_compute,

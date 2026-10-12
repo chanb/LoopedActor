@@ -4,7 +4,10 @@
 #   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver | mem | iso_mem | rim | iso_rim
 # Optional environment variables:
 #   GRID=MxN            board size (default 5x4)
-#   EPISODE_LENGTH=N    steps per episode (default M*N, as in the Stoix Lights Out sweep)
+#   EPISODE_LENGTH=N    steps per training episode (default int(M*N*DIFFICULTY_THRESHOLD) = the threshold, one more than
+#                       the hardest training goal needs, so the policy must press (nearly) only solution cells; also
+#                       used by the eval/train_* episodes; runs before this default used M*N)
+#   EVAL_EPISODE_LENGTH=N  steps per held-out (eval/test_*) episode (default M*N, one more than the hardest held-out goal needs)
 #   DIFFICULTY_THRESHOLD=f  training goals need < int(M*N*f) presses, evaluation goals >= it (default 0.5)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
@@ -63,8 +66,10 @@ set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/lightsout}"; DEVICE="${4:-0}";
 GRID="${GRID:-5x4}"; DIFFICULTY_THRESHOLD="${DIFFICULTY_THRESHOLD:-0.5}"
 [[ "$GRID" =~ ^([0-9]+)x([0-9]+)$ ]] || { echo "GRID must be MxN, got $GRID"; exit 1; }
-DEFAULT_EPISODE_LENGTH=$(( BASH_REMATCH[1] * BASH_REMATCH[2] ))
+DEFAULT_EVAL_EPISODE_LENGTH=$(( BASH_REMATCH[1] * BASH_REMATCH[2] ))
+DEFAULT_EPISODE_LENGTH=$(awk -v c="$DEFAULT_EVAL_EPISODE_LENGTH" -v t="$DIFFICULTY_THRESHOLD" 'BEGIN { print int(c * t) }')  # = the env's threshold
 EPISODE_LENGTH="${EPISODE_LENGTH:-$DEFAULT_EPISODE_LENGTH}"
+EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$DEFAULT_EVAL_EPISODE_LENGTH}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"
@@ -135,6 +140,7 @@ if [[ "$CELL_ENCODER_ITERS" != 0 ]]; then
 fi
 [[ "$GRID" != 5x4 ]] && RUN+="_g${GRID}"
 [[ "$EPISODE_LENGTH" != "$DEFAULT_EPISODE_LENGTH" ]] && RUN+="_el${EPISODE_LENGTH}"
+[[ "$EVAL_EPISODE_LENGTH" != "$DEFAULT_EVAL_EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
 [[ "$DIFFICULTY_THRESHOLD" != 0.5 ]] && RUN+="_dt${DIFFICULTY_THRESHOLD}"
 case "$MLP_TYPE" in
   swiglu) ;;
@@ -161,7 +167,7 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
 RUN+="_s${SEED}"
 # Every hyperparameter flag except the seed; hashed into the wandb group.
-HPARAM_FLAGS=(--env_id="lightsout-${GRID}" --lightsout_episode_length="$EPISODE_LENGTH"
+HPARAM_FLAGS=(--env_id="lightsout-${GRID}" --lightsout_episode_length="$EPISODE_LENGTH" --lightsout_eval_episode_length="$EVAL_EPISODE_LENGTH"
   --lightsout_difficulty_threshold="$DIFFICULTY_THRESHOLD"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout=4

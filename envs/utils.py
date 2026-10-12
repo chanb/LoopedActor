@@ -43,6 +43,8 @@ def make_env(args):
         config.m, config.n = int(lo.group(1)), int(lo.group(2))
         config.episode_length = getattr(args, 'lightsout_episode_length', 6)
         config.difficulty_threshold = getattr(args, 'lightsout_difficulty_threshold', 0.5)
+        # Held-out (eval_reset) episodes: 0 = the training episode length.
+        config.eval_episode_length = getattr(args, 'lightsout_eval_episode_length', 0) or config.episode_length
         return LightsOutEnv, config
     sp = re.fullmatch(r"slidingpuzzle-(\d+)x(\d+)", args.env_id)  # slidingpuzzle-<N>x<N>, procedurally generated
     if sp is not None:

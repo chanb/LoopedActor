@@ -2,7 +2,8 @@
 
 Lights Out instances are procedural (no level bank), so for every goal distance `dist` (number of distinct presses
 that generated the goal, 1 .. M*N-1) the script draws `--levels_per_dist` instances from fixed seeds
-(`LightsOutEnv.reset_with_dist`) and rolls out the deterministic policy (argmax) for `--episode_length` steps.
+(`LightsOutEnv.reset_with_dist`) and rolls out the deterministic policy (argmax) for `--episode_length` steps below the
+difficulty threshold and `--eval_episode_length` steps at or above it (the training budgets of train.sh).
 Reports per-distance success rate, mean realized think iterations, KL-convergence rate and mean episode length,
 plus aggregates over the training distances [1, threshold) and the evaluation distances [threshold, M*N).
 
@@ -119,7 +120,11 @@ def main():
     ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--grid', default='5x4', help='board MxN the checkpoint was trained on')
     ap.add_argument('--difficulty_threshold', type=float, default=0.5, help='splits distances into train / eval ranges')
-    ap.add_argument('--episode_length', type=int, default=0, help='steps per episode (0 = M*N, the training default)')
+    ap.add_argument('--episode_length', type=int, default=0,
+                    help='steps per episode for distances below the threshold (0 = the threshold, the train.sh default; '
+                         'checkpoints trained before that default used M*N)')
+    ap.add_argument('--eval_episode_length', type=int, default=0,
+                    help='steps per episode for distances at or above the threshold (0 = M*N, the train.sh default)')
     ap.add_argument('--dists', type=int, nargs='+', default=None, help='goal distances to evaluate (default 1 .. M*N-1)')
     ap.add_argument('--levels_per_dist', type=int, default=1000)
     ap.add_argument('--batch', type=int, default=512)
@@ -130,7 +135,8 @@ def main():
     m, n = (int(v) for v in args.grid.split('x'))
     cfg = default_config(); cfg.m, cfg.n = m, n; cfg.difficulty_threshold = args.difficulty_threshold
     env = LightsOutEnv(cfg)
-    T = args.episode_length or m * n
+    T_train = args.episode_length or env.threshold
+    T_eval = args.eval_episode_length or m * n
     dists = args.dists or list(range(1, m * n))
     mod = build_module(args, m, n)
     with open(args.ckpt, 'rb') as f:
@@ -140,6 +146,7 @@ def main():
 
     per_dist = {}
     for d in dists:
+        T = T_train if d < env.threshold else T_eval
         per_dist[d] = evaluate(env, mod, policy_vars, norm, d, args.levels_per_dist, T, args.batch, args.seed)
         r = per_dist[d]
         print(f'{args.ckpt} dist {d:3d} n={r["levels"]:5d} success {r["success"]:.3f} think {r["think"]:.2f} '
@@ -153,7 +160,7 @@ def main():
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
     tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') and args.max_iters != 16 else ''
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
-    json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=T,
+    json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=T_train, eval_episode_length=T_eval,
                    max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') else None,
                    threshold=env.threshold, results={str(d): r for d, r in per_dist.items()}, summary=summary),
               open(out, 'w'), indent=1)

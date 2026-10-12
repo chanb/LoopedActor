@@ -63,24 +63,31 @@ class Evaluator:
         key: jax.Array,
         discount_act: float = 1.0,
         discount_compute: float = 1.0,
+        test_eval_env=None,
+        test_episode_length: int = None,
     ):
+        """`eval_env` / `episode_length` run the train split; the test split (eval_reset) uses `test_eval_env` /
+        `test_episode_length` when given (a different episode budget), else the same."""
         self._key = key
         self._eval_walltime = 0.0
+        if test_eval_env is None:
+            test_eval_env, test_episode_length = eval_env, episode_length
         # Wrap the environment with EvalWrapper for metric tracking
         eval_env = EvalWrapper(eval_env)
+        test_eval_env = EvalWrapper(test_eval_env)
 
         # Helper to define the unroll logic for either reset or eval_reset
-        def make_unroll_fn(reset_type: str):
+        def make_unroll_fn(env, reset_type: str, unroll_length: int):
             def generate_unroll_logic(policy_params, key):
                 reset_keys = jax.random.split(key, num_eval_envs)
-                reset_fn = getattr(eval_env, reset_type)
+                reset_fn = getattr(env, reset_type)
                 eval_first_state = reset_fn(reset_keys)
                 return generate_unroll(
-                    eval_env,
+                    env,
                     eval_first_state,
                     eval_policy_fn(policy_params),
                     key,
-                    unroll_length=episode_length,
+                    unroll_length=unroll_length,
                     discount_act=discount_act,
                     discount_compute=discount_compute,
                 )
@@ -88,10 +95,10 @@ class Evaluator:
 
         # Two separate JIT'd functions: in-distribution ("easy" resets) and
         # the held-out harder distances ("hard" eval resets).
-        self._generate_train_unroll = make_unroll_fn("reset")
-        self._generate_test_unroll = make_unroll_fn("eval_reset")
+        self._generate_train_unroll = make_unroll_fn(eval_env, "reset", episode_length)
+        self._generate_test_unroll = make_unroll_fn(test_eval_env, "eval_reset", test_episode_length)
 
-        self._steps_per_unroll = episode_length * num_eval_envs
+        self._steps_per_eval = (episode_length + test_episode_length) * num_eval_envs
 
     def run_evaluation(
         self,
@@ -135,7 +142,7 @@ class Evaluator:
             metrics[f'eval/{split_name}_episode_think_iters'] = np.mean(think['think_iters'])
 
         metrics['eval/epoch_eval_time'] = epoch_eval_time
-        metrics['eval/sps'] = (self._steps_per_unroll * 2) / epoch_eval_time
+        metrics['eval/sps'] = self._steps_per_eval / epoch_eval_time
         self._eval_walltime += epoch_eval_time
         metrics['eval/walltime'] = self._eval_walltime
 
