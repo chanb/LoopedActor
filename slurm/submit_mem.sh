@@ -17,21 +17,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/run_pack.sh"
+source "${SCRIPT_DIR}/mem_study.sh"
 REPO_DIR="${REPO_DIR:-/home/chanb/research/iclr_2027/LoopedActor}"
 LOG_DIR="${LOG_DIR:-/home/chanb/scratch/logs/looped_actor}"
 OUT_ROOT="${OUT_ROOT:-/home/chanb/scratch/looped_actor/exp}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 DRY_RUN="${DRY_RUN:-0}"
-read -r -a ENVS <<< "${ENVS:-sokoban rushhour lightsout slidingpuzzle}"
-read -r -a SEEDS <<< "${SEEDS:-1 2 3 4 5 6 7 8 9 10}"
-
-COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=0.999"
-# config name -> "<env vars> <arm>"
-CONFIGS=(
-  "iso_mem_it1|MAX_THINK_ITERS=1 iso_mem"
-  "iso_mem_it4|MAX_THINK_ITERS=4 iso_mem"
-  "mem_it4|MAX_THINK_ITERS=4 mem"
-)
+read -r -a ENVS <<< "${ENVS:-$MEM_STUDY_ENVS}"
+read -r -a SEEDS <<< "${SEEDS:-$MEM_STUDY_SEEDS}"
+COMMON="$MEM_STUDY_COMMON"
+CONFIGS=("${MEM_STUDY_CONFIGS[@]}")   # experiment definitions: slurm/mem_study.sh
 
 # PACK[<env>:<config>] = "<runs per GPU> <XLA memory fraction per run> <time limit> <host RAM per job>"
 # From the measurements below. GPU memory is never the constraint (every config peaks at <= 3 GiB), so runs per GPU are
