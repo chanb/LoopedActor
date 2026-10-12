@@ -47,7 +47,7 @@ from models.fprm import (
     make_latent_init,
     rms_norm,
 )
-from models.fprm_cot_thinker import _qkv, _residual_scales, _swiglu
+from models.fprm_cot_thinker import _attn_softmax, _mixed_precision_input, _qkv, _residual_scales, _swiglu
 from models.fprm_thinker import tokenize
 from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
 
@@ -83,7 +83,7 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
             grid = grid + params['grid_depthwise_conv']['bias']
         z = jnp.concatenate([grid.reshape(B, num_cells, H), z[:, num_cells:]], axis=1)
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z + b2 * x
+    h, a1, b1 = _mixed_precision_input(a2 * z + b2 * x, a1, b1, cfg)
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
     thought_kv = []
     for i in range(cfg.num_layers):
@@ -92,14 +92,14 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
         logits_cur = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
         logits_mem = jnp.einsum('bqhd,bkhd->bhqk', q, mem_k[i]) * scale
         logits_mem = jnp.where(mem_valid[None, None, None, :], logits_mem, -jnp.inf)
-        probs = jax.nn.softmax(jnp.concatenate([logits_cur, logits_mem], axis=-1), axis=-1)
+        probs = _attn_softmax(jnp.concatenate([logits_cur, logits_mem], axis=-1))
         out = (jnp.einsum('bhqk,bkhd->bqhd', probs[..., :N], v)
                + jnp.einsum('bhqk,bkhd->bqhd', probs[..., N:], mem_v[i]))
-        out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel']
+        out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
         thought_kv.append((k[:, -1], v[:, -1]))
-    return h, thought_kv
+    return h.astype(x.dtype), thought_kv
 
 
 class FPRMMemActorValue(nn.Module):
@@ -245,7 +245,7 @@ class FPRMMemActorValue(nn.Module):
         latent_embed = self.latent_embed
         z0_thought = jnp.broadcast_to(z0[None, None], (B, 1, H))
         kv_shape = (cfg.num_layers, B, S, cfg.num_heads, H // cfg.num_heads)
-        memory = (jnp.zeros(kv_shape, cells.dtype), jnp.zeros(kv_shape, cells.dtype))
+        memory = (jnp.zeros(kv_shape, cfg.compute_dtype), jnp.zeros(kv_shape, cfg.compute_dtype))
 
         def body(carry, i):
             # Pass i + 1: refine the cells and run thought t_{i+1}, reading the thoughts written by passes 1..i.

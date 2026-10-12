@@ -34,7 +34,7 @@ from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 def build_module(args, m, n):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
-                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to)
+                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=m, n=n, config=cfg, output_dim_1=m * n, obs_channels=0, action_head='per_cell')
     if args.arch == 'fprm':
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
@@ -115,6 +115,7 @@ def main():
     ap.add_argument('--num_layers', type=int, default=2)
     ap.add_argument('--mlp_type', default='swiglu', choices=['swiglu', 'gelu'], help='the checkpoint\'s --mlp_type')
     ap.add_argument('--mlp_round_to', type=int, default=256, help='the checkpoint\'s --mlp_round_to')
+    ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--grid', default='5x4', help='board MxN the checkpoint was trained on')
     ap.add_argument('--difficulty_threshold', type=float, default=0.5, help='splits distances into train / eval ranges')
     ap.add_argument('--episode_length', type=int, default=0, help='steps per episode (0 = M*N, the training default)')

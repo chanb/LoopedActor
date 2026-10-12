@@ -34,7 +34,7 @@ from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 def build_module(args, N):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
-                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to)
+                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=N, n=N, config=cfg, output_dim_1=4, obs_channels=N * N, action_head='readout',
               tokenizer=args.tokenizer, tokenizer_conv_features=args.tokenizer_conv_features)
     if args.arch == 'fprm':
@@ -112,6 +112,7 @@ def main():
     ap.add_argument('--num_layers', type=int, default=2)
     ap.add_argument('--mlp_type', default='swiglu', choices=['swiglu', 'gelu'], help='the checkpoint\'s --mlp_type')
     ap.add_argument('--mlp_round_to', type=int, default=256, help='the checkpoint\'s --mlp_round_to')
+    ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--tokenizer', default='cell', choices=['cell', 'flat', 'conv'], help='the checkpoint\'s --tokenizer')
     ap.add_argument('--tokenizer_conv_features', type=int, default=64, help='the checkpoint\'s --tokenizer_conv_features')
     ap.add_argument('--grid', type=int, default=3, help='board size N (N x N) the checkpoint was trained on')

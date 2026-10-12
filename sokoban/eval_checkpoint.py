@@ -35,7 +35,7 @@ from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 def build_module(args):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
-                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to)
+                      mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=10, n=10, config=cfg, output_dim_1=4, obs_channels=4, action_head='readout',
               tokenizer=args.tokenizer, tokenizer_conv_features=args.tokenizer_conv_features)
     if args.arch == 'fprm':
@@ -119,6 +119,7 @@ def main():
     ap.add_argument('--num_layers', type=int, default=2)
     ap.add_argument('--mlp_type', default='swiglu', choices=['swiglu', 'gelu'], help='the checkpoint\'s --mlp_type')
     ap.add_argument('--mlp_round_to', type=int, default=256, help='the checkpoint\'s --mlp_round_to')
+    ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--splits', nargs='+', default=['unfiltered_valid', 'unfiltered_test'])
     ap.add_argument('--max_levels', type=int, default=2000, help='levels per split (0 = whole bank)')
     ap.add_argument('--out', default=None, help='JSON path (default: next to the checkpoint, eval_<name>[_cap<N>].json)')

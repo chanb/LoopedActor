@@ -31,6 +31,9 @@
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
 #                       64 -> 384, 1 -> 341)
+#   COMPUTE_DTYPE=float32|float16|bfloat16  block computation dtype (default float32). bfloat16: ~1.6-1.75x faster, fp32 range;
+#                       float16: slightly faster and more precise, but activations can overflow (multi_block NaNs)
+#   DYNAMIC_LOSS_SCALE=0|1  COMPUTE_DTYPE=float16: dynamic loss scaling against fp16 gradient underflow (default 1)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
 # Non-default values are appended to the run directory name (e.g. looped_it8_g4_s0).
@@ -65,7 +68,7 @@ GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"
+MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
@@ -151,6 +154,14 @@ case "$MLP_TYPE" in
 esac
 [[ "$MLP_ROUND_TO" =~ ^[1-9][0-9]*$ ]] || { echo "MLP_ROUND_TO must be a positive integer, got $MLP_ROUND_TO"; exit 1; }
 [[ "$MLP_ROUND_TO" != 256 ]] && { ARM_FLAGS+=(--mlp_round_to="$MLP_ROUND_TO"); RUN+="_mr${MLP_ROUND_TO}"; }
+case "$COMPUTE_DTYPE" in
+  float32) ;;
+  float16) ARM_FLAGS+=(--compute_dtype=float16); RUN+="_fp16" ;;
+  bfloat16) ARM_FLAGS+=(--compute_dtype=bfloat16); RUN+="_bf16" ;;
+  *) echo "COMPUTE_DTYPE must be float32, float16 or bfloat16, got $COMPUTE_DTYPE"; exit 1 ;;
+esac
+[[ "$DYNAMIC_LOSS_SCALE" == 0 || "$DYNAMIC_LOSS_SCALE" == 1 ]] || { echo "DYNAMIC_LOSS_SCALE must be 0 or 1, got $DYNAMIC_LOSS_SCALE"; exit 1; }
+[[ "$COMPUTE_DTYPE" == float16 && "$DYNAMIC_LOSS_SCALE" == 0 ]] && { ARM_FLAGS+=(--no-dynamic_loss_scale); RUN+="_nols"; }
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"

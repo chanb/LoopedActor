@@ -80,10 +80,25 @@ def _residual_scales(params, cfg: FPRMConfig):
     return a1, b1, a2, b2
 
 
+def _mixed_precision_input(h, a1, b1, cfg: FPRMConfig):
+    """Cast the core's mixed input and residual scales to cfg.compute_dtype (as FPRMCore does); the caller casts the
+    core's output back to the carried latent's dtype."""
+    h = h.astype(cfg.compute_dtype)
+    if not isinstance(a1, float):
+        a1, b1 = a1.astype(h.dtype), b1.astype(h.dtype)
+    return h, a1, b1
+
+
+def _attn_softmax(logits):
+    """Attention softmax computed in float32, returned in the logits' dtype."""
+    return jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
+
+
 def _qkv(params, x, cfg: FPRMConfig):
-    """[..., H] -> q, k, v of shape [..., num_heads, head_dim]."""
+    """[..., H] -> q, k, v of shape [..., num_heads, head_dim], in cfg.compute_dtype."""
     H = x.shape[-1]
-    qkv = x @ params['qkv_proj']['kernel']
+    x = x.astype(cfg.compute_dtype)
+    qkv = x @ params['qkv_proj']['kernel'].astype(x.dtype)
     qkv = qkv.reshape(x.shape[:-1] + (3 * cfg.num_heads, H // cfg.num_heads))
     q, k, v = jnp.split(qkv, 3, axis=-2)
     return q, k, v
@@ -92,9 +107,9 @@ def _qkv(params, x, cfg: FPRMConfig):
 def _swiglu(params, x):
     """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU or GELU depending on which parameters exist."""
     if 'up_proj' in params:  # mlp_type='gelu'
-        return jax.nn.gelu(x @ params['up_proj']['kernel']) @ params['down_proj']['kernel']
-    gate, up = jnp.split(x @ params['gate_up_proj']['kernel'], 2, axis=-1)
-    return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel']
+        return jax.nn.gelu(x @ params['up_proj']['kernel'].astype(x.dtype)) @ params['down_proj']['kernel'].astype(x.dtype)
+    gate, up = jnp.split(x @ params['gate_up_proj']['kernel'].astype(x.dtype), 2, axis=-1)
+    return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel'].astype(x.dtype)
 
 
 def _core_prefill(params, z, tokens, grid_shape, num_cells, cfg: FPRMConfig):
@@ -114,7 +129,7 @@ def _core_prefill(params, z, tokens, grid_shape, num_cells, cfg: FPRMConfig):
             grid = grid + params['grid_depthwise_conv']['bias']
         z = jnp.concatenate([grid.reshape(B, num_cells, H), z[:, num_cells:]], axis=1)
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z + b2 * tokens
+    h, a1, b1 = _mixed_precision_input(a2 * z + b2 * tokens, a1, b1, cfg)
 
     pos = jnp.arange(L)
     attn_mask = (pos[None, :] < num_cells) | (pos[None, :] <= pos[:, None])  # [L, L]
@@ -125,12 +140,12 @@ def _core_prefill(params, z, tokens, grid_shape, num_cells, cfg: FPRMConfig):
         q, k, v = _qkv(p['self_attn'], rms_norm(h, cfg.rms_norm_eps), cfg)
         logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
         logits = jnp.where(attn_mask[None, None], logits, -jnp.inf)
-        out = jnp.einsum('bhqk,bkhd->bqhd', jax.nn.softmax(logits, axis=-1), v)
-        out = out.reshape(B, L, H) @ p['self_attn']['o_proj']['kernel']
+        out = jnp.einsum('bhqk,bkhd->bqhd', _attn_softmax(logits), v)
+        out = out.reshape(B, L, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
         cache.append((k, v))
-    return h, cache
+    return h.astype(z.dtype), cache
 
 
 def _core_decode(params, z, token, prefix_cache, buf_k, buf_v, slot, cfg: FPRMConfig):
@@ -143,7 +158,7 @@ def _core_decode(params, z, token, prefix_cache, buf_k, buf_v, slot, cfg: FPRMCo
     B, H = token.shape
     S = buf_k.shape[2]
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z + b2 * token
+    h, a1, b1 = _mixed_precision_input(a2 * z + b2 * token, a1, b1, cfg)
     slot_valid = jnp.arange(S) <= slot  # [S]
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
     for i in range(cfg.num_layers):
@@ -155,16 +170,16 @@ def _core_decode(params, z, token, prefix_cache, buf_k, buf_v, slot, cfg: FPRMCo
         logits_pre = jnp.einsum('bhd,bkhd->bhk', q, k_pre) * scale
         logits_buf = jnp.einsum('bhd,bkhd->bhk', q, buf_k[i]) * scale
         logits_buf = jnp.where(slot_valid[None, None], logits_buf, -jnp.inf)
-        probs = jax.nn.softmax(jnp.concatenate([logits_pre, logits_buf], axis=-1), axis=-1)
+        probs = _attn_softmax(jnp.concatenate([logits_pre, logits_buf], axis=-1))
         P = k_pre.shape[1]
         out = (
             jnp.einsum('bhk,bkhd->bhd', probs[..., :P], v_pre)
             + jnp.einsum('bhk,bkhd->bhd', probs[..., P:], buf_v[i])
         )
-        out = out.reshape(B, H) @ p['self_attn']['o_proj']['kernel']
+        out = out.reshape(B, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
-    return h, buf_k, buf_v
+    return h.astype(z.dtype), buf_k, buf_v
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +384,7 @@ class FPRMCoTThinkerActorValue(nn.Module):
             # Passes 2..max_think_iters: one new token each, written to thought slot `slot`.
             z0_token = jnp.broadcast_to(self.latent_init[None].astype(tokens.dtype), (B, H))
             kv_shape = (cfg.num_layers, B, S, cfg.num_heads, H // cfg.num_heads)
-            buffers = (jnp.zeros(kv_shape, tokens.dtype), jnp.zeros(kv_shape, tokens.dtype))
+            buffers = (jnp.zeros(kv_shape, cfg.compute_dtype), jnp.zeros(kv_shape, cfg.compute_dtype))
 
             def body(carry, slot):
                 st, (buf_k, buf_v) = carry

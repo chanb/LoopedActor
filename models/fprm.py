@@ -61,6 +61,10 @@ class FPRMConfig:
     mlp_round_to: int = 256
     softmax_temp: float = 1.0
     rms_norm_eps: float = 1e-5
+    # Mixed precision: dtype of the block computation ('float32' | 'float16' | 'bfloat16'). Parameters stay float32,
+    # and so does the latent carried between core calls (FPRMCore casts its result back), so rounding error does not
+    # accumulate across think iterations; the softmax and RMSNorm statistics are computed in float32.
+    compute_dtype: str = 'float32'
 
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
@@ -134,10 +138,12 @@ class FPRMAttention(nn.Module):
         head_dim = H // num_heads
         assert head_dim * num_heads == H
 
+        cdt = jnp.dtype(cfg.compute_dtype)
         qkv = nn.Dense(
             3 * H,
             use_bias=False,
             kernel_init=trunc_normal_init(1.0 / math.sqrt(H)),
+            dtype=cdt,
             name='qkv_proj',
         )(x)
         qkv = qkv.reshape(B, L, 3 * num_heads, head_dim)
@@ -150,7 +156,7 @@ class FPRMAttention(nn.Module):
         logits = jnp.where(token_mask[:, None, None, :], logits, -jnp.inf)
         if attn_mask is not None:
             logits = jnp.where(attn_mask[:, None], logits, -jnp.inf)
-        probs = jax.nn.softmax(logits, axis=-1)
+        probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(cdt)
         out = jnp.einsum('bhqk,bkhd->bqhd', probs, value)
         out = out.reshape(B, L, H)
 
@@ -158,6 +164,7 @@ class FPRMAttention(nn.Module):
             H,
             use_bias=False,
             kernel_init=trunc_normal_init(1.0 / math.sqrt(H)),
+            dtype=cdt,
             name='o_proj',
         )(out)
         # Zero invalid queries (future padded batching; all-true masks here).
@@ -184,16 +191,18 @@ class FPRMSwiGLU(nn.Module):
         cfg = self.config
         H = cfg.d_model
         inter = mlp_hidden_dim(cfg)
+        cdt = jnp.dtype(cfg.compute_dtype)
 
         if cfg.mlp_type == 'gelu':
-            y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), name='up_proj')(x)
+            y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), dtype=cdt, name='up_proj')(x)
             y = jax.nn.gelu(y)
-            return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), name='down_proj')(y)
+            return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), dtype=cdt, name='down_proj')(y)
 
         gate_up = nn.Dense(
             2 * inter,
             use_bias=False,
             kernel_init=trunc_normal_init(1.0 / math.sqrt(H)),
+            dtype=cdt,
             name='gate_up_proj',
         )(x)
         gate, up = jnp.split(gate_up, 2, axis=-1)
@@ -202,6 +211,7 @@ class FPRMSwiGLU(nn.Module):
             H,
             use_bias=False,
             kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)),
+            dtype=cdt,
             name='down_proj',
         )(y)
         return y
@@ -222,9 +232,9 @@ class FPRMBlock(nn.Module):
         out = FPRMAttention(cfg, name='self_attn')(
             rms_norm(h, cfg.rms_norm_eps), token_mask, attn_mask
         )
-        h = alpha_1 * h + beta_1 * out
+        h = alpha_1 * h + beta_1 * out.astype(h.dtype)
         out = FPRMSwiGLU(cfg, name='mlp')(rms_norm(h, cfg.rms_norm_eps))
-        h = alpha_1 * h + beta_1 * out
+        h = alpha_1 * h + beta_1 * out.astype(h.dtype)
         return h
 
 
@@ -302,12 +312,14 @@ class FPRMCore(nn.Module):
             a1 = a2 = b1 = b2 = 1.0
 
         # Input mixing (repeated input injection).
-        h = a2 * z + b2 * input_tokens
+        h = (a2 * z + b2 * input_tokens).astype(cfg.compute_dtype)
+        if not isinstance(a1, float):
+            a1, b1 = a1.astype(h.dtype), b1.astype(h.dtype)
 
         for i in range(cfg.num_layers):
             h = FPRMBlock(cfg, name=f'block_{i}')(h, token_mask, a1, b1, attn_mask)
 
-        return h
+        return h.astype(z.dtype)
 
 
 def _logit(p):

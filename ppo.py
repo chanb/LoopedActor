@@ -119,6 +119,12 @@ class Args:
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
+    compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
+                                          # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
+    dynamic_loss_scale: bool = True       # compute_dtype=float16 only: scale the loss by S so small fp16 gradients do not underflow; a minibatch
+                                          # with a nonfinite gradient is skipped and S halved, S doubles after loss_scale_period good steps
+    loss_scale_init: float = 4096.0       # initial S (fp16 gradients underflow at S = 1 and overflow at S = 2^16 at initialization)
+    loss_scale_period: int = 1000         # good minibatch steps before S is doubled
 
     # FPRM thinker
     fprm_d_model: int = 128
@@ -145,6 +151,8 @@ class PPOTrainingState(TrainState):
     """Contains training state for the learner."""
     normalizer_params: Any
     env_steps: float
+    loss_scale: Any  # () float32, dynamic fp16 loss scale (unused unless compute_dtype=float16 and dynamic_loss_scale)
+    loss_scale_good_steps: Any  # () int32, consecutive finite-gradient steps since the last scale change
 
 
 class Transition(NamedTuple):
@@ -278,6 +286,7 @@ def main(args: Args):
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
         mlp_round_to=args.mlp_round_to,
+        compute_dtype=args.compute_dtype,
     )
     if args.architecture == 'fprm':
         actor_critic_network = FPRMThinkerActorValue(
@@ -386,6 +395,8 @@ def main(args: Args):
         tx=make_optimizer(args),
         normalizer_params=running_statistics.init_state((obs_size + goal_size,)),
         env_steps=np.zeros((), dtype=np.float64),
+        loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
+        loss_scale_good_steps=jnp.zeros((), jnp.int32),
     )
     make_policy = make_inference_fn(actor_critic_network)
 
@@ -557,6 +568,8 @@ def main(args: Args):
             'think_iters': jnp.mean(think_iters.astype(jnp.float32)),
         }
 
+    use_loss_scale = args.compute_dtype == 'float16' and args.dynamic_loss_scale
+
     @jax.jit
     def learn_step(training_state, data, key_sgd):
 
@@ -566,14 +579,43 @@ def main(args: Args):
                 training_state, key, kl_stop = carry
                 key, key_loss = jax.random.split(key)
 
-                (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                    training_state.params, training_state.normalizer_params, data, key_loss
-                )
+                if use_loss_scale:
+                    scale = training_state.loss_scale
+
+                    def scaled_loss(*a):
+                        loss, aux = compute_ppo_loss(*a)
+                        return loss * scale, aux
+
+                    (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
+                        training_state.params, training_state.normalizer_params, data, key_loss
+                    )
+                    grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
+                    finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
+                    # Zero a nonfinite gradient so the (discarded) update below stays finite.
+                    grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
+                else:
+                    (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
+                        training_state.params, training_state.normalizer_params, data, key_loss
+                    )
                 grad_norm = optax.global_norm(grads)  # pre-clip
                 metrics['grad_norm'] = grad_norm
                 if args.max_grad_norm > 0.0:
                     metrics['grad_clip_frac'] = (grad_norm > args.max_grad_norm).astype(jnp.float32)
                 new_training_state = training_state.apply_gradients(grads=grads)
+                if use_loss_scale:
+                    # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
+                    # consecutive finite steps.
+                    new_training_state = jax.tree_util.tree_map(
+                        lambda new, old: jnp.where(finite, new, old), new_training_state, training_state
+                    )
+                    good = jnp.where(finite, training_state.loss_scale_good_steps + 1, 0)
+                    grow = good >= args.loss_scale_period
+                    new_scale = jnp.where(finite, jnp.where(grow, scale * 2.0, scale), jnp.maximum(scale / 2.0, 1.0))
+                    new_training_state = new_training_state.replace(
+                        loss_scale=new_scale, loss_scale_good_steps=jnp.where(grow, 0, good)
+                    )
+                    metrics['loss_scale'] = scale
+                    metrics['nonfinite_grad_frac'] = (~finite).astype(jnp.float32)
                 if args.target_kl > 0.0:
                     # Once approx_kl exceeds the target, skip every remaining
                     # minibatch update until the next rollout.

@@ -52,7 +52,7 @@ from models.fprm import (
     make_latent_init,
     rms_norm,
 )
-from models.fprm_cot_thinker import _qkv, _residual_scales, _swiglu
+from models.fprm_cot_thinker import _attn_softmax, _mixed_precision_input, _qkv, _residual_scales, _swiglu
 from models.fprm_thinker import tokenize
 from models.tokenizers import InputGridConv, scaled_residual
 
@@ -66,7 +66,7 @@ def block_core(params, block, cache_k, cache_v, cache_valid, z0, cfg: FPRMConfig
     each [B, N, nh, hd])."""
     B, N, H = block.shape
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z0 + b2 * block
+    h, a1, b1 = _mixed_precision_input(a2 * z0 + b2 * block, a1, b1, cfg)
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
     kv = []
     for i in range(cfg.num_layers):
@@ -75,15 +75,15 @@ def block_core(params, block, cache_k, cache_v, cache_valid, z0, cfg: FPRMConfig
         logits_cache = jnp.einsum('bqhd,bkhd->bhqk', q, cache_k[i]) * scale
         logits_cache = jnp.where(cache_valid[None, None, None, :], logits_cache, -jnp.inf)
         logits_self = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
-        probs = jax.nn.softmax(jnp.concatenate([logits_cache, logits_self], axis=-1), axis=-1)
+        probs = _attn_softmax(jnp.concatenate([logits_cache, logits_self], axis=-1))
         C = cache_k.shape[2]
         out = (jnp.einsum('bhqk,bkhd->bqhd', probs[..., :C], cache_v[i])
                + jnp.einsum('bhqk,bkhd->bqhd', probs[..., C:], v))
-        out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel']
+        out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
         kv.append((k, v))
-    return h, kv
+    return h.astype(block.dtype), kv
 
 
 def select_halting(logits, values, residuals, min_iters, max_iters, thresh):
@@ -208,7 +208,7 @@ class FPRMRiMActorValue(nn.Module):
         sep = jnp.broadcast_to(self.sep, (B, H))
         C = max(T - 1, 1) * N  # cache positions (the last block is never read back)
         kv_shape = (cfg.num_layers, B, C, cfg.num_heads, H // cfg.num_heads)
-        cache = (jnp.zeros(kv_shape, cells.dtype), jnp.zeros(kv_shape, cells.dtype))
+        cache = (jnp.zeros(kv_shape, cfg.compute_dtype), jnp.zeros(kv_shape, cfg.compute_dtype))
 
         def run_block(prev_cells, cache_, s):
             """Step s + 1: block [cells, BOT] (s = 0) or [refeed(previous cell outputs), SEP]; returns the block's

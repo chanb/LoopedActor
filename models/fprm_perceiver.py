@@ -81,7 +81,7 @@ from models.fprm import (
     make_latent_init,
     rms_norm,
 )
-from models.fprm_cot_thinker import _core_decode, _qkv, _residual_scales, _swiglu
+from models.fprm_cot_thinker import _attn_softmax, _core_decode, _mixed_precision_input, _qkv, _residual_scales, _swiglu
 from models.fprm_thinker import tokenize
 from models.tokenizers import InputGridConv, ObsTokenizer, check_tokenizer, core_config, scaled_residual, token_grid_shape
 
@@ -124,17 +124,17 @@ def encoder_layers(params, z, x, grid_shape, cfg: FPRMConfig):
             grid = grid + params['grid_depthwise_conv']['bias']
         z = grid.reshape(B, P, H)
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z + b2 * x
+    h, a1, b1 = _mixed_precision_input(a2 * z + b2 * x, a1, b1, cfg)
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
     outs = []
     for i in range(cfg.num_layers):
         p = params[f'block_{i}']
         q, k, v = _qkv(p['self_attn'], rms_norm(h, cfg.rms_norm_eps), cfg)
-        attn = jax.nn.softmax(jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale, axis=-1)
-        out = jnp.einsum('bhqk,bkhd->bqhd', attn, v).reshape(B, P, H) @ p['self_attn']['o_proj']['kernel']
+        attn = _attn_softmax(jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale)
+        out = jnp.einsum('bhqk,bkhd->bqhd', attn, v).reshape(B, P, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
-        outs.append(h)
+        outs.append(h.astype(x.dtype))
     return outs
 
 
@@ -143,7 +143,7 @@ def latent_prefill(params, z0, latents, prefix_cache, cfg: FPRMConfig):
     Returns (outputs [B, K, H], per-layer [(k, v)] each [B, K, nh, hd]) - the latents' cache entries."""
     B, K, H = latents.shape
     a1, b1, a2, b2 = _residual_scales(params, cfg)
-    h = a2 * z0 + b2 * latents
+    h, a1, b1 = _mixed_precision_input(a2 * z0 + b2 * latents, a1, b1, cfg)
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
     cache = []
     for i in range(cfg.num_layers):
@@ -152,12 +152,12 @@ def latent_prefill(params, z0, latents, prefix_cache, cfg: FPRMConfig):
         k_pre, v_pre = prefix_cache[i]
         keys = jnp.concatenate([k_pre, k], axis=1)
         values = jnp.concatenate([v_pre, v], axis=1)
-        attn = jax.nn.softmax(jnp.einsum('bqhd,bkhd->bhqk', q, keys) * scale, axis=-1)
-        out = jnp.einsum('bhqk,bkhd->bqhd', attn, values).reshape(B, K, H) @ p['self_attn']['o_proj']['kernel']
+        attn = _attn_softmax(jnp.einsum('bqhd,bkhd->bhqk', q, keys) * scale)
+        out = jnp.einsum('bhqk,bkhd->bqhd', attn, values).reshape(B, K, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
         cache.append((k, v))
-    return h, cache
+    return h.astype(latents.dtype), cache
 
 
 class FPRMPerceiverActorValue(nn.Module):
@@ -387,8 +387,8 @@ class FPRMPerceiverActorValue(nn.Module):
         initial = jnp.broadcast_to(self.bot[None], (B, K, H))
         init_out, init_kv = latent_prefill(core_p, z0, initial, prefix_cache, cfg)
         kv_shape = (cfg.num_layers, B, S, cfg.num_heads, H // cfg.num_heads)
-        buf_k = jnp.zeros(kv_shape, cells.dtype).at[:, :, :K].set(jnp.stack([k for k, _ in init_kv]))
-        buf_v = jnp.zeros(kv_shape, cells.dtype).at[:, :, :K].set(jnp.stack([v for _, v in init_kv]))
+        buf_k = jnp.zeros(kv_shape, cfg.compute_dtype).at[:, :, :K].set(jnp.stack([k for k, _ in init_kv]))
+        buf_v = jnp.zeros(kv_shape, cfg.compute_dtype).at[:, :, :K].set(jnp.stack([v for _, v in init_kv]))
         state = update(state, init_out[:, -1], cell_latents)
 
         def body(carry, slot):
