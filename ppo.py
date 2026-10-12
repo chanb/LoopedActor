@@ -95,6 +95,8 @@ class Args:
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
+    value_expectile: float = 0.5          # value loss |tau - 1(u < 0)| u^2 with u = target - V: 0.5 = MSE (mean return),
+                                          # > 0.5 = an upper expectile of the return (optimistic V, as Stoix --expectile)
     clipping_epsilon: float = 0.3
     normalize_advantage: bool = True
     normalize_observations: bool = False  # running mean/std normalization of the observations (per input feature, so tied to the
@@ -233,6 +235,7 @@ def make_optimizer(args):
 
 def main(args: Args):
 
+    assert 0.0 < args.value_expectile < 1.0, args.value_expectile
     args.num_training_step = args.num_timesteps // (args.num_envs * args.rollout_length)
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
     args.num_training_steps_per_real_reset = args.num_training_step // max(1, args.num_reset_steps)
@@ -544,9 +547,10 @@ def main(args: Args):
             surrogate_loss2 = (jnp.clip(rho_s, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
             policy_loss = -jnp.mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
 
-            # Value function loss
+            # Value function loss: expectile regression (tau = 0.5 gives the MSE 0.25 * mean(v_error^2)).
             v_error = value_targets - baseline
-            v_loss = jnp.mean(v_error * v_error) * 0.5 * 0.5
+            v_weight = jnp.abs(args.value_expectile - (v_error < 0).astype(v_error.dtype))
+            v_loss = jnp.mean(v_weight * v_error * v_error) * 0.5
 
             # Entropy loss
             entropy = jnp.mean(policy_dist.entropy())
@@ -582,6 +586,9 @@ def main(args: Args):
             'entropy_loss': entropy_loss,
             'approx_kl': approx_kl,
             'think_iters': jnp.mean(think_iters.astype(jnp.float32)),
+            # Mean predicted value vs. mean (lambda-return) target: a growing gap shows expectile optimism.
+            'value_mean': jnp.mean(values),
+            'value_target_mean': jnp.mean(value_targets),
         }
 
     use_loss_scale = args.compute_dtype == 'float16' and args.dynamic_loss_scale

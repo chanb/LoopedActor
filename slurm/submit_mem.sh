@@ -10,6 +10,7 @@ set -euo pipefail
 #   ENVS="lightsout slidingpuzzle" slurm/submit_mem.sh
 #   SEEDS="1 2 3" slurm/submit_mem.sh
 #   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" slurm/submit_mem.sh
+#   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout slurm/submit_mem.sh
 # Optional: REPO_DIR (repo on the cluster), OUT_ROOT (experiment output root, <OUT_ROOT>/<env>/<run>/train.log),
 # LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards).
 # The cluster checkout needs LoopedActor/.venv, data/boxoban/*.npz and data/rushhour/*.npz

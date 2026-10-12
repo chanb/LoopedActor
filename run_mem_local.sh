@@ -9,6 +9,7 @@ set -uo pipefail
 #   GPUS="3 5 7" RUNS_PER_GPU=2 ./run_mem_local.sh
 #   ENVS="lightsout slidingpuzzle" SEEDS="1 2 3" ./run_mem_local.sh
 #   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" ./run_mem_local.sh
+#   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout ./run_mem_local.sh
 #   DRY_RUN=1 ./run_mem_local.sh                          # print the queue only
 #   nohup ./run_mem_local.sh > mem_local.log 2>&1 &       # keep running after logout
 # Optional: OUT_ROOT (default exp/mem_study; runs go to <OUT_ROOT>/<env>/<run>/train.log), MEM_FRACTION (GPU memory
