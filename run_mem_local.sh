@@ -1,13 +1,14 @@
 #!/bin/bash
 set -uo pipefail
 
-# Runs the fprm_mem study (slurm/mem_study.sh: iso_mem T=1, iso_mem T=4, mem T=4 on all four environments, 10 seeds)
-# on local GPUs without slurm. Runs are queued longest first (T=4 before T=1, sokoban > rushhour > lightsout >
-# slidingpuzzle) and started on the next free slot; each GPU has RUNS_PER_GPU slots.
+# Runs the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem at caps MEM_ITERS,
+# default 2 3 4, on all four environments, 10 seeds) on local GPUs without slurm. Runs are queued longest first (by the
+# estimated run time in slurm/mem_study.sh) and started on the next free slot; each GPU has RUNS_PER_GPU slots.
 #
 #   ./run_mem_local.sh                                    # all 120 runs on GPUs 0-7, one run per GPU
 #   GPUS="3 5 7" RUNS_PER_GPU=2 ./run_mem_local.sh
 #   ENVS="lightsout slidingpuzzle" SEEDS="1 2 3" ./run_mem_local.sh
+#   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" ./run_mem_local.sh
 #   DRY_RUN=1 ./run_mem_local.sh                          # print the queue only
 #   nohup ./run_mem_local.sh > mem_local.log 2>&1 &       # keep running after logout
 # Optional: OUT_ROOT (default exp/mem_study; runs go to <OUT_ROOT>/<env>/<run>/train.log), MEM_FRACTION (GPU memory
@@ -33,17 +34,18 @@ run_name() {  # run_name <env> <arm> <env vars...>: the run directory name train
   env "$@" bash -c "$(sed -n '/^set -euo/,/^GROUP=/p' "$env/scripts/train.sh"); echo \"\$RUN\"" _ "$arm" 1 2>/dev/null
 }
 
-# Queue: T=4 configs first, then T=1; within each, the envs in order (slowest first); then seeds.
+# Queue: longest estimated run first (slurm/mem_study.sh), then seeds in order.
 QUEUE=()   # "<env>|<arm>|<seed>|<env vars>"
-for pass in 4 1; do
+mapfile -t QUEUE < <(
   for env in "${ENVS[@]}"; do
     for entry in "${MEM_STUDY_CONFIGS[@]}"; do
       spec="${entry#*|}"; arm="${spec##* }"; vars="${spec% *}"
-      [[ "$vars" == *"MAX_THINK_ITERS=${pass}"* ]] || continue
-      for seed in "${SEEDS[@]}"; do QUEUE+=("${env}|${arm}|${seed}|${MEM_STUDY_COMMON} ${vars}"); done
+      h="$(mem_study_hours "$env" "$(mem_study_cap "$vars")")"
+      for seed in "${SEEDS[@]}"; do printf '%s\t%03d\t%s\n' "$h" "$seed" "${env}|${arm}|${seed}|${MEM_STUDY_COMMON} ${vars}"; done
     done
-  done
-done
+  done | sort -t$'\t' -k1,1gr -k2,2n -s | cut -f3)
+TOTAL_HOURS=$(for env in "${ENVS[@]}"; do for entry in "${MEM_STUDY_CONFIGS[@]}"; do spec="${entry#*|}"; vars="${spec% *}"
+  echo "$(mem_study_hours "$env" "$(mem_study_cap "$vars")") ${#SEEDS[@]}"; done; done | awk '{ t += $1 * $2 } END { printf "%.0f", t }')
 
 SLOTS=()     # one entry per (GPU, slot): the GPU index
 for g in "${GPUS[@]}"; do for ((k = 0; k < RUNS_PER_GPU; k++)); do SLOTS+=("$g"); done; done
@@ -51,7 +53,7 @@ declare -A SLOT_PID=() SLOT_DESC=()
 mkdir -p "$OUT_ROOT/launcher_logs"
 n_started=0; n_skipped=0; n_failed=0
 log() { echo "[$(date '+%F %T')] $*"; }
-log "${#QUEUE[@]} runs, ${#SLOTS[@]} slots (GPUs ${GPUS[*]} x ${RUNS_PER_GPU}), memory fraction ${MEM_FRACTION} per run, output ${OUT_ROOT}"
+log "${#QUEUE[@]} runs (~${TOTAL_HOURS} GPU-hours on an A4500), ${#SLOTS[@]} slots (GPUs ${GPUS[*]} x ${RUNS_PER_GPU}), memory fraction ${MEM_FRACTION} per run, output ${OUT_ROOT}"
 
 reap() {  # collect finished runs; sets FREE to a free slot index (or empty)
   FREE=""
