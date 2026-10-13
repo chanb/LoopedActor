@@ -2,18 +2,24 @@
 # compute) and mem at every cap in MEM_ITERS (policy-KL halting) on all four environments. Every run: bfloat16 + GELU
 # MLP, DISCOUNT_ACT=0.99, DISCOUNT_COMPUTE=0.999, each env's default board / episode settings.
 #   ISO_ITERS   iso_mem caps (default "1 2 3 4")
-#   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2)
+#   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2; an empty list
+#               (MEM_ITERS=) runs no mem configs, likewise ISO_ITERS=)
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
+#   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
+#               get the same tag; NUM_EPOCHS also rescales the time estimates)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=0.999"
+MEM_STUDY_TAG=""   # appended to slurm job names
+[[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
+[[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 # "<config name>|<env vars> <arm>"
 MEM_STUDY_CONFIGS=()
 for _ve in ${VALUE_EXPECTILES:-0.5}; do
   _sfx=""; [[ "$_ve" != 0.5 ]] && _sfx="_ve${_ve}"
-  for _t in ${ISO_ITERS:-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} iso_mem"); done
-  for _t in ${MEM_ITERS:-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} mem"); done
+  for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} iso_mem"); done
+  for _t in ${MEM_ITERS-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} mem"); done
 done
 unset _t _ve _sfx
 
@@ -34,8 +40,9 @@ declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
   [lightsout]=4 [slidingpuzzle]=4 [rushhour]=5 [sokoban]=8)
 
 mem_study_hours() {  # mem_study_hours <env> <cap>: estimated hours of one run alone
+  # (measured with 4 epochs; ~95% of the time is the update, which scales with NUM_EPOCHS)
   local h1 h4; read -r h1 h4 <<< "${MEM_STUDY_HOURS[$1]}"
-  awk -v a="$h1" -v b="$h4" -v t="$2" 'BEGIN { printf "%.2f", a + (b - a) * (t - 1) / 3 }'
+  awk -v a="$h1" -v b="$h4" -v t="$2" -v e="${NUM_EPOCHS:-4}" 'BEGIN { printf "%.2f", (a + (b - a) * (t - 1) / 3) * (0.05 + 0.95 * e / 4) }'
 }
 
 mem_study_cap() {  # mem_study_cap "<env vars>": the MAX_THINK_ITERS value in a config's env vars

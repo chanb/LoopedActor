@@ -11,6 +11,7 @@ set -euo pipefail
 #   SEEDS="1 2 3" slurm/submit_mem.sh
 #   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" slurm/submit_mem.sh
 #   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout slurm/submit_mem.sh
+#   TARGET_KL=0.03 ENVS=lightsout ISO_ITERS=4 MEM_ITERS= slurm/submit_mem.sh
 # Optional: REPO_DIR (repo on the cluster), OUT_ROOT (experiment output root, <OUT_ROOT>/<env>/<run>/train.log),
 # LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards).
 # The cluster checkout needs LoopedActor/.venv, data/boxoban/*.npz and data/rushhour/*.npz
@@ -65,7 +66,7 @@ for env in "${ENVS[@]}"; do
     for seed in "${SEEDS[@]}"; do
       cmds+=("XLA_PYTHON_CLIENT_MEM_FRACTION=${frac} WANDB_MODE=${WANDB_MODE} ${COMMON} ${vars} ${env}/scripts/train.sh ${arm} ${seed} ${OUT_ROOT}/${env} 0")
       if (( ${#cmds[@]} == per_gpu )) || [[ "$seed" == "${SEEDS[-1]}" ]]; then
-        job="mem-${env}-${name}-s$(echo "${cmds[@]}" | grep -o "${arm} [0-9]* " | awk '{print $2}' | paste -sd_)"
+        job="mem-${env}-${name}${MEM_STUDY_TAG}-s$(echo "${cmds[@]}" | grep -o "${arm} [0-9]* " | awk '{print $2}' | paste -sd_)"
         CMDS_B64="$(printf '%s\n' "${cmds[@]}" | base64 -w0)"
         sbatch_cmd=(sbatch --export=ALL,REPO_DIR="${REPO_DIR}",CMDS_B64="${CMDS_B64}" --job-name="${job}"
                     --time="${time}" --mem="${host_mem}" --cpus-per-task=$(( ${#cmds[@]} + 1 ))
