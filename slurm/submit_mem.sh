@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/run_pack.sh"
 source "${SCRIPT_DIR}/mem_study.sh"
-REPO_DIR="${REPO_DIR:-/home/chanb/research/iclr_2027/LoopedActor}"
+REPO_DIR="${REPO_DIR:-/home/chanb/scratch/code/LoopedActor}"
 LOG_DIR="${LOG_DIR:-/home/chanb/scratch/logs/looped_actor}"
 OUT_ROOT="${OUT_ROOT:-/home/chanb/scratch/looped_actor/exp}"
 WANDB_MODE="${WANDB_MODE:-offline}"
