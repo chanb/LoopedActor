@@ -1,6 +1,6 @@
 # The fprm_mem study, sourced by slurm/submit_mem.sh and run_mem_local.sh: iso_mem at every cap in ISO_ITERS (fixed
 # compute) and mem at every cap in MEM_ITERS (policy-KL halting) on all four environments. Every run: bfloat16 + GELU
-# MLP, DISCOUNT_ACT=0.99, DISCOUNT_COMPUTE=0.999, each env's default board / episode settings.
+# MLP, DISCOUNT_ACT=0.99, DISCOUNT_COMPUTE=0.999 (unless set), each env's default board / episode settings.
 #   ISO_ITERS   iso_mem caps (default "1 2 3 4")
 #   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2; an empty list
 #               (MEM_ITERS=) runs no mem configs, likewise ISO_ITERS=)
@@ -8,10 +8,13 @@
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
 #               get the same tag; NUM_EPOCHS also rescales the time estimates)
+#   DISCOUNT_COMPUTE  per-extra-think-iteration discount (default 0.999; train.sh adds _gc<g> to the run name when
+#               != 1.0; slurm job names get _gc<g> when set)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
-MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=0.999"
+MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=${DISCOUNT_COMPUTE:-0.999}"
 MEM_STUDY_TAG=""   # appended to slurm job names
+[[ -n "${DISCOUNT_COMPUTE:-}" ]] && MEM_STUDY_TAG+="_gc${DISCOUNT_COMPUTE}"
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 # "<config name>|<env vars> <arm>"
