@@ -178,6 +178,7 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
 RUN+="_s${SEED}"
+[[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.
 HPARAM_FLAGS=(--env_id="lightsout-${GRID}" --lightsout_episode_length="$EPISODE_LENGTH" --lightsout_eval_episode_length="$EVAL_EPISODE_LENGTH"
   --lightsout_difficulty_threshold="$DIFFICULTY_THRESHOLD"
