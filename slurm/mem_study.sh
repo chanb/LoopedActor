@@ -33,7 +33,7 @@ unset _t _ve _sfx
 # mem and iso_mem at the same cap cost the same (halting freezes examples but does not skip compute); the cost of a cap
 # T is interpolated linearly through the T=1 and T=4 measurements (each think iteration is one more core call).
 declare -A MEM_STUDY_HOURS=(  # "<hours at T=1> <hours at T=4>"
-  [lightsout]="0.7 2.9" [slidingpuzzle]="0.6 2.2" [rushhour]="1.9 7.9" [sokoban]="3.7 15.6")
+  [lightsout]="0.3 1.0" [slidingpuzzle]="0.6 2.2" [rushhour]="1.9 7.9" [sokoban]="3.7 15.6")
 declare -A MEM_STUDY_GPU_FRACTION=(  # XLA memory fraction per run on a ~45GiB L40S: >= 2x the measured peak, room for T > 4
   [lightsout]=0.08 [slidingpuzzle]=0.08 [rushhour]=0.10 [sokoban]=0.15)
 declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)

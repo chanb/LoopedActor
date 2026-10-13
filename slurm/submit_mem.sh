@@ -12,7 +12,7 @@ set -euo pipefail
 #   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" slurm/submit_mem.sh
 #   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout slurm/submit_mem.sh
 #   TARGET_KL=0.03 ENVS=lightsout ISO_ITERS=4 MEM_ITERS= slurm/submit_mem.sh
-#   CONCURRENCY=3 MAX_JOB_HOURS=48 slurm/submit_mem.sh   # longer jobs, 3 runs at a time, the next starting as one ends
+#   MAX_RUNS_PER_GPU=3 MAX_JOB_HOURS=48 slurm/submit_mem.sh   # longer jobs, 3 runs at a time, the next starting as one ends
 # Optional: REPO_DIR (repo on the cluster), OUT_ROOT (experiment output root, <OUT_ROOT>/<env>/<run>/train.log),
 # LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards).
 # The cluster checkout needs LoopedActor/.venv, data/boxoban/*.npz and data/rushhour/*.npz
@@ -31,27 +31,24 @@ read -r -a SEEDS <<< "${SEEDS:-$MEM_STUDY_SEEDS}"
 COMMON="$MEM_STUDY_COMMON"
 CONFIGS=("${MEM_STUDY_CONFIGS[@]}")   # experiment definitions: slurm/mem_study.sh
 
-# Packing, from the measured costs in slurm/mem_study.sh. GPU memory is never the constraint (every config peaks at
-# <= 3 GiB), so the runs per GPU are set by the time limit: packed runs share the GPU, so a job takes about
-# <runs per GPU> x <single-run hours>; the limit leaves SAFETY headroom over that. ppo.py cannot resume, so a run that
-# hits the limit is lost.
-MAX_JOB_HOURS="${MAX_JOB_HOURS:-24}"        # cluster time limit per job
-SAFETY="${SAFETY:-1.3}"                     # job time limit = SAFETY x estimated time
-MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-10}"     # runs per job
-CONCURRENCY="${CONCURRENCY:-0}"             # runs executing at once within a job (0 = all); the others wait for a free
-                                            # slot. Runs share the GPU either way, so a job's estimated time is the same;
-                                            # but at the time limit only the runs still in flight are lost, and the job
-                                            # requests CPUs / RAM for CONCURRENCY runs only.
-[[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || { echo "CONCURRENCY must be a non-negative integer, got $CONCURRENCY"; exit 1; }
-pack() {  # pack <env> <cap>: "<runs per GPU> <XLA memory fraction per run> <time limit> <host RAM per job>"
+# Packing, from the measured costs in slurm/mem_study.sh:
+#   MAX_RUNS_PER_GPU  runs executing on a job's GPU at once (default 10; lowered per env so their memory fractions add
+#                     up to <= 0.9). A job's further runs wait and start as running ones finish.
+#   MAX_JOB_HOURS     cluster time limit per job (default 24); SAFETY (default 1.3) = headroom over the estimate.
+# Runs on one GPU share it, so a job takes about <runs in the job> x <single-run hours> however many run at once; the
+# number of runs per job is the most whose estimate x SAFETY fits in MAX_JOB_HOURS. ppo.py cannot resume, so a run still
+# going at the time limit is lost (runs that already finished are kept).
+MAX_JOB_HOURS="${MAX_JOB_HOURS:-24}"
+SAFETY="${SAFETY:-1.3}"
+MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-${CONCURRENCY:-10}}"   # CONCURRENCY: older name, same meaning
+[[ "$MAX_RUNS_PER_GPU" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_RUNS_PER_GPU must be a positive integer, got $MAX_RUNS_PER_GPU"; exit 1; }
+concurrency() {  # concurrency <env>: runs at once on one GPU (MAX_RUNS_PER_GPU, capped by memory)
+  awk -v c="$MAX_RUNS_PER_GPU" -v f="${MEM_STUDY_GPU_FRACTION[$1]}" 'BEGIN { k = int(0.9 / f + 1e-9); print (c < k ? c : k) }'
+}
+pack() {  # pack <env> <cap>: "<runs per job> <XLA memory fraction per run> <time limit>"
   local env=$1 h n minutes
   h="$(mem_study_hours "$env" "$2")"
-  n=$(awk -v m="$MAX_JOB_HOURS" -v s="$SAFETY" -v h="$h" -v c="$MAX_RUNS_PER_GPU" \
-        'BEGIN { n = int(m * 60 / (s * h * 60 + 1)); if (n < 1) n = 1; if (n > c) n = c; print n }')
-  # memory: the fractions of the runs on one GPU at once add up to at most 0.9
-  if (( CONCURRENCY == 0 )); then
-    n=$(awk -v n="$n" -v f="${MEM_STUDY_GPU_FRACTION[$env]}" 'BEGIN { k = int(0.9 / f + 1e-9); print (n < k ? n : k) }')
-  fi
+  n=$(awk -v m="$MAX_JOB_HOURS" -v s="$SAFETY" -v h="$h" 'BEGIN { n = int(m * 60 / (s * h * 60 + 1)); print (n < 1 ? 1 : n) }')
   # balance: split the seeds into the fewest jobs of at most n runs, as evenly as possible
   local jobs=$(( (${#SEEDS[@]} + n - 1) / n )); n=$(( (${#SEEDS[@]} + jobs - 1) / jobs ))
   minutes=$(awk -v n="$n" -v s="$SAFETY" -v h="$h" -v m="$MAX_JOB_HOURS" \
@@ -61,10 +58,6 @@ pack() {  # pack <env> <cap>: "<runs per GPU> <XLA memory fraction per run> <tim
   fi
   printf '%s %s %02d:%02d:00\n' "$n" "${MEM_STUDY_GPU_FRACTION[$env]}" $(( minutes / 60 )) $(( minutes % 60 ))
 }
-(( CONCURRENCY == 0 )) || for env in ${ENVS:-$MEM_STUDY_ENVS}; do   # CONCURRENCY runs must fit in GPU memory
-  awk -v c="$CONCURRENCY" -v f="${MEM_STUDY_GPU_FRACTION[$env]}" 'BEGIN { exit !(c * f <= 0.9 + 1e-9) }' \
-    || { echo "CONCURRENCY=${CONCURRENCY} x memory fraction ${MEM_STUDY_GPU_FRACTION[$env]} (${env}) exceeds 0.9 of the GPU" >&2; exit 1; }
-done
 
 [[ "$DRY_RUN" == 1 ]] || mkdir -p "${LOG_DIR}"
 n_jobs=0
@@ -79,9 +72,9 @@ for env in "${ENVS[@]}"; do
       if (( ${#cmds[@]} == per_gpu )) || [[ "$seed" == "${SEEDS[-1]}" ]]; then
         job="mem-${env}-${name}${MEM_STUDY_TAG}-s$(echo "${cmds[@]}" | grep -o "${arm} [0-9]* " | awk '{print $2}' | paste -sd_)"
         CMDS_B64="$(printf '%s\n' "${cmds[@]}" | base64 -w0)"
-        running=${#cmds[@]}; (( CONCURRENCY > 0 && CONCURRENCY < running )) && running=$CONCURRENCY
+        running=$(concurrency "$env"); (( running > ${#cmds[@]} )) && running=${#cmds[@]}
         host_mem="$(( running * MEM_STUDY_HOST_GB[$env] + 2 ))G"
-        sbatch_cmd=(sbatch --export=ALL,REPO_DIR="${REPO_DIR}",CMDS_B64="${CMDS_B64}",CONCURRENCY="${CONCURRENCY}" --job-name="${job}"
+        sbatch_cmd=(sbatch --export=ALL,REPO_DIR="${REPO_DIR}",CMDS_B64="${CMDS_B64}",CONCURRENCY="${running}" --job-name="${job}"
                     --time="${time}" --mem="${host_mem}" --cpus-per-task=$(( running + 1 ))
                     --output="${LOG_DIR}/%x_%j.out" "${RUN_SCRIPT}")
         if [[ "$DRY_RUN" == 1 ]]; then
