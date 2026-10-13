@@ -18,7 +18,7 @@ export CUDA_MPS_PIPE_DIRECTORY=$SLURM_TMPDIR/tmp
 export CUDA_MPS_LOG_DIRECTORY=$SLURM_TMPDIR/tmp
 nvidia-cuda-mps-control -d
 
-cd "${REPO_DIR:-/home/chanb/research/iclr_2027/LoopedActor}"
+cd "${REPO_DIR:-/home/chanb/scratch/code/LoopedActor}"
 
 echo "hostname: $(hostname)"
 echo "starting at: $(date)"
