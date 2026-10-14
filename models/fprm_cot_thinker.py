@@ -206,7 +206,8 @@ class FPRMCoTThinkerActorValue(nn.Module):
     config: FPRMConfig = FPRMConfig()
     max_think_iters: int = 8
     min_think_iters: int = 2
-    # Stop thinking once KL(pi_i || pi_{i-1}) between consecutive readouts drops below this (0 = always max_think_iters).
+    # Stop thinking once KL(pi_i || pi_{i-1}) between consecutive readouts is <= this (0 = only at a fixed point,
+    # < 0 = always max_think_iters).
     halt_kl: float = 1e-3
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
@@ -342,7 +343,9 @@ class FPRMCoTThinkerActorValue(nn.Module):
             nonfinite = st.nonfinite | ~finite
 
             # Stop priority: nonfinite > converged > iteration_cap.
-            converged = (iterations >= self.min_think_iters) & (kl < self.halt_kl)
+            # KL <= halt_kl halts: halt_kl = 0 halts only at a fixed point (consecutive policies equal up to rounding);
+            # halt_kl < 0 never halts.
+            converged = (iterations >= self.min_think_iters) & (kl <= self.halt_kl) & (self.halt_kl >= 0)
             capped = iterations >= self.max_think_iters
             should_stop = nonfinite | converged | capped
             reason = jnp.full_like(st.stop_reason, STOP_ACTIVE)

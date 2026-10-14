@@ -24,6 +24,10 @@ other thinkers (KL(pi_i || pi_{i-1}) < `halt_kl` once i >= `min_think_iters`, or
 previous policy), with halted examples frozen inside the differentiable scan; the final readout and the 'fp_*'
 diagnostics are sown as by the other thinkers, so it is interchangeable in the PPO loss.
 
+`value_at_max_iters`: halting only fixes the policy readout (logits of the halt pass); the cells and thoughts of a
+halted example keep evolving for all max_think_iters passes (up to its halt pass the trajectory is the one above), and
+the value is read out from the last pass. The scan runs every pass for every example either way, so this costs nothing.
+
 Cost per pass: one core call over P + 1 tokens plus the memory keys - about one fprm iteration. Each pass is
 rematerialized in the backward pass (`remat`). Supports the observation tokenizers of models/tokenizers.py; no
 parameter shape depends on m, n or the iteration cap.
@@ -58,6 +62,7 @@ class MemState:
     token: jax.Array  # [B, H] newest thought output, fed back as the next thought
     logits: jax.Array  # [B, A] readout of the last executed pass
     value: jax.Array  # [B]
+    value_last: jax.Array  # [B] value readout of the newest pass (not frozen at halting; value_at_max_iters)
     residual: jax.Array  # [B] float32, policy KL at the last executed pass
     iterations: jax.Array  # [B] int32, executed passes
     active: jax.Array  # [B] bool
@@ -110,7 +115,8 @@ class FPRMMemActorValue(nn.Module):
     config: FPRMConfig = FPRMConfig()
     max_think_iters: int = 8
     min_think_iters: int = 2
-    # Stop thinking once KL(pi_i || pi_{i-1}) between consecutive readouts drops below this (0 = always max_think_iters).
+    # Stop thinking once KL(pi_i || pi_{i-1}) between consecutive readouts is <= this (0 = only at a fixed point,
+    # < 0 = always max_think_iters).
     halt_kl: float = 1e-3
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
@@ -118,6 +124,7 @@ class FPRMMemActorValue(nn.Module):
     action_head: str = 'per_cell'  # see FPRMThinkerActorValue
     remat: bool = True             # rematerialize each pass in the backward pass
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
+    value_at_max_iters: bool = False  # value from the last (max_think_iters-th) pass's latent instead of the halt pass's
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
 
@@ -203,7 +210,9 @@ class FPRMMemActorValue(nn.Module):
             nonfinite = st.nonfinite | ~finite
 
             # Stop priority: nonfinite > converged > iteration_cap.
-            converged = (iterations >= self.min_think_iters) & (kl < self.halt_kl)
+            # KL <= halt_kl halts: halt_kl = 0 halts only at a fixed point (consecutive policies equal up to rounding);
+            # halt_kl < 0 never halts.
+            converged = (iterations >= self.min_think_iters) & (kl <= self.halt_kl) & (self.halt_kl >= 0)
             capped = iterations >= self.max_think_iters
             should_stop = nonfinite | converged | capped
             reason = jnp.full_like(st.stop_reason, STOP_ACTIVE)
@@ -216,6 +225,7 @@ class FPRMMemActorValue(nn.Module):
                 token=jnp.where(finite[:, None], out, st.token),
                 logits=jnp.where(finite[:, None], logits, st.logits),
                 value=jnp.where(finite, value, st.value),
+                value_last=jnp.where(finite, value, st.value_last),
                 residual=kl,
                 iterations=iterations,
                 active=~should_stop,
@@ -228,13 +238,18 @@ class FPRMMemActorValue(nn.Module):
                 mask = st.active.reshape((-1,) + (1,) * (new.ndim - 1))
                 return jnp.where(mask, new, old)
 
-            return jax.tree_util.tree_map(sel, stepped, st)
+            new_st = jax.tree_util.tree_map(sel, stepped, st)
+            if self.value_at_max_iters:
+                # Halting fixes only the policy readout: the trajectory (cells, thought) and the value keep going.
+                new_st = new_st.replace(z=stepped.z, token=stepped.token, value_last=stepped.value_last)
+            return new_st
 
         state = MemState(
             z=jnp.broadcast_to(z0[None, None], cells.shape),  # cell latents start at latent_init, as in fprm
             token=jnp.zeros((B, H), cells.dtype),
             logits=jnp.zeros((B, self.output_dim_1), cells.dtype),
             value=jnp.zeros((B,), cells.dtype),
+            value_last=jnp.zeros((B,), cells.dtype),
             residual=jnp.full((B,), jnp.inf, jnp.float32),
             iterations=jnp.zeros((B,), jnp.int32),
             active=jnp.ones((B,), bool),
@@ -267,7 +282,7 @@ class FPRMMemActorValue(nn.Module):
         (state, _), _ = jax.lax.scan(body, (state, memory), jnp.arange(T))
 
         logits = state.logits.reshape(input_shape[:-1] + (-1,))
-        value = state.value.reshape(input_shape[:-1])
+        value = (state.value_last if self.value_at_max_iters else state.value).reshape(input_shape[:-1])
         self.sow('intermediates', 'logits', logits)
         self.sow('intermediates', 'value', value)
 

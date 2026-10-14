@@ -12,6 +12,8 @@
 #               get the same tag; NUM_EPOCHS also rescales the time estimates)
 #   DISCOUNT_COMPUTE  per-extra-think-iteration discount (default 0.999; train.sh adds _gc<g> to the run name when
 #               != 1.0; slurm job names get _gc<g> when set)
+#   VALUE_AT_MAX_ITERS=1  value from the MAX_THINK_ITERS-th pass's latent (train.sh adds _vT to the run name; slurm job
+#               names get _vT; mem / iso_mem only)
 #   HALT_KL     mem configs' policy-KL halting threshold (default 1e-3; train.sh adds _hkl<k> to mem run names when
 #               != 1e-3; slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
@@ -22,6 +24,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
+[[ "${VALUE_AT_MAX_ITERS:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" VALUE_AT_MAX_ITERS=1"; MEM_STUDY_TAG+="_vT"; }
 # "<config name>|<env vars> <arm>"
 MEM_STUDY_CONFIGS=()
 for _ve in ${VALUE_EXPECTILES:-0.5}; do

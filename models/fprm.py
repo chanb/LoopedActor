@@ -457,9 +457,10 @@ def _classify_stop(state: FPSolverState, config: FPRMConfig, min_iters,
                    max_iters):
     """Stop condition + reason, with the priority
     nonfinite > converged > iteration_cap."""
+    # residual <= fp_thresh converges: fp_thresh = 0 only at a fixed point (up to rounding); fp_thresh < 0 never.
     converged = (state.iterations >= min_iters) & (
-        state.residual < config.fp_thresh
-    )
+        state.residual <= config.fp_thresh
+    ) & (config.fp_thresh >= 0)
     capped = state.iterations >= max_iters
 
     reason = jnp.full_like(state.stop_reason, STOP_ACTIVE)

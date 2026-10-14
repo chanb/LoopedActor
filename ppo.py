@@ -95,6 +95,8 @@ class Args:
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
+    value_at_max_iters: bool = False      # fprm_mem: the value is read out from the max_think_iters-th pass's latent (halting
+                                          # fixes only the policy readout; the latent keeps evolving), not from the halt pass
     value_expectile: float = 0.5          # value loss |tau - 1(u < 0)| u^2 with u = target - V: 0.5 = MSE (mean return),
                                           # > 0.5 = an upper expectile of the return (optimistic V, as Stoix --expectile)
     clipping_epsilon: float = 0.3
@@ -138,7 +140,8 @@ class Args:
     max_think_iters: int = 8              # cap on core calls ("think iterations") per decision
     min_think_iters: int = 2              # halting is checked only after this many iterations
     halt_criterion: str = 'kl'            # 'kl' (policy-KL halting) | 'latent_residual' (original FPRM-paper rule: latent max-token residual)
-    halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts < this
+    halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts <= this
+                                          # (0 = only at a fixed point, < 0 = never: the iso_* arms pass -1)
     halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh;
                                           # fprm_rim: relative change of the SEP latent between steps)
     perceiver_step_grid_conv: bool = False  # fprm_perceiver: apply a residual depthwise 3x3 conv to the cells at every thinking step
@@ -236,6 +239,7 @@ def make_optimizer(args):
 def main(args: Args):
 
     assert 0.0 < args.value_expectile < 1.0, args.value_expectile
+    assert not args.value_at_max_iters or args.architecture == 'fprm_mem', '--value_at_max_iters is implemented for fprm_mem only'
     args.num_training_step = args.num_timesteps // (args.num_envs * args.rollout_length)
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
     args.num_training_steps_per_real_reset = args.num_training_step // max(1, args.num_reset_steps)
@@ -368,6 +372,7 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
+            value_at_max_iters=args.value_at_max_iters,
         )
     elif args.architecture == 'fprm_rim':
         assert args.tokenizer == 'cell', "fprm_rim needs tokenizer='cell'"

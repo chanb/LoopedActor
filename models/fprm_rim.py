@@ -98,7 +98,7 @@ def select_halting(logits, values, residuals, min_iters, max_iters, thresh):
         it_new = it + 1
         finite = jnp.all(jnp.isfinite(lg), -1) & jnp.isfinite(v) & ~jnp.isnan(res)
         nonfinite_new = nonfinite | ~finite
-        converged = (it_new >= min_iters) & (res < thresh)
+        converged = (it_new >= min_iters) & (res <= thresh) & (thresh >= 0)  # 0: only at a fixed point; < 0: never
         capped = it_new >= max_iters
         stop = nonfinite_new | converged | capped
         r = jnp.full_like(reason, STOP_ACTIVE)
@@ -127,8 +127,8 @@ class FPRMRiMActorValue(nn.Module):
     max_think_iters: int = 8
     min_think_iters: int = 2
     halt_criterion: str = 'latent'      # 'latent' (SEP latent converged) | 'kl' (policy KL)
-    halt_residual_thresh: float = 0.1   # 'latent': ||sep_s - sep_{s-1}|| / ||sep_s|| below this halts (<0 = never; 0 can still halt on fp rounding)
-    halt_kl: float = 1e-3               # 'kl': KL(pi_s || pi_{s-1}) below this halts (<0 = never; 0 can still halt on fp rounding)
+    halt_residual_thresh: float = 0.1   # 'latent': ||sep_s - sep_{s-1}|| / ||sep_s|| below this halts (0 = only at a fixed point, < 0 = never)
+    halt_kl: float = 1e-3               # 'kl': KL(pi_s || pi_{s-1}) at or below this halts (0 = only at a fixed point, < 0 = never)
     output_dim_1: int = 9
     output_dim_2: int = 1
     obs_channels: int = 0

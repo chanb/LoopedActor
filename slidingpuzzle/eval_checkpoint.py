@@ -99,7 +99,8 @@ def main():
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
     ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim', 'multi_block', 'single_block'])
     ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
-    ap.add_argument('--halt_kl', type=float, default=1e-3)
+    ap.add_argument('--halt_kl', type=float, default=1e-3,
+                    help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
     ap.add_argument('--rim_halt', default='latent', choices=['latent', 'kl'], help='fprm_rim: halting rule (latent = SEP convergence)')
     ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent: the checkpoint\'s threshold')
     ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
