@@ -4,17 +4,22 @@
 #   ISO_ITERS   iso_mem caps (default "1 2 3 4")
 #   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2; an empty list
 #               (MEM_ITERS=) runs no mem configs, likewise ISO_ITERS=)
+#   ISO_RIM_ITERS, RIM_ITERS  iso_rim / rim caps (default empty = none; e.g. ISO_RIM_ITERS="1 2" ISO_ITERS= MEM_ITERS= runs
+#               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
 #               get the same tag; NUM_EPOCHS also rescales the time estimates)
 #   DISCOUNT_COMPUTE  per-extra-think-iteration discount (default 0.999; train.sh adds _gc<g> to the run name when
 #               != 1.0; slurm job names get _gc<g> when set)
+#   HALT_KL     mem configs' policy-KL halting threshold (default 1e-3; train.sh adds _hkl<k> to mem run names when
+#               != 1e-3; slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99 DISCOUNT_COMPUTE=${DISCOUNT_COMPUTE:-0.999}"
 MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${DISCOUNT_COMPUTE:-}" ]] && MEM_STUDY_TAG+="_gc${DISCOUNT_COMPUTE}"
+[[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 # "<config name>|<env vars> <arm>"
@@ -23,6 +28,8 @@ for _ve in ${VALUE_EXPECTILES:-0.5}; do
   _sfx=""; [[ "$_ve" != 0.5 ]] && _sfx="_ve${_ve}"
   for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} iso_mem"); done
   for _t in ${MEM_ITERS-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} mem"); done
+  for _t in ${ISO_RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("iso_rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} iso_rim"); done
+  for _t in ${RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} rim"); done
 done
 unset _t _ve _sfx
 
