@@ -41,6 +41,7 @@ from models.fprm_thinker import FPRMThinkerActorValue
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue
 from models.fprm_perceiver import FPRMPerceiverActorValue
 from models.fprm_mem import FPRMMemActorValue
+from models.fprm_mem_halt import FPRMMemHaltActorValue
 from models.fprm_rim import FPRMRiMActorValue
 from models.transformer_baseline import TransformerActorValue
 
@@ -113,6 +114,8 @@ class Args:
     # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
     # 'fprm_perceiver' — Perceiver AR-style latent CoT: latents (from <BOT>) attend to the cell tokens + earlier latents at every layer
     # 'fprm_mem'       — fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other; readout from the newest thought)
+    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i) (learned alpha, beta);
+    #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_kl only initializes beta
     # 'fprm_rim'       — RiM-style: each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts when the
     #                    SEP latent converges (--halt_criterion latent_residual) or by policy KL (kl)
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
@@ -151,6 +154,9 @@ class Args:
                                             # iteration's layer-l output)
     input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
     input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
+    halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
+    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
+    halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -188,17 +194,26 @@ def load_params(path):
         return pickle.loads(fin.read())
 
 
-def make_inference_fn(actor_critic_network):
-    """Creates params and inference function for the PPO agent."""
+def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
+    """Creates params and inference function for the PPO agent.
+
+    stochastic_halt: the network samples its think time c (fprm_mem_halt); the stored log_prob is the joint
+    log p(c|s) + log pi_c(a|s), and compute_time = c is replayed in the loss. Deterministic: c = argmax p(c|s).
+    """
     def make_policy(params, deterministic: bool = False):
 
         def policy(observations, goals, key_sample):
             inputs = jnp.concatenate([observations, goals], axis=-1)
+            halt_kw = {}
+            if stochastic_halt and not deterministic:
+                key_sample, key_halt = jax.random.split(key_sample)
+                halt_kw = {'halt_key': key_halt}
             (policy_dist, value), inter = actor_critic_network.apply(
                 params['policy'],
                 inputs,
                 params['normalizer'],
                 mutable=['intermediates'],
+                **halt_kw,
             )
             # Compute time of this decision = number of think iterations (core calls).
             compute_time = inter['intermediates']['fp_iterations'][0]
@@ -208,6 +223,8 @@ def make_inference_fn(actor_critic_network):
 
             actions = policy_dist.sample(seed=key_sample)
             log_prob = policy_dist.log_prob(actions)
+            if stochastic_halt:
+                log_prob = log_prob + inter['intermediates']['halt_log_prob'][0]
             return actions, {
                 'log_prob': log_prob,
                 'value': value,
@@ -374,6 +391,24 @@ def main(args: Args):
             thought_norm=args.cot_thought_norm,
             value_at_max_iters=args.value_at_max_iters,
         )
+    elif args.architecture == 'fprm_mem_halt':
+        assert args.halt_criterion == 'kl', "fprm_mem_halt supports only halt_criterion='kl'"
+        actor_critic_network = FPRMMemHaltActorValue(
+            m=env.m,
+            n=env.n,
+            config=fprm_config,
+            max_think_iters=args.max_think_iters,
+            min_think_iters=args.min_think_iters,
+            halt_kl=args.halt_kl,
+            halt_beta_head=args.halt_beta_head,
+            halt_head_grad=args.halt_head_grad,
+            output_dim_1=action_size,
+            obs_channels=obs_channels,
+            action_head=action_head,
+            tokenizer=args.tokenizer,
+            tokenizer_conv_features=args.tokenizer_conv_features,
+            thought_norm=args.cot_thought_norm,
+        )
     elif args.architecture == 'fprm_rim':
         assert args.tokenizer == 'cell', "fprm_rim needs tokenizer='cell'"
         actor_critic_network = FPRMRiMActorValue(
@@ -413,7 +448,8 @@ def main(args: Args):
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
     )
-    make_policy = make_inference_fn(actor_critic_network)
+    stochastic_halt = args.architecture == 'fprm_mem_halt'
+    make_policy = make_inference_fn(actor_critic_network, stochastic_halt)
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
 
@@ -544,9 +580,9 @@ def main(args: Args):
 
         behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
 
-        def ppo_terms(policy_dist, baseline):
-            # Policy function loss
-            target_action_log_probs = policy_dist.log_prob(data.action)
+        def ppo_terms(policy_dist, baseline, halt_log_prob=0.0):
+            # Policy function loss (stochastic halting: joint log p(c|s) + log pi_c(a|s))
+            target_action_log_probs = policy_dist.log_prob(data.action) + halt_log_prob
             rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
             surrogate_loss1 = rho_s * advantages
             surrogate_loss2 = (jnp.clip(rho_s, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
@@ -570,21 +606,40 @@ def main(args: Args):
 
         # PPO loss on the final actor / value readout. Halted examples freeze
         # inside the network, so their readout is the one they halted at.
+        # Stochastic halting: replay the rollout's think time c.
+        halt_kw = {'halt_steps': data.extras['policy_extras']['compute_time']} if stochastic_halt else {}
         _, inter = actor_critic_network.apply(
             params, data.observation, normalizer_params,
             mutable=['intermediates'],
+            **halt_kw,
         )
         logits = inter['intermediates']['logits'][0]
         values = inter['intermediates']['value'][0]
+        halt_metrics = {}
+        if stochastic_halt:
+            halt_log_prob = inter['intermediates']['halt_log_prob'][0]
+            halt_entropy = jnp.mean(inter['intermediates']['halt_entropy'][0])
+            halt_metrics = {
+                'halt_entropy': halt_entropy,
+                'halt_alpha': inter['intermediates']['halt_alpha'][0],
+                'halt_beta': jnp.mean(inter['intermediates']['halt_beta_t'][0]),
+            }
+            # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
+            mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
+            halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
+        else:
+            halt_log_prob, halt_entropy = 0.0, 0.0
         policy_loss, v_loss, entropy_loss, approx_kl = ppo_terms(
-            distrax.Categorical(logits=logits), values
+            distrax.Categorical(logits=logits), values, halt_log_prob
         )
+        entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
 
         think_iters = inter['intermediates']['fp_iterations'][0]
 
         total_loss = policy_loss + v_loss + entropy_loss
 
         return total_loss, {
+            **halt_metrics,
             'total_loss': total_loss,
             'policy_loss': policy_loss,
             'v_loss': v_loss,
