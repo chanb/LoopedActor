@@ -157,6 +157,10 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_update: str = 'joint'            # fprm_mem_halt policy update: 'joint' = PPO ratio of the sampled (c, a), log p(c|s) + log pi_c(a|s);
+                                          # 'all_c' = every think time c from the one sampled action, using Q(s, c, a) = g_c^(c-1) Q_env(s, a)
+                                          # (see compute_ppo_loss)
+    halt_explore: float = 0.0             # fprm_mem_halt, halt_update='all_c': rollouts sample c from (1 - this) p(c|s) + this * Uniform
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -194,11 +198,13 @@ def load_params(path):
         return pickle.loads(fin.read())
 
 
-def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
+def make_inference_fn(actor_critic_network, stochastic_halt: bool = False, halt_all_c: bool = False):
     """Creates params and inference function for the PPO agent.
 
     stochastic_halt: the network samples its think time c (fprm_mem_halt); the stored log_prob is the joint
     log p(c|s) + log pi_c(a|s), and compute_time = c is replayed in the loss. Deterministic: c = argmax p(c|s).
+    halt_all_c: also store, for every think time c, log p(c|s) and log pi_c(a|s) of the sampled action, and the
+    behaviour marginal log pi_bar(a|s) = log sum_c mu(c|s) pi_c(a|s) (c is sampled from mu, see halt_explore).
     """
     def make_policy(params, deterministic: bool = False):
 
@@ -225,11 +231,21 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
             log_prob = policy_dist.log_prob(actions)
             if stochastic_halt:
                 log_prob = log_prob + inter['intermediates']['halt_log_prob'][0]
-            return actions, {
+            extras = {
                 'log_prob': log_prob,
                 'value': value,
                 'compute_time': compute_time,
             }
+            if halt_all_c:
+                I = inter['intermediates']
+                log_pa = jnp.take_along_axis(
+                    jax.nn.log_softmax(I['logits_all'][0], axis=-1), actions[..., None, None], axis=-1)[..., 0]  # [B, T]
+                extras.update({
+                    'halt_old_log_pc': I['halt_log_probs'][0],
+                    'halt_old_log_pa': log_pa,
+                    'halt_log_mu_a': jax.nn.logsumexp(I['halt_behaviour_log_probs'][0] + log_pa, axis=-1),
+                })
+            return actions, extras
 
         return policy
     return make_policy
@@ -402,6 +418,7 @@ def main(args: Args):
             halt_kl=args.halt_kl,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
+            halt_explore=args.halt_explore,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -449,7 +466,11 @@ def main(args: Args):
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
     )
     stochastic_halt = args.architecture == 'fprm_mem_halt'
-    make_policy = make_inference_fn(actor_critic_network, stochastic_halt)
+    assert args.halt_update in ('joint', 'all_c'), args.halt_update
+    halt_all_c = stochastic_halt and args.halt_update == 'all_c'
+    # 'joint' stores the target's log p(c|s) as the behaviour probability, so c must be sampled from p itself.
+    assert halt_all_c or args.halt_explore == 0.0, '--halt_explore needs --architecture=fprm_mem_halt --halt_update=all_c'
+    make_policy = make_inference_fn(actor_critic_network, stochastic_halt, halt_all_c)
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
 
@@ -604,6 +625,39 @@ def main(args: Args):
             )
             return policy_loss, v_loss, entropy_loss, approx_kl
 
+        def all_c_terms(I):
+            """halt_update='all_c': the policy loss over every think time c from the one sampled action a.
+
+            Since Q(s, c, a) = g_c^(c-1) Q_env(s, a), `advantages` holds A_c = g_c^(c-1) Q_env(s, a) - V(s) for every c
+            ([B, T], see learn_step). With the behaviour marginal pi_bar(a|s) = sum_c mu(c|s) pi_old,c(a|s),
+              loss = -sum_c w_c min(r_c A_c, clip(r_c) A_c),  w_c = p_old(c|s) pi_old,c(a|s) / pi_bar(a|s),
+              r_c = p(c|s) pi_c(a|s) / (p_old(c|s) pi_old,c(a|s)),
+            the PPO version of the unbiased estimator sum_c grad(p(c|s) pi_c(a|s)) / pi_bar(a|s) A_c. Think times
+            that cannot halt (p forced to 0) get no weight. Returns (policy_loss, entropy, approx_kl, metrics).
+            """
+            ex = data.extras['policy_extras']
+            old_lpc, old_lpa, log_mu_a = ex['halt_old_log_pc'], ex['halt_old_log_pa'], ex['halt_log_mu_a']
+            log_pi_all = jax.nn.log_softmax(I['logits_all'][0], axis=-1)  # [B, T, A]
+            lpa = jnp.take_along_axis(log_pi_all, data.action[:, None, None].astype(jnp.int32), axis=-1)[..., 0]
+            lpc = I['halt_log_probs'][0]
+            valid = old_lpc > -1e8  # forced-zero think times have log p = -1e9 (models/fprm_mem_halt.py)
+            log_r = jnp.where(valid, (lpc + lpa) - (old_lpc + old_lpa), 0.0)
+            w = jnp.where(valid, jnp.exp(old_lpc + old_lpa - log_mu_a[:, None]), 0.0)
+            r = jnp.exp(log_r)
+            surr = jnp.minimum(r * advantages, jnp.clip(r, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
+            policy_loss = -jnp.mean(jnp.sum(w * surr, axis=-1))
+            # Action entropy of every pass, weighted by p(c|s) (no gradient into p: the bonus must not favour think
+            # times whose readout happens to be more random).
+            ent_all = -jnp.sum(jnp.exp(log_pi_all) * log_pi_all, axis=-1)  # [B, T]
+            entropy = jnp.mean(jnp.sum(jax.lax.stop_gradient(jnp.exp(lpc)) * ent_all, axis=-1))
+            approx_kl = jax.lax.stop_gradient(jnp.mean(jnp.sum(w * (r - 1.0 - log_r), axis=-1)))
+            T = lpc.shape[-1]
+            metrics = {
+                'halt_weight_sum': jnp.mean(jnp.sum(w, axis=-1)),  # ~1 (exactly 1 at halt_explore = 0)
+                'halt_expected_c': jnp.mean(jnp.sum(jnp.exp(lpc) * jnp.arange(1, T + 1), axis=-1)),
+            }
+            return policy_loss, entropy, approx_kl, metrics
+
         # PPO loss on the final actor / value readout. Halted examples freeze
         # inside the network, so their readout is the one they halted at.
         # Stochastic halting: replay the rollout's think time c.
@@ -629,9 +683,17 @@ def main(args: Args):
             halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
-        policy_loss, v_loss, entropy_loss, approx_kl = ppo_terms(
-            distrax.Categorical(logits=logits), values, halt_log_prob
-        )
+        if halt_all_c:
+            policy_loss, entropy, approx_kl, all_c_metrics = all_c_terms(inter['intermediates'])
+            halt_metrics.update(all_c_metrics)
+            v_error = value_targets - values
+            v_weight = jnp.abs(args.value_expectile - (v_error < 0).astype(v_error.dtype))
+            v_loss = jnp.mean(v_weight * v_error * v_error) * 0.5
+            entropy_loss = args.entropy_cost * -entropy
+        else:
+            policy_loss, v_loss, entropy_loss, approx_kl = ppo_terms(
+                distrax.Categorical(logits=logits), values, halt_log_prob
+            )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
 
         think_iters = inter['intermediates']['fp_iterations'][0]
@@ -760,7 +822,20 @@ def main(args: Args):
             lambda_=args.gae_lambda,
             discount=discount,
         )
-        if args.normalize_advantage:
+        if halt_all_c:
+            # Runtime factorization: c only scales the return of a decision (and everything after it) by
+            # discount_compute^(c - 1), so Q(s, c, a) = discount_compute^(c - 1) Q_env(s, a). Recover Q_env from the
+            # sampled c's advantage and evaluate every c: A_c = discount_compute^(c - 1) Q_env - V, [T_roll, B, T].
+            # (GAE's multi-step return follows the behaviour think times; with a small halt_explore it is ~ on-policy.)
+            q_env = (advantages + data.value) / compute_discount
+            c_all = jnp.arange(1, args.max_think_iters + 1, dtype=jnp.float32)
+            adv_all = (args.discount_compute ** (c_all - 1) * q_env[..., None] - data.value[..., None]) \
+                * (1 - truncation)[..., None]  # as GAE: no advantage at truncated steps
+            if args.normalize_advantage:
+                # One shift and scale for every c (a shared constant baseline keeps the estimator unbiased).
+                adv_all = (adv_all - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = adv_all
+        elif args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         (training_state, _, _, _, _, _), metrics = jax.lax.scan(
