@@ -30,6 +30,7 @@ from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
 from models.fprm_perceiver import FPRMPerceiverActorValue  # noqa: E402
 from models.fprm_mem import FPRMMemActorValue  # noqa: E402
+from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
 from models.fprm_rim import FPRMRiMActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
@@ -50,6 +51,9 @@ def build_module(args, m, n):
     if args.arch == 'fprm_mem':
         return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                  thought_norm=args.thought_norm, **kw)
+    if args.arch == 'fprm_mem_halt':
+        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+                                     halt_beta_head=not args.no_halt_beta_head, thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_perceiver':
         return FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                        thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth,
@@ -59,11 +63,17 @@ def build_module(args, m, n):
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
-def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed):
+def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed, halt_mode='mode', halt_fixed=0):
     @jax.jit
-    def act(obs, goal):
+    def act(obs, goal, key):
         x = jnp.concatenate([obs, goal], axis=-1)
-        (pi, _), inter = mod.apply(policy_vars, x, norm, mutable=['intermediates'])
+        # fprm_mem_halt: c = argmax p(c|s) (mode), c ~ p(c|s) (sample) or a fixed c for every state (fixed).
+        kw = {}
+        if halt_mode == 'sample':
+            kw = {'halt_key': key}
+        elif halt_mode == 'fixed':
+            kw = {'halt_steps': jnp.full((obs.shape[0],), halt_fixed, jnp.int32)}
+        (pi, _), inter = mod.apply(policy_vars, x, norm, mutable=['intermediates'], **kw)
         I = inter['intermediates']
         conv = I['fp_converged'][0] if 'fp_converged' in I else jnp.zeros(obs.shape[0], bool)
         return pi.mode(), I['fp_iterations'][0], conv
@@ -71,12 +81,14 @@ def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed):
     reset_v = jax.jit(jax.vmap(env.reset_with_dist, in_axes=(0, None)))
     step_v = jax.jit(jax.vmap(env.step))
     keys = jax.random.split(jax.random.PRNGKey(seed * 1000 + dist), n_levels)
+    halt_key = jax.random.PRNGKey(seed * 1000 + dist + 7919)
     succ = np.zeros(n_levels, bool); length = np.full(n_levels, T, np.int32)
     think_sum = conv_sum = 0.0; steps = 0
     for s0 in range(0, n_levels, B):
         st = reset_v(keys[s0:s0 + B], dist); done = np.zeros(st.obs.shape[0], bool)
         for t in range(T):
-            a, its, cv = act(st.obs, st.info['target_goal'])
+            halt_key, k = jax.random.split(halt_key)
+            a, its, cv = act(st.obs, st.info['target_goal'], k)
             alive = ~done
             think_sum += float(np.asarray(its)[alive].sum()); conv_sum += float(np.asarray(cv)[alive].sum())
             steps += int(alive.sum())
@@ -101,10 +113,14 @@ def aggregate(per_dist, dists):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim', 'multi_block', 'single_block'])
+    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim', 'multi_block', 'single_block'])
     ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3,
                     help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
+    ap.add_argument('--no_halt_beta_head', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --no-halt_beta_head')
+    ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
+                    help='fprm_mem_halt: think time c = argmax p(c|s) (the training eval), c ~ p(c|s), or --halt_fixed for every state')
+    ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
     ap.add_argument('--rim_halt', default='latent', choices=['latent', 'kl'], help='fprm_rim: halting rule (latent = SEP convergence)')
     ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent: the checkpoint\'s threshold')
     ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
@@ -148,7 +164,8 @@ def main():
     per_dist = {}
     for d in dists:
         T = T_train if d < env.threshold else T_eval
-        per_dist[d] = evaluate(env, mod, policy_vars, norm, d, args.levels_per_dist, T, args.batch, args.seed)
+        per_dist[d] = evaluate(env, mod, policy_vars, norm, d, args.levels_per_dist, T, args.batch, args.seed,
+                               args.halt_mode, args.halt_fixed)
         r = per_dist[d]
         print(f'{args.ckpt} dist {d:3d} n={r["levels"]:5d} success {r["success"]:.3f} think {r["think"]:.2f} '
               f'conv {r["converged"]:.3f} len {r["mean_len"]:.1f}', flush=True)
@@ -159,10 +176,12 @@ def main():
             print(f'{name:11s} success {s["success"]:.3f} think {s["think"]:.2f} conv {s["converged"]:.3f} len {s["mean_len"]:.1f}')
 
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
-    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') and args.max_iters != 16 else ''
+    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim') and args.max_iters != 16 else ''
+    if args.arch == 'fprm_mem_halt' and args.halt_mode != 'mode':
+        tag += f'_{args.halt_mode}' + (str(args.halt_fixed) if args.halt_mode == 'fixed' else '')
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
     json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=T_train, eval_episode_length=T_eval,
-                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') else None,
+                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim') else None,
                    threshold=env.threshold, results={str(d): r for d, r in per_dist.items()}, summary=summary),
               open(out, 'w'), indent=1)
     print('wrote', out)
