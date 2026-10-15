@@ -157,6 +157,11 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_optimizer: str = 'shared'        # fprm_mem_halt: optimizer of the halting parameters (alpha, beta; HALT_PARAMS):
+                                          # 'shared' = the main Adam; 'sgd' | 'adam' = a separate optimizer at halt_learning_rate
+                                          # (not clipped by max_grad_norm, which then clips the other parameters only)
+    halt_learning_rate: float = 1e-2      # halt_optimizer != 'shared': its learning rate (annealed with anneal_lr)
+    halt_momentum: float = 0.0            # halt_optimizer='sgd': momentum (0 = plain SGD)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -235,22 +240,38 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     return make_policy
 
 
+HALT_PARAMS = ('halt_alpha_raw', 'halt_beta')  # fprm_mem_halt's halting parameters (alpha, beta bias + beta head)
+
+
 def make_optimizer(args):
-    if args.anneal_lr:
+    def schedule(lr):
+        if not args.anneal_lr:
+            return lr
         total_grad_steps = (
             args.num_training_step
             * args.num_epochs_per_rollout
             * args.num_minibatches_per_rollout
         )
-        learning_rate = optax.linear_schedule(
-            args.learning_rate, 0.0, total_grad_steps
-        )
-    else:
-        learning_rate = args.learning_rate
-    tx = optax.adam(learning_rate=learning_rate)
+        return optax.linear_schedule(lr, 0.0, total_grad_steps)
+
+    tx = optax.adam(learning_rate=schedule(args.learning_rate))
     if args.max_grad_norm > 0.0:
         tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx)
-    return tx
+    if args.halt_optimizer == 'shared':
+        return tx
+    if args.halt_optimizer == 'sgd':
+        halt_tx = optax.sgd(learning_rate=schedule(args.halt_learning_rate), momentum=args.halt_momentum or None)
+    elif args.halt_optimizer == 'adam':
+        halt_tx = optax.adam(learning_rate=schedule(args.halt_learning_rate))
+    else:
+        raise ValueError(f"Unknown halt_optimizer: {args.halt_optimizer}")
+
+    def labels(params):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, _: 'halt' if any(getattr(k, 'key', None) in HALT_PARAMS for k in path) else 'main', params
+        )
+
+    return optax.multi_transform({'main': tx, 'halt': halt_tx}, labels)
 
 
 def main(args: Args):
@@ -439,6 +460,8 @@ def main(args: Args):
     else:
         raise ValueError(f"Unknown architecture: {args.architecture}")
 
+    if args.halt_optimizer != 'shared':
+        assert args.architecture == 'fprm_mem_halt', '--halt_optimizer needs --architecture fprm_mem_halt'
     training_state = PPOTrainingState.create(
         apply_fn=None,
         params=actor_critic_network.init(key_policy, x=jnp.zeros((1, obs_size + goal_size))),

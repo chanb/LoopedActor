@@ -29,6 +29,10 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
+#   HALT_OPTIMIZER=shared|sgd|adam  mem_halt: optimizer of alpha / beta (default shared = the main Adam; sgd / adam = a
+#                       separate one at HALT_LR, not gradient-clipped)
+#   HALT_LR=lr          HALT_OPTIMIZER=sgd|adam: its learning rate (default 1e-2)
+#   HALT_MOMENTUM=m     HALT_OPTIMIZER=sgd: momentum (default 0 = plain SGD)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per board cell, flat = one token per observation value,
 #                         conv = 3x3 conv, one token per output channel
@@ -90,6 +94,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
+HALT_OPTIMIZER="${HALT_OPTIMIZER:-shared}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_MOMENTUM="${HALT_MOMENTUM:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -135,7 +140,15 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD (shared study settings)
+  case "$HALT_OPTIMIZER" in
+    shared) ;;
+    sgd|adam) ARM_FLAGS+=(--halt_optimizer="$HALT_OPTIMIZER" --halt_learning_rate="$HALT_LR"); RUN+="_h${HALT_OPTIMIZER}${HALT_LR}"
+              if [[ "$HALT_OPTIMIZER" == sgd ]] && awk -v m="$HALT_MOMENTUM" 'BEGIN { exit !(m > 0) }'; then
+                ARM_FLAGS+=(--halt_momentum="$HALT_MOMENTUM"); RUN+="_hm${HALT_MOMENTUM}"
+              fi ;;
+    *) echo "HALT_OPTIMIZER must be shared, sgd or adam, got $HALT_OPTIMIZER"; exit 1 ;;
+  esac
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_OPTIMIZER (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
