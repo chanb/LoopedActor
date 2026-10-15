@@ -19,13 +19,15 @@ The think time c is an action of the joint policy:
 the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
-(rollout: c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
+(rollout: c ~ mu(c | s) = (1 - halt_explore) p(c | s) + halt_explore * Uniform{c that can halt}; halt_explore = 0 is
+c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
 
 The value is read out from the last pass (fprm_mem's `value_at_max_iters`): since c is an action, a baseline that
 depended on it would bias the halting gradient.
 
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
-plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
+plus 'halt_log_prob' (log p(c | s)), 'halt_log_probs' (log p(. | s), [B, T]), 'halt_behaviour_log_probs'
+(log mu(. | s), [B, T]), 'logits_all' (the readout of every pass, [B, T, A]; ppo.py's halt_update='all_c'), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
 'halt_beta_t' (beta_i, [T, B]).
 """
 
@@ -77,6 +79,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_kl: float = 1e-3          # initialization only: h_i = 1/2 at KL_i = halt_kl (beta = log halt_kl, alpha = 1)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
+    halt_explore: float = 0.0      # rollouts (halt_key): mix this much of a uniform think time into p(c | s)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -90,6 +93,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
+        assert 0.0 <= self.halt_explore <= 1.0, self.halt_explore
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -212,11 +216,20 @@ class FPRMMemHaltActorValue(nn.Module):
         min_iters = 1 if T == 1 else max(self.min_think_iters, 2)
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]
         log_pc_b = log_pc.T  # [B, T]
+        # Behaviour distribution of sampled think times: mu = (1 - eps) p + eps * Uniform{min_iters..T}.
+        eps = self.halt_explore
+        if eps > 0:
+            eligible = jnp.arange(1, T + 1) >= min_iters
+            log_unif = jnp.where(eligible, math.log(eps / (T - min_iters + 1)), _NEG)
+            log_mu_b = jnp.logaddexp(math.log1p(-eps) + log_pc_b, log_unif[None, :]) if eps < 1 else (
+                jnp.broadcast_to(log_unif, log_pc_b.shape))
+        else:
+            log_mu_b = log_pc_b
 
         if halt_steps is not None:
             c = jnp.asarray(halt_steps, jnp.int32).reshape(B)
         elif halt_key is not None:
-            c = jax.random.categorical(halt_key, log_pc_b, axis=-1).astype(jnp.int32) + 1
+            c = jax.random.categorical(halt_key, log_mu_b, axis=-1).astype(jnp.int32) + 1
         else:
             c = jnp.argmax(log_pc_b, axis=-1).astype(jnp.int32) + 1
         idx = c - 1
@@ -233,6 +246,9 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'value', value)
         self.sow('intermediates', 'halt_log_prob', halt_log_prob.reshape(input_shape[:-1]))
         self.sow('intermediates', 'halt_entropy', halt_entropy.reshape(input_shape[:-1]))
+        self.sow('intermediates', 'halt_log_probs', log_pc_b.reshape(input_shape[:-1] + (T,)))
+        self.sow('intermediates', 'halt_behaviour_log_probs', log_mu_b.reshape(input_shape[:-1] + (T,)))
+        self.sow('intermediates', 'logits_all', jnp.swapaxes(logits_t, 0, 1).reshape(input_shape[:-1] + (T, -1)))
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_alpha', alpha)
         self.sow('intermediates', 'halt_beta_t', beta_t)

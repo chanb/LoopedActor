@@ -25,6 +25,9 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
+#   HALT_UPDATE=joint|all_c  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
+#                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py)
+#   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per grid cell, flat = one token per observation value,
 #                         conv = 3x3 conv, one token per output channel
@@ -85,6 +88,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
+HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -130,7 +134,17 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD (shared study settings)
+  case "$HALT_UPDATE" in
+    joint) ;;
+    all_c) ARM_FLAGS+=(--halt_update=all_c); RUN+="_hallc" ;;
+    *) echo "HALT_UPDATE must be joint or all_c, got $HALT_UPDATE"; exit 1 ;;
+  esac
+  awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e + 0 == e && e >= 0 && e <= 1) }' || { echo "HALT_EXPLORE must be in [0, 1], got $HALT_EXPLORE"; exit 1; }
+  if awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e > 0) }'; then
+    [[ "$HALT_UPDATE" == all_c ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c"; exit 1; }
+    ARM_FLAGS+=(--halt_explore="$HALT_EXPLORE"); RUN+="_hex${HALT_EXPLORE}"
+  fi
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_EXPLORE (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
