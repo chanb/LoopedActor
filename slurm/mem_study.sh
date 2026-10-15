@@ -80,5 +80,5 @@ mem_study_hours() {  # mem_study_hours <env> <cap>: estimated hours of one run a
 }
 
 mem_study_cap() {  # mem_study_cap "<env vars>": the MAX_THINK_ITERS value in a config's env vars
-  local v; for v in $1; do [[ "$v" == MAX_THINK_ITERS=* ]] && echo "${v#MAX_THINK_ITERS=}"; done
+  local v; for v in $1; do [[ "$v" == MAX_THINK_ITERS=* ]] && echo "${v#MAX_THINK_ITERS=}"; done; return 0
 }

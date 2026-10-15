@@ -40,28 +40,27 @@ CONFIGS=("${MEM_STUDY_CONFIGS[@]}")   # experiment definitions: slurm/mem_study.
 #                     up to <= 0.9). A job's further runs wait and start as running ones finish. The 0.9 of the
 #                     GPU is split evenly among the runs executing at once (XLA_PYTHON_CLIENT_MEM_FRACTION).
 #   MAX_JOB_HOURS     cluster time limit per job (default 24); SAFETY (default 1.3) = headroom over the estimate.
-# Runs on one GPU share it, so a job takes about <runs in the job> x <single-run hours> however many run at once; the
-# number of runs per job is the most whose estimate x SAFETY fits in MAX_JOB_HOURS. ppo.py cannot resume, so a run still
+#   TIERS             the cluster's time-limit tiers in hours (default "3 12 24 72 168"); a dry run prints how many
+#                     jobs each tier would need, to choose MAX_JOB_HOURS.
+# Runs on one GPU share it, so a job takes about the sum of its runs' single-run hours however many run at once. All
+# runs of an env (every config and seed) are packed first-fit decreasing into the fewest jobs whose estimate x SAFETY
+# (+30 min startup) fits in MAX_JOB_HOURS; each job runs its longest runs first. ppo.py cannot resume, so a run still
 # going at the time limit is lost (runs that already finished are kept).
 MAX_JOB_HOURS="${MAX_JOB_HOURS:-24}"
 SAFETY="${SAFETY:-1.3}"
+TIERS="${TIERS:-3 12 24 72 168}"
 MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-${CONCURRENCY:-10}}"   # CONCURRENCY: older name, same meaning
 [[ "$MAX_RUNS_PER_GPU" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_RUNS_PER_GPU must be a positive integer, got $MAX_RUNS_PER_GPU"; exit 1; }
 concurrency() {  # concurrency <env>: runs at once on one GPU (MAX_RUNS_PER_GPU, capped by memory)
   awk -v c="$MAX_RUNS_PER_GPU" -v f="${MEM_STUDY_GPU_FRACTION[$1]}" 'BEGIN { k = int(0.9 / f + 1e-9); print (c < k ? c : k) }'
 }
-pack() {  # pack <env> <cap> <number of runs>: "<runs per job> <time limit>"
-  local env=$1 runs=$3 h n minutes
-  h="$(mem_study_hours "$env" "$2")"
-  n=$(awk -v m="$MAX_JOB_HOURS" -v s="$SAFETY" -v h="$h" 'BEGIN { n = int(m * 60 / (s * h * 60 + 1)); print (n < 1 ? 1 : n) }')
-  # balance: split the seeds into the fewest jobs of at most n runs, as evenly as possible
-  local jobs=$(( (runs + n - 1) / n )); n=$(( (runs + jobs - 1) / jobs ))
-  minutes=$(awk -v n="$n" -v s="$SAFETY" -v h="$h" -v m="$MAX_JOB_HOURS" \
-        'BEGIN { t = int(n * h * s * 60) + 30; if (t > m * 60 - 1) t = m * 60 - 1; print t }')
-  if awk -v s="$SAFETY" -v h="$h" -v m="$MAX_JOB_HOURS" 'BEGIN { exit !(s * h > m) }'; then
-    echo "warning: ${env} T=$2 needs ~${h}h alone (x${SAFETY} > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
-  fi
-  printf '%s %02d:%02d:00\n' "$n" $(( minutes / 60 )) $(( minutes % 60 ))
+job_capacity() {  # job_capacity <hours>: minutes of (SAFETY-scaled) work that fit in a job of that time limit
+  awk -v m="$1" 'BEGIN { print int(m * 60) - 31 }'
+}
+bin_pack() {  # bin_pack <hours>: reads "<minutes> <id>" lines, prints "<job> <id>" lines, longest runs first
+  # (first-fit decreasing; a run longer than a job gets a job of its own)
+  sort -k1,1nr | awk -v cap="$(job_capacity "$1")" \
+    '{ for (b = 0; b < n; b++) if (used[b] + $1 <= cap) break; if (b == n) n++; used[b] += $1; print b, $2 }'
 }
 
 completed() {  # completed <env> <env vars> <arm> <seed>: the run's train.log reached the last evaluation
@@ -73,43 +72,72 @@ completed() {  # completed <env> <env vars> <arm> <seed>: the run's train.log re
 }
 
 [[ "$DRY_RUN" == 1 ]] || mkdir -p "${LOG_DIR}"
-n_jobs=0; n_skipped=0
+n_jobs=0; n_skipped=0; req_minutes=0; est_minutes=0
+declare -A tier_jobs=()
 for env in "${ENVS[@]}"; do
+  cmds=(); minutes=(); names=(); seeds=()   # every run of this env still to do
   for entry in "${CONFIGS[@]}"; do
     name="${entry%%|*}"; spec="${entry#*|}"
     arm="${spec##* }"; vars="${spec% *}"
-    todo=()
+    cap="$(mem_study_cap "$vars")"; h="$(mem_study_hours "$env" "$cap")"
+    m=$(awk -v h="$h" -v s="$SAFETY" 'BEGIN { print int(h * s * 60 + 0.999) }')
+    if (( m > $(job_capacity "$MAX_JOB_HOURS") )); then
+      echo "warning: ${env} ${name} needs ~${h}h alone (x${SAFETY} + 30 min startup > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
+    fi
     for seed in "${SEEDS[@]}"; do
       if [[ "$SKIP_COMPLETED" == 1 ]] && completed "$env" "$vars" "$arm" "$seed"; then
-        n_skipped=$(( n_skipped + 1 ))
-      else
-        todo+=("$seed")
+        n_skipped=$(( n_skipped + 1 )); continue
       fi
-    done
-    (( ${#todo[@]} > 0 )) || continue
-    read -r per_gpu time <<< "$(pack "$env" "$(mem_study_cap "$vars")" "${#todo[@]}")"
-    cmds=()
-    for seed in "${todo[@]}"; do
       cmds+=("WANDB_MODE=${WANDB_MODE} WANDB_PROJECT=${WANDB_PROJECT} ${COMMON} ${vars} ${env}/scripts/train.sh ${arm} ${seed} ${OUT_ROOT}/${env} 0")
-      if (( ${#cmds[@]} == per_gpu )) || [[ "$seed" == "${todo[-1]}" ]]; then
-        job="mem-${env}-${name}${MEM_STUDY_TAG}-s$(echo "${cmds[@]}" | grep -o "${arm} [0-9]* " | awk '{print $2}' | paste -sd_)"
-        running=$(concurrency "$env"); (( running > ${#cmds[@]} )) && running=${#cmds[@]}
-        frac=$(awk -v r="$running" 'BEGIN { printf "%.3f", int(900 / r) / 1000 }')   # 0.9 of the GPU split among them
-        cmds=("${cmds[@]/#/XLA_PYTHON_CLIENT_MEM_FRACTION=${frac} }")
-        CMDS_B64="$(printf '%s\n' "${cmds[@]}" | base64 -w0)"
-        host_mem="$(( running * MEM_STUDY_HOST_GB[$env] + 2 ))G"
-        sbatch_cmd=(sbatch --export=ALL,REPO_DIR="${REPO_DIR}",CMDS_B64="${CMDS_B64}",CONCURRENCY="${running}" --job-name="${job}"
-                    --time="${time}" --mem="${host_mem}" --cpus-per-task=$(( running + 1 ))
-                    --output="${LOG_DIR}/%x_%j.out" "${RUN_SCRIPT}")
-        if [[ "$DRY_RUN" == 1 ]]; then
-          echo "sbatch --job-name=${job} --time=${time} --mem=${host_mem} --cpus-per-task=$(( running + 1 ))  (${#cmds[@]} runs, ${running} at a time)"
-          printf '    %s\n' "${cmds[@]}"
-        else
-          "${sbatch_cmd[@]}"
-        fi
-        n_jobs=$(( n_jobs + 1 )); cmds=()
-      fi
+      minutes+=("$m"); names+=("$name"); seeds+=("$seed")
     done
   done
+  (( ${#cmds[@]} > 0 )) || continue
+  items="$(for i in "${!cmds[@]}"; do echo "${minutes[$i]} $i"; done)"
+  for tier in $TIERS; do
+    tier_jobs[$tier]=$(( ${tier_jobs[$tier]:-0} + $(bin_pack "$tier" <<< "$items" | awk '{ print $1 }' | sort -u | wc -l) ))
+  done
+  declare -A job_ids=()
+  while read -r b i; do job_ids[$b]+=" $i"; done < <(bin_pack "$MAX_JOB_HOURS" <<< "$items")
+  n_env_jobs=${#job_ids[@]}
+  for (( b = 0; b < n_env_jobs; b++ )); do
+    read -r -a ids <<< "${job_ids[$b]}"
+    job_cmds=(); total=0
+    for i in "${ids[@]}"; do job_cmds+=("${cmds[$i]}"); total=$(( total + minutes[$i] )); done
+    job_names=$(for i in "${ids[@]}"; do echo "${names[$i]}"; done | sort -u)
+    if [[ "$(wc -l <<< "$job_names")" == 1 ]]; then
+      job="mem-${env}-${job_names}${MEM_STUDY_TAG}-s$(for i in "${ids[@]}"; do echo "${seeds[$i]}"; done | sort -n | paste -sd_)"
+    else
+      job="mem-${env}-pack$(( b + 1 ))of${n_env_jobs}${MEM_STUDY_TAG}"
+    fi
+    limit=$(( total + 30 )); max_limit=$(awk -v m="$MAX_JOB_HOURS" 'BEGIN { print int(m * 60) - 1 }')
+    (( limit > max_limit )) && limit=$max_limit
+    time=$(printf '%02d:%02d:00' $(( limit / 60 )) $(( limit % 60 )))
+    req_minutes=$(( req_minutes + limit ))
+    est=$(awk -v t="$total" -v s="$SAFETY" 'BEGIN { print int(t / s) }'); est_minutes=$(( est_minutes + est ))
+    running=$(concurrency "$env"); (( running > ${#job_cmds[@]} )) && running=${#job_cmds[@]}
+    frac=$(awk -v r="$running" 'BEGIN { printf "%.3f", int(900 / r) / 1000 }')   # 0.9 of the GPU split among them
+    job_cmds=("${job_cmds[@]/#/XLA_PYTHON_CLIENT_MEM_FRACTION=${frac} }")
+    CMDS_B64="$(printf '%s\n' "${job_cmds[@]}" | base64 -w0)"
+    host_mem="$(( running * MEM_STUDY_HOST_GB[$env] + 2 ))G"
+    sbatch_cmd=(sbatch --export=ALL,REPO_DIR="${REPO_DIR}",CMDS_B64="${CMDS_B64}",CONCURRENCY="${running}" --job-name="${job}"
+                --time="${time}" --mem="${host_mem}" --cpus-per-task=$(( running + 1 ))
+                --output="${LOG_DIR}/%x_%j.out" "${RUN_SCRIPT}")
+    if [[ "$DRY_RUN" == 1 ]]; then
+      echo "sbatch --job-name=${job} --time=${time} --mem=${host_mem} --cpus-per-task=$(( running + 1 ))  (${#job_cmds[@]} runs, ${running} at a time, ~$(awk -v e="$est" 'BEGIN { printf "%.1f", e / 60 }')h estimated)"
+      printf '    %s\n' "${job_cmds[@]}"
+    else
+      "${sbatch_cmd[@]}"
+    fi
+    n_jobs=$(( n_jobs + 1 ))
+  done
+  unset job_ids
 done
 echo "${n_jobs} jobs $([[ "$DRY_RUN" == 1 ]] && echo "(dry run, nothing submitted)" || echo submitted), ${n_skipped} completed runs skipped"
+if (( n_jobs > 0 )); then
+  awk -v r="$req_minutes" -v e="$est_minutes" \
+    'BEGIN { printf "requested %.1f GPU-hours for ~%.1f estimated (%.0f%% of the time limits)\n", r / 60, e / 60, 100 * e / r }'
+  if [[ "$DRY_RUN" == 1 ]]; then
+    printf 'jobs needed per tier (MAX_JOB_HOURS):'; for tier in $TIERS; do printf '  %sh: %s' "$tier" "${tier_jobs[$tier]}"; done; echo
+  fi
+fi
