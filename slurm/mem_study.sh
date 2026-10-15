@@ -8,8 +8,8 @@
 #               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_OPTIMIZER / HALT_LR /
-#               HALT_MOMENTUM are read by train.sh
+#               (every pass runs); HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_SIGNAL / HALT_OPTIMIZER /
+#               HALT_LR / HALT_MOMENTUM are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -32,6 +32,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ "${HALT_BETA_HEAD:-1}" == 0 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=0"; MEM_STUDY_TAG+="_nobh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
+[[ "${HALT_SIGNAL:-kl}" != kl ]] && { MEM_STUDY_COMMON+=" HALT_SIGNAL=${HALT_SIGNAL}"; MEM_STUDY_TAG+="_hs${HALT_SIGNAL}"; }
 if [[ "${HALT_OPTIMIZER:-shared}" != shared ]]; then
   MEM_STUDY_COMMON+=" HALT_OPTIMIZER=${HALT_OPTIMIZER} HALT_LR=${HALT_LR:-1e-2}"; MEM_STUDY_TAG+="_h${HALT_OPTIMIZER}${HALT_LR:-1e-2}"
   [[ -n "${HALT_MOMENTUM:-}" ]] && { MEM_STUDY_COMMON+=" HALT_MOMENTUM=${HALT_MOMENTUM}"; MEM_STUDY_TAG+="_hm${HALT_MOMENTUM}"; }

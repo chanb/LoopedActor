@@ -9,6 +9,11 @@ so h_i -> 1 as the policy stops changing (KL_i -> 0) and h_i -> 0 while thinking
 learned bias plus (`halt_beta_head`) a zero-initialized Dense on the rms-normed newest thought of pass i, i.e.
 state-dependent. alpha = 1, beta = log(halt_kl) at initialization, so h_i = 1/2 exactly at the old threshold
 KL_i = halt_kl. KL_i is stop-gradient'ed.
+`halt_signal` swaps KL_i for another change D_i (also stop-gradient'ed): 'tv' = the total variation distance
+1/2 sum_a |pi_i(a) - pi_{i-1}(a)| (first order in the change, so less sensitive to rare actions than KL; roughly
+sqrt(KL / 2)), 'latent' = the mean squared distance between
+the latents (cells + thought) of passes i and i-1, 'latent_rel' = that divided by the mean square of pass i's latents;
+halt_kl is then the initial threshold on D_i.
 
 The think time c is an action of the joint policy:
 
@@ -74,7 +79,11 @@ class FPRMMemHaltActorValue(nn.Module):
     config: FPRMConfig = FPRMConfig()
     max_think_iters: int = 8
     min_think_iters: int = 2
-    halt_kl: float = 1e-3          # initialization only: h_i = 1/2 at KL_i = halt_kl (beta = log halt_kl, alpha = 1)
+    halt_kl: float = 1e-3          # initialization only: h_i = 1/2 at D_i = halt_kl (beta = log halt_kl, alpha = 1)
+    halt_signal: str = 'kl'        # D_i: 'kl' = KL(pi_i || pi_{i-1}); 'tv' = 1/2 sum_a |pi_i(a) - pi_{i-1}(a)|;
+                                   # 'latent' = mean squared distance between the latents
+                                   # (cells + thought) of passes i and i-1; 'latent_rel' = that squared distance / the
+                                   # mean square of pass i's latents (scale-free)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
     output_dim_1: int = 9   # action logits (= m * n buttons)
@@ -90,6 +99,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
+        assert self.halt_signal in ('kl', 'tv', 'latent', 'latent_rel'), self.halt_signal
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -193,10 +203,21 @@ class FPRMMemHaltActorValue(nn.Module):
             value = jnp.where(finite, value, value_prev)
             beta = jnp.where(finite, beta, 0.0)
 
-            lp_new = jax.nn.log_softmax(logits, axis=-1)
-            lp_prev = jax.nn.log_softmax(logits_prev, axis=-1)
-            kl = jnp.sum(jnp.exp(lp_new) * (lp_new - lp_prev), axis=-1)
-            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1 (no previous policy) is forced h = 0 below
+            if self.halt_signal == 'kl':
+                lp_new = jax.nn.log_softmax(logits, axis=-1)
+                lp_prev = jax.nn.log_softmax(logits_prev, axis=-1)
+                kl = jnp.sum(jnp.exp(lp_new) * (lp_new - lp_prev), axis=-1)
+            elif self.halt_signal == 'tv':
+                p_new = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+                p_prev = jax.nn.softmax(logits_prev.astype(jnp.float32), axis=-1)
+                kl = 0.5 * jnp.sum(jnp.abs(p_new - p_prev), axis=-1)
+            else:
+                new = jnp.concatenate([z_cells, out[:, None]], axis=1).astype(jnp.float32)
+                prev = jnp.concatenate([z, token[:, None]], axis=1).astype(jnp.float32)
+                kl = jnp.mean(jnp.square(new - prev), axis=(-2, -1))
+                if self.halt_signal == 'latent_rel':
+                    kl = kl / (jnp.mean(jnp.square(new), axis=(-2, -1)) + _KL_EPS)
+            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1 (no previous pass) is forced h = 0 below
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
             return carry, (logits, value, beta, kl, nonfinite)

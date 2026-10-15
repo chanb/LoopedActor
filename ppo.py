@@ -157,6 +157,9 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_signal: str = 'kl'               # fprm_mem_halt: what h_i = sigmoid(beta - alpha log D_i) reads: 'kl' (policy KL between
+                                          # passes) | 'tv' (policy total variation) | 'latent' (mean squared latent change) | 'latent_rel' (the same / mean square
+                                          # of the new latents); halt_kl is then the initial threshold on D_i
     halt_optimizer: str = 'shared'        # fprm_mem_halt: optimizer of the halting parameters (alpha, beta; HALT_PARAMS):
                                           # 'shared' = the main Adam; 'sgd' | 'adam' = a separate optimizer at halt_learning_rate
                                           # (not clipped by max_grad_norm, which then clips the other parameters only)
@@ -423,6 +426,7 @@ def main(args: Args):
             halt_kl=args.halt_kl,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
+            halt_signal=args.halt_signal,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -460,6 +464,8 @@ def main(args: Args):
     else:
         raise ValueError(f"Unknown architecture: {args.architecture}")
 
+    if args.halt_signal != 'kl':
+        assert args.architecture == 'fprm_mem_halt', '--halt_signal needs --architecture fprm_mem_halt'
     if args.halt_optimizer != 'shared':
         assert args.architecture == 'fprm_mem_halt', '--halt_optimizer needs --architecture fprm_mem_halt'
     training_state = PPOTrainingState.create(
