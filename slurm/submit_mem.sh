@@ -14,7 +14,7 @@ set -euo pipefail
 #   TARGET_KL=0.03 ENVS=lightsout ISO_ITERS=4 MEM_ITERS= slurm/submit_mem.sh
 #   MAX_RUNS_PER_GPU=3 MAX_JOB_HOURS=48 slurm/submit_mem.sh   # longer jobs, 3 runs at a time, the next starting as one ends
 # Optional: REPO_DIR (repo on the cluster), OUT_ROOT (experiment output root, <OUT_ROOT>/<env>/<run>/train.log),
-# LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards).
+# LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards), WANDB_PROJECT (default looped_actor).
 # SKIP_COMPLETED (default 1) leaves out runs whose train.log reached the final evaluation; failed, crashed or
 # timed-out runs (and ones still queued or running) are submitted again. SKIP_COMPLETED=0 submits everything.
 # The cluster checkout needs LoopedActor/.venv, data/boxoban/*.npz and data/rushhour/*.npz
@@ -27,6 +27,7 @@ REPO_DIR="${REPO_DIR:-/home/chanb/scratch/code/LoopedActor}"
 LOG_DIR="${LOG_DIR:-/home/chanb/scratch/logs/looped_actor}"
 OUT_ROOT="${OUT_ROOT:-/home/chanb/scratch/looped_actor/exp}"
 WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_PROJECT="${WANDB_PROJECT:-looped_actor}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 read -r -a ENVS <<< "${ENVS:-$MEM_STUDY_ENVS}"
@@ -89,7 +90,7 @@ for env in "${ENVS[@]}"; do
     read -r per_gpu time <<< "$(pack "$env" "$(mem_study_cap "$vars")" "${#todo[@]}")"
     cmds=()
     for seed in "${todo[@]}"; do
-      cmds+=("WANDB_MODE=${WANDB_MODE} ${COMMON} ${vars} ${env}/scripts/train.sh ${arm} ${seed} ${OUT_ROOT}/${env} 0")
+      cmds+=("WANDB_MODE=${WANDB_MODE} WANDB_PROJECT=${WANDB_PROJECT} ${COMMON} ${vars} ${env}/scripts/train.sh ${arm} ${seed} ${OUT_ROOT}/${env} 0")
       if (( ${#cmds[@]} == per_gpu )) || [[ "$seed" == "${todo[-1]}" ]]; then
         job="mem-${env}-${name}${MEM_STUDY_TAG}-s$(echo "${cmds[@]}" | grep -o "${arm} [0-9]* " | awk '{print $2}' | paste -sd_)"
         running=$(concurrency "$env"); (( running > ${#cmds[@]} )) && running=${#cmds[@]}

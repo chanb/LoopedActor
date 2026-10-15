@@ -43,12 +43,14 @@
 #   TARGET_KL=k         stop a rollout's remaining minibatch updates once approx_kl > k (default 0 = off; skipped updates
 #                       still compute their gradient, so this saves no time)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
+#   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
 #   VALUE_AT_MAX_ITERS=0|1  mem / iso_mem: read the value out from the MAX_THINK_ITERS-th pass's latent instead of the
 #                       halt pass's (halting then fixes only the policy readout) (default 0)
 #   VALUE_EXPECTILE=tau  value loss expectile in (0, 1) (default 0.5 = MSE; e.g. 0.9 = optimistic upper-expectile value,
 #                       as Stoix --expectile)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
+# WANDB_PROJECT=name sets the wandb project (default looped_actor; not part of the run directory name).
 # Non-default values are appended to the run directory name (e.g. looped_it8_g3x3_s0).
 # All arms: PPO on procedurally generated instances (lightsout-<M>x<N>: random initial grid, goal = initial
 # toggled by dist random presses; train dist in [1, threshold), in-training evaluation (eval/test_* metrics) on
@@ -202,6 +204,11 @@ awk -v k="$TARGET_KL" 'BEGIN { exit !(k + 0 == k && k >= 0) }' || { echo "TARGET
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$TARGET_KL"); RUN+="_tkl${TARGET_KL}"; }
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }
 [[ "$NUM_EPOCHS" != 4 ]] && RUN+="_ep${NUM_EPOCHS}"
+NUM_TIMESTEPS="${NUM_TIMESTEPS:-100000000}"
+[[ "$NUM_TIMESTEPS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_TIMESTEPS must be a positive integer, got $NUM_TIMESTEPS"; exit 1; }
+if [[ "$NUM_TIMESTEPS" != 100000000 ]]; then
+  (( NUM_TIMESTEPS % 1000000 == 0 )) && RUN+="_ts$(( NUM_TIMESTEPS / 1000000 ))M" || RUN+="_ts${NUM_TIMESTEPS}"
+fi
 case "$VALUE_AT_MAX_ITERS" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?mem$ ]] || { echo "VALUE_AT_MAX_ITERS=1 needs arm mem or iso_mem"; exit 1; }
@@ -218,7 +225,7 @@ HPARAM_FLAGS=(--env_id="lightsout-${GRID}" --lightsout_episode_length="$EPISODE_
   --lightsout_difficulty_threshold="$DIFFICULTY_THRESHOLD"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"
-  --num_timesteps=100000000 --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
+  --num_timesteps="$NUM_TIMESTEPS" --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
   "${ARM_FLAGS[@]}")
 GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}")"
 export WANDB_MODE=${WANDB_MODE:-disabled}
@@ -226,5 +233,5 @@ cd "$(dirname "$0")/../.."
 mkdir -p "$OUT/${RUN}"
 
 source .venv/bin/activate
-CUDA_VISIBLE_DEVICES="${DEVICE}" XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.8}" python -u ppo.py --seed="$SEED" --wandb_dir="$OUT/${RUN}" --track --wandb_group="$GROUP" \
+CUDA_VISIBLE_DEVICES="${DEVICE}" XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.8}" python -u ppo.py --seed="$SEED" --wandb_dir="$OUT/${RUN}" --track --wandb_group="$GROUP" --wandb_project_name="${WANDB_PROJECT:-looped_actor}" \
   "${HPARAM_FLAGS[@]}" 2>&1 | tee -a "$OUT/${RUN}/train.log"
