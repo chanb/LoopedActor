@@ -78,7 +78,9 @@ class Args:
     lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
     lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
-    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode
+    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
+    slidingpuzzle_eval_episode_length: int = 0    # slidingpuzzle-*: steps per evaluation-scramble (eval/test_*) episode;
+                                                  # 0 = slidingpuzzle_episode_length
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
@@ -157,8 +159,10 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_alpha_init: float = 0.0          # fprm_mem_halt: initial alpha (beta starts at alpha * log halt_kl); 0 = 2 for
+                                          # halt_signal='tv' (first order in the policy change), else 1
     halt_signal: str = 'kl'               # fprm_mem_halt: what h_i = sigmoid(beta - alpha log D_i) reads: 'kl' (policy KL between
-                                          # passes) | 'tv' (policy total variation) | 'latent' (mean squared latent change) | 'latent_rel' (the same / mean square
+                                          # passes) | 'tv' (policy total variation) | 'hellinger' (squared Hellinger) | 'latent' (mean squared latent change) | 'latent_rel' (the same / mean square
                                           # of the new latents); halt_kl is then the initial threshold on D_i
     halt_optimizer: str = 'shared'        # fprm_mem_halt: optimizer of the halting parameters (alpha, beta; HALT_PARAMS):
                                           # 'shared' = the main Adam; 'sgd' | 'adam' = a separate optimizer at halt_learning_rate
@@ -427,6 +431,7 @@ def main(args: Args):
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_signal=args.halt_signal,
+            halt_alpha_init=args.halt_alpha_init,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,

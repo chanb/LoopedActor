@@ -4,7 +4,8 @@
 #   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver | mem | iso_mem | mem_halt | rim | iso_rim
 # Optional environment variables:
 #   GRID=N              board size N x N (default 3 = 8-puzzle)
-#   EPISODE_LENGTH=N    steps per episode (default 40)
+#   EPISODE_LENGTH=N    steps per training episode (default 40; also used by the eval/train_* episodes)
+#   EVAL_EPISODE_LENGTH=N  steps per evaluation-scramble (eval/test_*) episode (default EPISODE_LENGTH)
 #   NUM_RANDOM_MOVES=K  training scramble length (random walk of the blank; default 100)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
@@ -29,10 +30,12 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_SIGNAL=kl|tv|latent|latent_rel  mem_halt: halting reads the policy KL between passes (default kl), their total
-#                       variation (tv; ~sqrt(KL/2), so try HALT_KL=2e-2), the mean squared
+#   HALT_SIGNAL=kl|tv|hellinger|latent|latent_rel  mem_halt: halting reads the policy KL between passes (default kl), their
+#                       total variation (tv; ~sqrt(KL/2), so try HALT_KL=2e-2), their squared Hellinger distance
+#                       (hellinger; ~KL/4, initialized at HALT_KL/4 so HALT_KL stays KL-equivalent), the mean squared
 #                       latent change (latent) or that relative to the latents' mean square (latent_rel); HALT_KL is then
 #                       the initial threshold on it
+#   HALT_ALPHA_INIT=a   mem_halt: initial alpha, beta starting at a * log HALT_KL (default 0 = 2 for HALT_SIGNAL=tv, else 1)
 #   HALT_OPTIMIZER=shared|sgd|adam  mem_halt: optimizer of alpha / beta (default shared = the main Adam; sgd / adam = a
 #                       separate one at HALT_LR, not gradient-clipped)
 #   HALT_LR=lr          HALT_OPTIMIZER=sgd|adam: its learning rate (default 1e-2)
@@ -90,7 +93,7 @@
 #
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
-GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"
+GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$EPISODE_LENGTH}"
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
@@ -98,7 +101,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
-HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_OPTIMIZER="${HALT_OPTIMIZER:-shared}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_MOMENTUM="${HALT_MOMENTUM:-0}"
+HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_ALPHA_INIT="${HALT_ALPHA_INIT:-0}"; HALT_OPTIMIZER="${HALT_OPTIMIZER:-shared}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_MOMENTUM="${HALT_MOMENTUM:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -146,9 +149,11 @@ if [[ "$ARM" == mem_halt ]]; then
   esac
   case "$HALT_SIGNAL" in
     kl) ;;
-    tv|latent|latent_rel) ARM_FLAGS+=(--halt_signal="$HALT_SIGNAL"); RUN+="_hs${HALT_SIGNAL}" ;;
-    *) echo "HALT_SIGNAL must be kl, tv, latent or latent_rel, got $HALT_SIGNAL"; exit 1 ;;
+    tv|hellinger|latent|latent_rel) ARM_FLAGS+=(--halt_signal="$HALT_SIGNAL"); RUN+="_hs${HALT_SIGNAL}" ;;
+    *) echo "HALT_SIGNAL must be kl, tv, hellinger, latent or latent_rel, got $HALT_SIGNAL"; exit 1 ;;
   esac
+  awk -v a="$HALT_ALPHA_INIT" 'BEGIN { exit !(a + 0 == a && a >= 0) }' || { echo "HALT_ALPHA_INIT must be >= 0, got $HALT_ALPHA_INIT"; exit 1; }
+  awk -v a="$HALT_ALPHA_INIT" 'BEGIN { exit !(a > 0) }' && { ARM_FLAGS+=(--halt_alpha_init="$HALT_ALPHA_INIT"); RUN+="_ha${HALT_ALPHA_INIT}"; }
   case "$HALT_OPTIMIZER" in
     shared) ;;
     sgd|adam) ARM_FLAGS+=(--halt_optimizer="$HALT_OPTIMIZER" --halt_learning_rate="$HALT_LR"); RUN+="_h${HALT_OPTIMIZER}${HALT_LR}"
@@ -157,7 +162,7 @@ if [[ "$ARM" == mem_halt ]]; then
               fi ;;
     *) echo "HALT_OPTIMIZER must be shared, sgd or adam, got $HALT_OPTIMIZER"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_SIGNAL / HALT_OPTIMIZER (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_SIGNAL / HALT_ALPHA_INIT / HALT_OPTIMIZER (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
@@ -204,6 +209,7 @@ esac
 [[ "$GRID" =~ ^[0-9]+$ ]] || { echo "GRID must be an integer N (board N x N), got $GRID"; exit 1; }
 [[ "$GRID" != 3 ]] && RUN+="_g${GRID}"
 [[ "$EPISODE_LENGTH" != 40 ]] && RUN+="_el${EPISODE_LENGTH}"
+[[ "$EVAL_EPISODE_LENGTH" != "$EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
 [[ "$NUM_RANDOM_MOVES" != 100 ]] && RUN+="_rm${NUM_RANDOM_MOVES}"
 [[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"
 case "$MLP_TYPE" in
@@ -250,7 +256,7 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 RUN+="_s${SEED}"
 [[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.
-HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH"
+HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH" --slidingpuzzle_eval_episode_length="$EVAL_EPISODE_LENGTH"
   --slidingpuzzle_num_random_moves="$NUM_RANDOM_MOVES" --slidingpuzzle_eval_num_random_moves="$EVAL_NUM_RANDOM_MOVES"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"
