@@ -4,7 +4,8 @@
 #   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver | mem | iso_mem | mem_halt | rim | iso_rim
 # Optional environment variables:
 #   GRID=N              board size N x N (default 3 = 8-puzzle)
-#   EPISODE_LENGTH=N    steps per episode (default 40)
+#   EPISODE_LENGTH=N    steps per training episode (default 40; also used by the eval/train_* episodes)
+#   EVAL_EPISODE_LENGTH=N  steps per evaluation-scramble (eval/test_*) episode (default EPISODE_LENGTH)
 #   NUM_RANDOM_MOVES=K  training scramble length (random walk of the blank; default 100)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
@@ -27,7 +28,7 @@
 #   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3);
 #                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
+#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
 #   HALT_UPDATE=joint|all_c  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
 #                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py)
@@ -85,7 +86,7 @@
 #
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
-GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"
+GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$EPISODE_LENGTH}"
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
@@ -130,8 +131,8 @@ if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
   case "$HALT_BETA_HEAD" in
-    1) ;;
-    0) ARM_FLAGS+=(--no-halt_beta_head); RUN+="_nobh" ;;
+    0) ;;
+    1) ARM_FLAGS+=(--halt_beta_head); RUN+="_bh" ;;
     *) echo "HALT_BETA_HEAD must be 0 or 1, got $HALT_BETA_HEAD"; exit 1 ;;
   esac
   case "$HALT_HEAD_GRAD" in
@@ -196,6 +197,7 @@ esac
 [[ "$GRID" =~ ^[0-9]+$ ]] || { echo "GRID must be an integer N (board N x N), got $GRID"; exit 1; }
 [[ "$GRID" != 3 ]] && RUN+="_g${GRID}"
 [[ "$EPISODE_LENGTH" != 40 ]] && RUN+="_el${EPISODE_LENGTH}"
+[[ "$EVAL_EPISODE_LENGTH" != "$EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
 [[ "$NUM_RANDOM_MOVES" != 100 ]] && RUN+="_rm${NUM_RANDOM_MOVES}"
 [[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"
 case "$MLP_TYPE" in
@@ -242,7 +244,7 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 RUN+="_s${SEED}"
 [[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.
-HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH"
+HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH" --slidingpuzzle_eval_episode_length="$EVAL_EPISODE_LENGTH"
   --slidingpuzzle_num_random_moves="$NUM_RANDOM_MOVES" --slidingpuzzle_eval_num_random_moves="$EVAL_NUM_RANDOM_MOVES"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"

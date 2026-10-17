@@ -20,7 +20,7 @@
 #   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3);
 #                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
+#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
 #   HALT_UPDATE=joint|all_c  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
 #                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py)
@@ -118,8 +118,8 @@ if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
   case "$HALT_BETA_HEAD" in
-    1) ;;
-    0) ARM_FLAGS+=(--no-halt_beta_head); RUN+="_nobh" ;;
+    0) ;;
+    1) ARM_FLAGS+=(--halt_beta_head); RUN+="_bh" ;;
     *) echo "HALT_BETA_HEAD must be 0 or 1, got $HALT_BETA_HEAD"; exit 1 ;;
   esac
   case "$HALT_HEAD_GRAD" in

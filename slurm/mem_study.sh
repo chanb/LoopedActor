@@ -30,7 +30,7 @@ MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DI
 MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
-[[ "${HALT_BETA_HEAD:-1}" == 0 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=0"; MEM_STUDY_TAG+="_nobh"; }
+[[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
 [[ "${HALT_UPDATE:-joint}" == all_c ]] && { MEM_STUDY_COMMON+=" HALT_UPDATE=all_c"; MEM_STUDY_TAG+="_hallc"; }
 [[ -n "${HALT_EXPLORE:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXPLORE=${HALT_EXPLORE}"; MEM_STUDY_TAG+="_hex${HALT_EXPLORE}"; }

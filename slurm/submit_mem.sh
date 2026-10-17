@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Submits the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem at caps MEM_ITERS,
 # default 2 3 4) on all four environments, 10 seeds each.
-# Seeds of one (env, config) are packed onto shared L40S GPUs (48GB, run with CUDA MPS); see pack() below.
+# The runs of an env (every config and seed) are packed onto shared L40S GPUs (48GB, run with CUDA MPS); see bin_pack() below.
 #
 #   slurm/submit_mem.sh                    # submit everything
 #   DRY_RUN=1 slurm/submit_mem.sh          # print the sbatch commands only
@@ -44,10 +44,17 @@ CONFIGS=("${MEM_STUDY_CONFIGS[@]}")   # experiment definitions: slurm/mem_study.
 #                     jobs each tier would need, to choose MAX_JOB_HOURS.
 # Runs on one GPU share it, so a job takes about the sum of its runs' single-run hours however many run at once. All
 # runs of an env (every config and seed) are packed first-fit decreasing into the fewest jobs whose estimate x SAFETY
+<<<<<<< HEAD
 # (+30 min startup) fits in MAX_JOB_HOURS; each job runs its longest runs first. ppo.py cannot resume, so a run still
 # going at the time limit is lost (runs that already finished are kept).
 MAX_JOB_HOURS="${MAX_JOB_HOURS:-24}"
 SAFETY="${SAFETY:-1.3}"
+=======
+# (+10 min startup) fits in MAX_JOB_HOURS; each job runs its longest runs first. ppo.py cannot resume, so a run still
+# going at the time limit is lost (runs that already finished are kept).
+MAX_JOB_HOURS="${MAX_JOB_HOURS:-24}"
+SAFETY="${SAFETY:-1.1}"
+>>>>>>> 0a012e88f2373c469966fa34b94eb806c8e160fe
 TIERS="${TIERS:-3 12 24 72 168}"
 MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-${CONCURRENCY:-10}}"   # CONCURRENCY: older name, same meaning
 [[ "$MAX_RUNS_PER_GPU" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_RUNS_PER_GPU must be a positive integer, got $MAX_RUNS_PER_GPU"; exit 1; }
@@ -55,7 +62,11 @@ concurrency() {  # concurrency <env>: runs at once on one GPU (MAX_RUNS_PER_GPU,
   awk -v c="$MAX_RUNS_PER_GPU" -v f="${MEM_STUDY_GPU_FRACTION[$1]}" 'BEGIN { k = int(0.9 / f + 1e-9); print (c < k ? c : k) }'
 }
 job_capacity() {  # job_capacity <hours>: minutes of (SAFETY-scaled) work that fit in a job of that time limit
+<<<<<<< HEAD
   awk -v m="$1" 'BEGIN { print int(m * 60) - 31 }'
+=======
+  awk -v m="$1" 'BEGIN { print int(m * 60) - 11 }'
+>>>>>>> 0a012e88f2373c469966fa34b94eb806c8e160fe
 }
 bin_pack() {  # bin_pack <hours>: reads "<minutes> <id>" lines, prints "<job> <id>" lines, longest runs first
   # (first-fit decreasing; a run longer than a job gets a job of its own)
@@ -82,7 +93,7 @@ for env in "${ENVS[@]}"; do
     cap="$(mem_study_cap "$vars")"; h="$(mem_study_hours "$env" "$cap")"
     m=$(awk -v h="$h" -v s="$SAFETY" 'BEGIN { print int(h * s * 60 + 0.999) }')
     if (( m > $(job_capacity "$MAX_JOB_HOURS") )); then
-      echo "warning: ${env} ${name} needs ~${h}h alone (x${SAFETY} + 30 min startup > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
+      echo "warning: ${env} ${name} needs ~${h}h alone (x${SAFETY} + 10 min startup > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
     fi
     for seed in "${SEEDS[@]}"; do
       if [[ "$SKIP_COMPLETED" == 1 ]] && completed "$env" "$vars" "$arm" "$seed"; then
@@ -110,7 +121,7 @@ for env in "${ENVS[@]}"; do
     else
       job="mem-${env}-pack$(( b + 1 ))of${n_env_jobs}${MEM_STUDY_TAG}"
     fi
-    limit=$(( total + 30 )); max_limit=$(awk -v m="$MAX_JOB_HOURS" 'BEGIN { print int(m * 60) - 1 }')
+    limit=$(( total + 10 )); max_limit=$(awk -v m="$MAX_JOB_HOURS" 'BEGIN { print int(m * 60) - 1 }')
     (( limit > max_limit )) && limit=$max_limit
     time=$(printf '%02d:%02d:00' $(( limit / 60 )) $(( limit % 60 )))
     req_minutes=$(( req_minutes + limit ))

@@ -57,6 +57,8 @@ def make_env(args):
         config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
         eval_moves = getattr(args, 'slidingpuzzle_eval_num_random_moves', 0)
         config.eval_num_random_moves = eval_moves if eval_moves > 0 else config.num_random_moves
+        # Evaluation-scramble (eval_reset) episodes: 0 = the training episode length.
+        config.eval_episode_length = getattr(args, 'slidingpuzzle_eval_episode_length', 0) or config.episode_length
         return SlidingPuzzleEnv, config
     raise ValueError(f"Environment {args.env_id} not supported (expected sokoban-<train>-<eval>, "
                      f"rushhour-<train>-<eval>, lightsout-<m>x<n> or slidingpuzzle-<N>x<N>)")
