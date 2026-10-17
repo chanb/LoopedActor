@@ -31,9 +31,12 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_UPDATE=joint|all_c  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
-#                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py)
-#   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
+#   HALT_UPDATE=joint|all_c|tpo  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
+#                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py), or
+#                       Target Policy Optimization on p(c|s) + PPO on the sampled c's readout (tpo; see ppo.py)
+#   HALT_TPO_ETA=eta    mem_halt, HALT_UPDATE=tpo: target temperature in batch-advantage-std units (default 1.0; the run
+#                       name gets _heta<eta> when != 1.0)
+#   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c|tpo: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
 # (No TOKENIZER option: Lights Out uses the per-cell press head, which needs the cell tokenizer.)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
@@ -95,7 +98,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
-HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"
+HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -143,14 +146,18 @@ if [[ "$ARM" == mem_halt ]]; then
   case "$HALT_UPDATE" in
     joint) ;;
     all_c) ARM_FLAGS+=(--halt_update=all_c); RUN+="_hallc" ;;
-    *) echo "HALT_UPDATE must be joint or all_c, got $HALT_UPDATE"; exit 1 ;;
+    tpo)
+      awk -v e="$HALT_TPO_ETA" 'BEGIN { exit !(e + 0 == e && e > 0) }' || { echo "HALT_TPO_ETA must be > 0, got $HALT_TPO_ETA"; exit 1; }
+      ARM_FLAGS+=(--halt_update=tpo --halt_tpo_eta="$HALT_TPO_ETA"); RUN+="_htpo"
+      awk -v e="$HALT_TPO_ETA" 'BEGIN { exit !(e != 1) }' && RUN+="_heta${HALT_TPO_ETA}" ;;
+    *) echo "HALT_UPDATE must be joint, all_c or tpo, got $HALT_UPDATE"; exit 1 ;;
   esac
   awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e + 0 == e && e >= 0 && e <= 1) }' || { echo "HALT_EXPLORE must be in [0, 1], got $HALT_EXPLORE"; exit 1; }
   if awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e > 0) }'; then
-    [[ "$HALT_UPDATE" == all_c ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c"; exit 1; }
+    [[ "$HALT_UPDATE" == all_c || "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c or tpo"; exit 1; }
     ARM_FLAGS+=(--halt_explore="$HALT_EXPLORE"); RUN+="_hex${HALT_EXPLORE}"
   fi
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_EXPLORE (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_TPO_ETA / HALT_EXPLORE (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
