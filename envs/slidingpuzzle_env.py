@@ -42,6 +42,7 @@ def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         grid_size=3,               # N: 3 = 8-puzzle, 4 = 15-puzzle
         episode_length=40,
+        eval_episode_length=40,    # eval_reset (eval/test_*) episodes; set by make_env (envs/utils.py)
         num_random_moves=10,       # training scramble length
         eval_num_random_moves=10,  # evaluation scramble length
         step_penalty=0.0,          # 0 = sparse reward (jumanji SparseRewardFn)

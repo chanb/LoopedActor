@@ -31,6 +31,16 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
+#   HALT_SIGNAL=kl|tv|hellinger|latent|latent_rel  mem_halt: halting reads the policy KL between passes (default kl), their
+#                       total variation (tv; ~sqrt(KL/2), so try HALT_KL=2e-2), their squared Hellinger distance
+#                       (hellinger; ~KL/4, initialized at HALT_KL/4 so HALT_KL stays KL-equivalent), the mean squared
+#                       latent change (latent) or that relative to the latents' mean square (latent_rel); HALT_KL is then
+#                       the initial threshold on it
+#   HALT_ALPHA_INIT=a   mem_halt: initial alpha, beta starting at a * log HALT_KL (default 0 = 2 for HALT_SIGNAL=tv, else 1)
+#   HALT_OPTIMIZER=shared|sgd|adam  mem_halt: optimizer of alpha / beta (default shared = the main Adam; sgd / adam = a
+#                       separate one at HALT_LR, not gradient-clipped)
+#   HALT_LR=lr          HALT_OPTIMIZER=sgd|adam: its learning rate (default 1e-2)
+#   HALT_MOMENTUM=m     HALT_OPTIMIZER=sgd: momentum (default 0 = plain SGD)
 # (No TOKENIZER option: Lights Out uses the per-cell press head, which needs the cell tokenizer.)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
@@ -92,6 +102,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
+HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_ALPHA_INIT="${HALT_ALPHA_INIT:-0}"; HALT_OPTIMIZER="${HALT_OPTIMIZER:-shared}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_MOMENTUM="${HALT_MOMENTUM:-0}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -136,7 +147,22 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD (shared study settings)
+  case "$HALT_SIGNAL" in
+    kl) ;;
+    tv|hellinger|latent|latent_rel) ARM_FLAGS+=(--halt_signal="$HALT_SIGNAL"); RUN+="_hs${HALT_SIGNAL}" ;;
+    *) echo "HALT_SIGNAL must be kl, tv, hellinger, latent or latent_rel, got $HALT_SIGNAL"; exit 1 ;;
+  esac
+  awk -v a="$HALT_ALPHA_INIT" 'BEGIN { exit !(a + 0 == a && a >= 0) }' || { echo "HALT_ALPHA_INIT must be >= 0, got $HALT_ALPHA_INIT"; exit 1; }
+  awk -v a="$HALT_ALPHA_INIT" 'BEGIN { exit !(a > 0) }' && { ARM_FLAGS+=(--halt_alpha_init="$HALT_ALPHA_INIT"); RUN+="_ha${HALT_ALPHA_INIT}"; }
+  case "$HALT_OPTIMIZER" in
+    shared) ;;
+    sgd|adam) ARM_FLAGS+=(--halt_optimizer="$HALT_OPTIMIZER" --halt_learning_rate="$HALT_LR"); RUN+="_h${HALT_OPTIMIZER}${HALT_LR}"
+              if [[ "$HALT_OPTIMIZER" == sgd ]] && awk -v m="$HALT_MOMENTUM" 'BEGIN { exit !(m > 0) }'; then
+                ARM_FLAGS+=(--halt_momentum="$HALT_MOMENTUM"); RUN+="_hm${HALT_MOMENTUM}"
+              fi ;;
+    *) echo "HALT_OPTIMIZER must be shared, sgd or adam, got $HALT_OPTIMIZER"; exit 1 ;;
+  esac
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_SIGNAL / HALT_ALPHA_INIT / HALT_OPTIMIZER (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \

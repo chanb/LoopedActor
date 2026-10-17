@@ -78,7 +78,9 @@ class Args:
     lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
     lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
-    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode
+    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
+    slidingpuzzle_eval_episode_length: int = 0    # slidingpuzzle-*: steps per evaluation-scramble (eval/test_*) episode;
+                                                  # 0 = slidingpuzzle_episode_length
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
@@ -157,6 +159,16 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_alpha_init: float = 0.0          # fprm_mem_halt: initial alpha (beta starts at alpha * log halt_kl); 0 = 2 for
+                                          # halt_signal='tv' (first order in the policy change), else 1
+    halt_signal: str = 'kl'               # fprm_mem_halt: what h_i = sigmoid(beta - alpha log D_i) reads: 'kl' (policy KL between
+                                          # passes) | 'tv' (policy total variation) | 'hellinger' (squared Hellinger) | 'latent' (mean squared latent change) | 'latent_rel' (the same / mean square
+                                          # of the new latents); halt_kl is then the initial threshold on D_i
+    halt_optimizer: str = 'shared'        # fprm_mem_halt: optimizer of the halting parameters (alpha, beta; HALT_PARAMS):
+                                          # 'shared' = the main Adam; 'sgd' | 'adam' = a separate optimizer at halt_learning_rate
+                                          # (not clipped by max_grad_norm, which then clips the other parameters only)
+    halt_learning_rate: float = 1e-2      # halt_optimizer != 'shared': its learning rate (annealed with anneal_lr)
+    halt_momentum: float = 0.0            # halt_optimizer='sgd': momentum (0 = plain SGD)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -235,22 +247,38 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     return make_policy
 
 
+HALT_PARAMS = ('halt_alpha_raw', 'halt_beta')  # fprm_mem_halt's halting parameters (alpha, beta bias + beta head)
+
+
 def make_optimizer(args):
-    if args.anneal_lr:
+    def schedule(lr):
+        if not args.anneal_lr:
+            return lr
         total_grad_steps = (
             args.num_training_step
             * args.num_epochs_per_rollout
             * args.num_minibatches_per_rollout
         )
-        learning_rate = optax.linear_schedule(
-            args.learning_rate, 0.0, total_grad_steps
-        )
-    else:
-        learning_rate = args.learning_rate
-    tx = optax.adam(learning_rate=learning_rate)
+        return optax.linear_schedule(lr, 0.0, total_grad_steps)
+
+    tx = optax.adam(learning_rate=schedule(args.learning_rate))
     if args.max_grad_norm > 0.0:
         tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx)
-    return tx
+    if args.halt_optimizer == 'shared':
+        return tx
+    if args.halt_optimizer == 'sgd':
+        halt_tx = optax.sgd(learning_rate=schedule(args.halt_learning_rate), momentum=args.halt_momentum or None)
+    elif args.halt_optimizer == 'adam':
+        halt_tx = optax.adam(learning_rate=schedule(args.halt_learning_rate))
+    else:
+        raise ValueError(f"Unknown halt_optimizer: {args.halt_optimizer}")
+
+    def labels(params):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, _: 'halt' if any(getattr(k, 'key', None) in HALT_PARAMS for k in path) else 'main', params
+        )
+
+    return optax.multi_transform({'main': tx, 'halt': halt_tx}, labels)
 
 
 def main(args: Args):
@@ -402,6 +430,8 @@ def main(args: Args):
             halt_kl=args.halt_kl,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
+            halt_signal=args.halt_signal,
+            halt_alpha_init=args.halt_alpha_init,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -439,6 +469,10 @@ def main(args: Args):
     else:
         raise ValueError(f"Unknown architecture: {args.architecture}")
 
+    if args.halt_signal != 'kl':
+        assert args.architecture == 'fprm_mem_halt', '--halt_signal needs --architecture fprm_mem_halt'
+    if args.halt_optimizer != 'shared':
+        assert args.architecture == 'fprm_mem_halt', '--halt_optimizer needs --architecture fprm_mem_halt'
     training_state = PPOTrainingState.create(
         apply_fn=None,
         params=actor_critic_network.init(key_policy, x=jnp.zeros((1, obs_size + goal_size))),
