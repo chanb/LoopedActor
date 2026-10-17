@@ -4,7 +4,8 @@
 #   arm: looped | iso_flops | iso_param | iso_loop | cot | iso_cot | perceiver | iso_perceiver | mem | iso_mem | mem_halt | rim | iso_rim
 # Optional environment variables:
 #   GRID=N              board size N x N (default 3 = 8-puzzle)
-#   EPISODE_LENGTH=N    steps per episode (default 40)
+#   EPISODE_LENGTH=N    steps per training episode (default 40; also used by the eval/train_* episodes)
+#   EVAL_EPISODE_LENGTH=N  steps per evaluation-scramble (eval/test_*) episode (default EPISODE_LENGTH)
 #   NUM_RANDOM_MOVES=K  training scramble length (random walk of the blank; default 100)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
@@ -82,7 +83,7 @@
 #
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
-GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"
+GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$EPISODE_LENGTH}"
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
@@ -182,6 +183,7 @@ esac
 [[ "$GRID" =~ ^[0-9]+$ ]] || { echo "GRID must be an integer N (board N x N), got $GRID"; exit 1; }
 [[ "$GRID" != 3 ]] && RUN+="_g${GRID}"
 [[ "$EPISODE_LENGTH" != 40 ]] && RUN+="_el${EPISODE_LENGTH}"
+[[ "$EVAL_EPISODE_LENGTH" != "$EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
 [[ "$NUM_RANDOM_MOVES" != 100 ]] && RUN+="_rm${NUM_RANDOM_MOVES}"
 [[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"
 case "$MLP_TYPE" in
@@ -228,7 +230,7 @@ ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE
 RUN+="_s${SEED}"
 [[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.
-HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH"
+HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_length="$EPISODE_LENGTH" --slidingpuzzle_eval_episode_length="$EVAL_EPISODE_LENGTH"
   --slidingpuzzle_num_random_moves="$NUM_RANDOM_MOVES" --slidingpuzzle_eval_num_random_moves="$EVAL_NUM_RANDOM_MOVES"
   --fprm_num_layers=2 --max_grad_norm=1.0
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"

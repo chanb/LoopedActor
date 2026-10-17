@@ -78,7 +78,8 @@ class Args:
     lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
     lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
-    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode
+    slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
+    slidingpuzzle_eval_episode_length: int = 0    # slidingpuzzle-*: steps per evaluation-scramble (eval/test_*) episode;
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
