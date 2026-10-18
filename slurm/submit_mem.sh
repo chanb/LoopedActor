@@ -82,7 +82,7 @@ for env in "${ENVS[@]}"; do
     cap="$(mem_study_cap "$vars")"; h="$(mem_study_hours "$env" "$cap")"
     m=$(awk -v h="$h" -v s="$SAFETY" 'BEGIN { print int(h * s * 60 + 0.999) }')
     if (( m > $(job_capacity "$MAX_JOB_HOURS") )); then
-      echo "warning: ${env} ${name} needs ~${h}h alone (x${SAFETY} + 10 min startup > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
+      echo "warning: ${env} ${name} needs ~${h}h alone (x${SAFETY} + 30 min startup > ${MAX_JOB_HOURS}h limit); its runs may hit the time limit" >&2
     fi
     for seed in "${SEEDS[@]}"; do
       if [[ "$SKIP_COMPLETED" == 1 ]] && completed "$env" "$vars" "$arm" "$seed"; then
@@ -110,7 +110,7 @@ for env in "${ENVS[@]}"; do
     else
       job="mem-${env}-pack$(( b + 1 ))of${n_env_jobs}${MEM_STUDY_TAG}"
     fi
-    limit=$(( total + 10 )); max_limit=$(awk -v m="$MAX_JOB_HOURS" 'BEGIN { print int(m * 60) - 1 }')
+    limit=$(( total + 30 )); max_limit=$(awk -v m="$MAX_JOB_HOURS" 'BEGIN { print int(m * 60) - 1 }')
     (( limit > max_limit )) && limit=$max_limit
     time=$(printf '%02d:%02d:00' $(( limit / 60 )) $(( limit % 60 )))
     req_minutes=$(( req_minutes + limit ))
