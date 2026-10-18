@@ -36,6 +36,7 @@
 #   HALT_TPO_ETA=eta    mem_halt, HALT_UPDATE=tpo: target temperature in batch-advantage-std units (default 1.0; the run
 #                       name gets _heta<eta> when != 1.0)
 #   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c|tpo: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
+#   HALT_EXTEND=k       mem_halt, HALT_UPDATE=all_c|tpo: rollouts then think min(c + j, T) passes, j ~ Uniform{0..k} (default 0)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per board cell, flat = one token per observation value,
 #                         conv = 3x3 conv, one token per output channel
@@ -97,7 +98,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
-HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
+HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_EXTEND="${HALT_EXTEND:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -156,6 +157,11 @@ if [[ "$ARM" == mem_halt ]]; then
   if awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e > 0) }'; then
     [[ "$HALT_UPDATE" == all_c || "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c or tpo"; exit 1; }
     ARM_FLAGS+=(--halt_explore="$HALT_EXPLORE"); RUN+="_hex${HALT_EXPLORE}"
+  fi
+  [[ "$HALT_EXTEND" =~ ^[0-9]+$ ]] || { echo "HALT_EXTEND must be an integer >= 0, got $HALT_EXTEND"; exit 1; }
+  if (( HALT_EXTEND > 0 )); then
+    [[ "$HALT_UPDATE" == all_c || "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXTEND > 0 needs HALT_UPDATE=all_c or tpo"; exit 1; }
+    ARM_FLAGS+=(--halt_extend="$HALT_EXTEND"); RUN+="_hext${HALT_EXTEND}"
   fi
 fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_TPO_ETA / HALT_EXPLORE (shared study settings)
 case "$THOUGHT_NORM" in

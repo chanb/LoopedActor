@@ -20,7 +20,7 @@ the readout of pass c is selected afterwards, so passes after c get no gradient 
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ mu(c | s) = (1 - halt_explore) p(c | s) + halt_explore * Uniform{c that can halt}; halt_explore = 0 is
-c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
+c ~ p(c | s); halt_extend = k then thinks c' = min(c + j, T), j ~ Uniform{0..k}) > neither (evaluation: c = argmax p(c | s)).
 
 The value is read out from the last pass (fprm_mem's `value_at_max_iters`): since c is an action, a baseline that
 depended on it would bias the halting gradient.
@@ -28,10 +28,13 @@ depended on it would bias the halting gradient.
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
 plus 'halt_log_prob' (log p(c | s)), 'halt_log_probs' (log p(. | s), [B, T]), 'halt_behaviour_log_probs'
 (log mu(. | s), [B, T]), 'logits_all' (the readout of every pass, [B, T, A]; ppo.py's halt_update='all_c'), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
-'halt_beta_t' (beta_i, [T, B]).
+'halt_beta_t' (beta_i, [T, B]), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
+passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
 """
 
 import math
+
+import numpy as np
 
 import distrax
 import flax.linen as nn
@@ -44,6 +47,7 @@ from models.fprm import (
     STOP_CONVERGED,
     STOP_ITERATION_CAP,
     STOP_NONFINITE,
+    compute_residuals,
     make_latent_init,
     rms_norm,
 )
@@ -80,6 +84,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
     halt_explore: float = 0.0      # rollouts (halt_key): mix this much of a uniform think time into p(c | s)
+    halt_extend: int = 0           # rollouts (halt_key): think c' = min(c + j, T) passes, j ~ Uniform{0..k}, c ~ the above
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -94,6 +99,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.max_think_iters >= 1, self.max_think_iters
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
         assert 0.0 <= self.halt_explore <= 1.0, self.halt_explore
+        assert self.halt_extend >= 0, self.halt_extend
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -192,6 +198,7 @@ class FPRMMemHaltActorValue(nn.Module):
             finite = (jnp.all(jnp.isfinite(logits), axis=-1) & jnp.isfinite(value)
                       & jnp.all(jnp.isfinite(out), axis=-1) & jnp.all(jnp.isfinite(z_cells), axis=(-2, -1)))
             z_cells = jnp.where(finite[:, None, None], z_cells, z)
+            latent_res, _, _ = compute_residuals(z, z_cells, jnp.ones(z.shape[:2], bool), cfg.eps)
             out = jnp.where(finite[:, None], out, token)
             logits = jnp.where(finite[:, None], logits, logits_prev)
             value = jnp.where(finite, value, value_prev)
@@ -203,12 +210,12 @@ class FPRMMemHaltActorValue(nn.Module):
             kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1 (no previous policy) is forced h = 0 below
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
-            return carry, (logits, value, beta, kl, nonfinite)
+            return carry, (logits, value, beta, kl, nonfinite, latent_res)
 
         if self.remat:
             body = jax.checkpoint(body, prevent_cse=False)
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
-        _, (logits_t, value_t, beta_t, kl_t, nonfinite_t) = jax.lax.scan(body, init, jnp.arange(T))
+        _, (logits_t, value_t, beta_t, kl_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
         alpha = jax.nn.softplus(self.halt_alpha_raw)
@@ -225,6 +232,15 @@ class FPRMMemHaltActorValue(nn.Module):
                 jnp.broadcast_to(log_unif, log_pc_b.shape))
         else:
             log_mu_b = log_pc_b
+        # Think-time extension: mu'(c') = sum_c mu(c) P(c' | c), P(c' | c) = P(min(c + j, T) = c'), j ~ Uniform{0..k}.
+        if self.halt_extend > 0:
+            k = self.halt_extend
+            P = np.zeros((T, T))
+            for i in range(T):
+                for j in range(k + 1):
+                    P[i, min(i + j, T - 1)] += 1.0 / (k + 1)
+            log_P = np.where(P > 0, np.log(np.maximum(P, 1e-300)), _NEG)
+            log_mu_b = jax.nn.logsumexp(log_mu_b[:, :, None] + log_P[None], axis=1)
 
         if halt_steps is not None:
             c = jnp.asarray(halt_steps, jnp.int32).reshape(B)
@@ -252,6 +268,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_alpha', alpha)
         self.sow('intermediates', 'halt_beta_t', beta_t)
+        self.sow('intermediates', 'latent_residual_t', latent_res_t)
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
         reason = jnp.where(nonfinite, STOP_NONFINITE, reason)

@@ -166,6 +166,7 @@ class Args:
                                           # plus PPO on the sampled c's readout pi_c(a|s) (see learn_step)
     halt_tpo_eta: float = 1.0             # halt_update='tpo': target temperature, in units of the batch advantage std
     halt_explore: float = 0.0             # fprm_mem_halt, halt_update='all_c'|'tpo': rollouts sample c from (1 - this) p(c|s) + this * Uniform
+    halt_extend: int = 0                  # fprm_mem_halt, halt_update='all_c'|'tpo': rollouts then think c' = min(c + j, T), j ~ Uniform{0..k}
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -426,6 +427,7 @@ def main(args: Args):
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_explore=args.halt_explore,
+            halt_extend=args.halt_extend,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -478,8 +480,8 @@ def main(args: Args):
     halt_tpo = stochastic_halt and args.halt_update == 'tpo'
     assert args.halt_tpo_eta > 0, args.halt_tpo_eta
     # 'joint' stores the target's log p(c|s) as the behaviour probability, so c must be sampled from p itself.
-    assert halt_all_c or halt_tpo or args.halt_explore == 0.0, \
-        '--halt_explore needs --architecture=fprm_mem_halt --halt_update=all_c|tpo'
+    assert halt_all_c or halt_tpo or (args.halt_explore == 0.0 and args.halt_extend == 0), \
+        '--halt_explore / --halt_extend need --architecture=fprm_mem_halt --halt_update=all_c|tpo'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt, halt_all_c or halt_tpo)
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
@@ -690,6 +692,12 @@ def main(args: Args):
             # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
+            # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
+            res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
+            c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)
+            halt_metrics['latent_res_at_c'] = jnp.mean(jnp.take_along_axis(res_t, c_idx[None], axis=0))
+            mean_res = jnp.mean(res_t, axis=-1)
+            halt_metrics.update({f'latent_res_{i + 1}': mean_res[i] for i in range(mean_res.shape[0])})
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
         if halt_all_c:
