@@ -9,7 +9,7 @@
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
 #               (every pass runs); HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE
-#               (joint|all_c|tpo) / HALT_TPO_ETA (tpo only) / HALT_EXPLORE / HALT_EXTEND are read by train.sh
+#               (joint|all_c|tpo) / HALT_TPO_ETA (tpo only) / HALT_EXPLORE / HALT_EXTEND / HALT_EXTEND_BACK are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -39,6 +39,7 @@ case "${HALT_UPDATE:-joint}" in
 esac
 [[ -n "${HALT_EXPLORE:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXPLORE=${HALT_EXPLORE}"; MEM_STUDY_TAG+="_hex${HALT_EXPLORE}"; }
 [[ -n "${HALT_EXTEND:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXTEND=${HALT_EXTEND}"; MEM_STUDY_TAG+="_hext${HALT_EXTEND}"; }
+[[ -n "${HALT_EXTEND_BACK:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXTEND_BACK=${HALT_EXTEND_BACK}"; MEM_STUDY_TAG+="_hextb${HALT_EXTEND_BACK}"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then

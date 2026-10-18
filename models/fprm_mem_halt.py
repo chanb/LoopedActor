@@ -17,7 +17,7 @@ The think time c is an action of the joint policy:
 
 (pass 1 has no previous policy, so it never halts unless T = 1). All T passes are always executed (as in fprm_mem);
 the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss
-(unless ppo.py's --halt_extend trains the other readouts too).
+(unless ppo.py's --halt_train_k trains the other readouts too).
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ mu(c | s) = (1 - halt_explore) p(c | s) + halt_explore * Uniform{c that can halt}; halt_explore = 0 is

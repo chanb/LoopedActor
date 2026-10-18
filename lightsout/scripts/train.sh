@@ -37,7 +37,8 @@
 #   HALT_TPO_ETA=eta    mem_halt, HALT_UPDATE=tpo: target temperature in batch-advantage-std units (default 1.0; the run
 #                       name gets _heta<eta> when != 1.0)
 #   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c|tpo: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
-#   HALT_EXTEND=k       mem_halt, HALT_UPDATE=tpo: the action loss trains every readout pi_c', c' <= c + k, not only pi_c (default 0)
+#   HALT_EXTEND=k       mem_halt, HALT_UPDATE=tpo: the action loss also trains the readouts pi_c', c - j <= c' <= c + k, not only pi_c
+#   HALT_EXTEND_BACK=j  (--halt_train_k / --halt_train_j; both default 0)
 # (No TOKENIZER option: Lights Out uses the per-cell press head, which needs the cell tokenizer.)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
@@ -99,7 +100,7 @@ MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTY
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
-HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_EXTEND="${HALT_EXTEND:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
+HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_EXTEND="${HALT_EXTEND:-0}"; HALT_EXTEND_BACK="${HALT_EXTEND_BACK:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -158,10 +159,11 @@ if [[ "$ARM" == mem_halt ]]; then
     [[ "$HALT_UPDATE" == all_c || "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c or tpo"; exit 1; }
     ARM_FLAGS+=(--halt_explore="$HALT_EXPLORE"); RUN+="_hex${HALT_EXPLORE}"
   fi
-  [[ "$HALT_EXTEND" =~ ^[0-9]+$ ]] || { echo "HALT_EXTEND must be an integer >= 0, got $HALT_EXTEND"; exit 1; }
-  if (( HALT_EXTEND > 0 )); then
-    [[ "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXTEND > 0 needs HALT_UPDATE=tpo"; exit 1; }
-    ARM_FLAGS+=(--halt_extend="$HALT_EXTEND"); RUN+="_hext${HALT_EXTEND}"
+  [[ "$HALT_EXTEND" =~ ^[0-9]+$ && "$HALT_EXTEND_BACK" =~ ^[0-9]+$ ]] || { echo "HALT_EXTEND / HALT_EXTEND_BACK must be integers >= 0"; exit 1; }
+  if (( HALT_EXTEND > 0 || HALT_EXTEND_BACK > 0 )); then
+    [[ "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXTEND / HALT_EXTEND_BACK > 0 need HALT_UPDATE=tpo"; exit 1; }
+    ARM_FLAGS+=(--halt_train_k="$HALT_EXTEND" --halt_train_j="$HALT_EXTEND_BACK"); RUN+="_hext${HALT_EXTEND}"
+    (( HALT_EXTEND_BACK > 0 )) && RUN+="_hextb${HALT_EXTEND_BACK}"
   fi
 fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_TPO_ETA / HALT_EXPLORE (shared study settings)
 case "$THOUGHT_NORM" in

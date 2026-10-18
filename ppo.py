@@ -166,8 +166,11 @@ class Args:
                                           # plus PPO on the sampled c's readout pi_c(a|s) (see learn_step)
     halt_tpo_eta: float = 1.0             # halt_update='tpo': target temperature, in units of the batch advantage std
     halt_explore: float = 0.0             # fprm_mem_halt, halt_update='all_c'|'tpo': rollouts sample c from (1 - this) p(c|s) + this * Uniform
-    halt_extend: int = 0                  # fprm_mem_halt, halt_update='tpo': the action loss trains every readout pi_c', c' <= c + this
-                                          # (c the sampled think time; >= max_think_iters trains every pass), not only pi_c
+    halt_train_k: int = 0                 # fprm_mem_halt, halt_update='tpo': the action loss also trains the readouts pi_c',
+                                          # c - halt_train_j <= c' <= c + halt_train_k (c the sampled think time), not only pi_c
+    halt_train_j: int = 0                 # see halt_train_k (>= max_think_iters with it trains every pass)
+    halt_train_coef: float = 1.0          # halt_train_k > 0: total weight of the extra readouts (the sampled pass has weight 1)
+    halt_train_rho_max: float = 10.0      # halt_train_k > 0: truncation of the ratio pi_old,c'(a|s) / pi_old,c(a|s)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -482,7 +485,9 @@ def main(args: Args):
     # 'joint' stores the target's log p(c|s) as the behaviour probability, so c must be sampled from p itself.
     assert halt_all_c or halt_tpo or args.halt_explore == 0.0, \
         '--halt_explore needs --architecture=fprm_mem_halt --halt_update=all_c|tpo'
-    assert halt_tpo or args.halt_extend == 0, '--halt_extend needs --architecture=fprm_mem_halt --halt_update=tpo'
+    assert args.halt_train_j >= 0 and args.halt_train_k >= 0, (args.halt_train_j, args.halt_train_k)
+    assert halt_tpo or args.halt_train_j == args.halt_train_k == 0, \
+        '--halt_train_j / --halt_train_k need --architecture=fprm_mem_halt --halt_update=tpo'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt, halt_all_c or halt_tpo)
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
@@ -719,24 +724,29 @@ def main(args: Args):
                 distrax.Categorical(logits=logits), values,
                 behaviour_action_log_probs=old_lpa_c, sample_weight=jax.lax.stop_gradient(is_c),
             )
-            if args.halt_extend > 0:
-                # Train every readout pi_c', c' <= c + halt_extend, not only the sampled c's, so that u_c reflects what each
-                # depth can achieve rather than how much each has been trained. PPO with the per-pass ratio
-                # r_c' = pi_c'(a|s) / pi_old,c'(a|s), weighted by pi_old,c'(a|s) / pi_bar(a|s) (a was drawn from pi_bar, not
-                # pi_c'), averaged over the trained passes.
-                log_pi_all = jax.nn.log_softmax(inter['intermediates']['logits_all'][0], axis=-1)  # [B, T, A]
-                lpa = jnp.take_along_axis(log_pi_all, data.action[:, None, None].astype(jnp.int32), axis=-1)[..., 0]
-                T = lpa.shape[-1]
-                train = (ex['halt_old_log_pc'] > -1e8) & (jnp.arange(1, T + 1) <= ex['compute_time'][:, None] + args.halt_extend)
-                w = jnp.where(train, jnp.exp(ex['halt_old_log_pa'] - ex['halt_log_mu_a'][:, None]), 0.0)
-                log_r = jnp.where(train, lpa - ex['halt_old_log_pa'], 0.0)
-                r = jnp.exp(log_r)
-                adv = advantages[:, None]
-                surr = jnp.minimum(r * adv, jnp.clip(r, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * adv)
-                policy_loss = -jnp.mean(jnp.sum(w * surr, axis=-1) / jnp.maximum(jnp.sum(train, axis=-1), 1))
-                approx_kl = jax.lax.stop_gradient(
-                    jnp.mean(jnp.sum(w * (r - 1.0 - log_r), axis=-1) / jnp.maximum(jnp.sum(train, axis=-1), 1)))
-                halt_metrics['halt_extend_passes'] = jnp.mean(jnp.sum(train, axis=-1))
+            if args.halt_train_j > 0 or args.halt_train_k > 0:
+                # Also train the other readouts pi_c', c - halt_train_j <= c' <= c + halt_train_k (c' != c, passes that can
+                # halt), so that u_c reflects what each depth can achieve. The sampled pass keeps weight 1; the others share
+                # halt_train_coef, each weighted by the truncated ratio min(pi_old,c'(a|s) / pi_old,c(a|s), halt_train_rho_max).
+                c = ex['compute_time'].astype(jnp.int32)                                   # [B], 1-indexed
+                log_pi_all = jax.nn.log_softmax(inter['intermediates']['logits_all'][0], -1)
+                lpa = jnp.take_along_axis(log_pi_all, data.action[:, None, None].astype(jnp.int32), -1)[..., 0]  # [B,T]
+                old_lpa = ex['halt_old_log_pa']                                             # [B,T]
+                old_lpa_c = jnp.take_along_axis(old_lpa, (c - 1)[:, None], -1)              # [B,1]
+
+                passes = jnp.arange(1, lpa.shape[-1] + 1)[None, :]
+                valid = ex['halt_old_log_pc'] > -1e8                                        # passes that can halt
+                extra = (valid & (passes >= c[:, None] - args.halt_train_j) & (passes <= c[:, None] + args.halt_train_k)
+                         & (passes != c[:, None]))
+                rho = jnp.exp(jnp.minimum(old_lpa - old_lpa_c, jnp.log(args.halt_train_rho_max)))
+                w = jnp.where(passes == c[:, None], 1.0,
+                              jnp.where(extra, args.halt_train_coef * rho / jnp.maximum(extra.sum(-1, keepdims=True), 1), 0.0))
+                w = jax.lax.stop_gradient(w * is_c[:, None])                                # keep the p_old/mu reweighting
+
+                r = jnp.exp(lpa - old_lpa)
+                A = advantages[:, None]
+                surr = jnp.minimum(r * A, jnp.clip(r, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * A)
+                policy_loss = -jnp.mean(jnp.sum(w * surr, -1))
             # Halt head: cross-entropy to the frozen target q(c|s) built in learn_step (zero on forced-zero c).
             q = ex['halt_target']
             lpc = inter['intermediates']['halt_log_probs'][0]
