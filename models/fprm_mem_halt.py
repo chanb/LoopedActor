@@ -16,11 +16,12 @@ The think time c is an action of the joint policy:
     log p(c, a | s) = log p(c | s) + log pi_c(a | s)
 
 (pass 1 has no previous policy, so it never halts unless T = 1). All T passes are always executed (as in fprm_mem);
-the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
+the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss
+(unless ppo.py's --halt_extend trains the other readouts too).
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ mu(c | s) = (1 - halt_explore) p(c | s) + halt_explore * Uniform{c that can halt}; halt_explore = 0 is
-c ~ p(c | s); halt_extend = k then thinks c' = min(c + j, T), j ~ Uniform{0..k}) > neither (evaluation: c = argmax p(c | s)).
+c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
 
 The value is read out from the last pass (fprm_mem's `value_at_max_iters`): since c is an action, a baseline that
 depended on it would bias the halting gradient.
@@ -33,8 +34,6 @@ passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against th
 """
 
 import math
-
-import numpy as np
 
 import distrax
 import flax.linen as nn
@@ -84,7 +83,6 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
     halt_explore: float = 0.0      # rollouts (halt_key): mix this much of a uniform think time into p(c | s)
-    halt_extend: int = 0           # rollouts (halt_key): think c' = min(c + j, T) passes, j ~ Uniform{0..k}, c ~ the above
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -99,7 +97,6 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.max_think_iters >= 1, self.max_think_iters
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
         assert 0.0 <= self.halt_explore <= 1.0, self.halt_explore
-        assert self.halt_extend >= 0, self.halt_extend
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -232,15 +229,6 @@ class FPRMMemHaltActorValue(nn.Module):
                 jnp.broadcast_to(log_unif, log_pc_b.shape))
         else:
             log_mu_b = log_pc_b
-        # Think-time extension: mu'(c') = sum_c mu(c) P(c' | c), P(c' | c) = P(min(c + j, T) = c'), j ~ Uniform{0..k}.
-        if self.halt_extend > 0:
-            k = self.halt_extend
-            P = np.zeros((T, T))
-            for i in range(T):
-                for j in range(k + 1):
-                    P[i, min(i + j, T - 1)] += 1.0 / (k + 1)
-            log_P = np.where(P > 0, np.log(np.maximum(P, 1e-300)), _NEG)
-            log_mu_b = jax.nn.logsumexp(log_mu_b[:, :, None] + log_P[None], axis=1)
 
         if halt_steps is not None:
             c = jnp.asarray(halt_steps, jnp.int32).reshape(B)
