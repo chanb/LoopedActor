@@ -83,6 +83,7 @@ class Args:
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_min_random_moves: int = 0       # slidingpuzzle-*: > 0 draws each training scramble length uniformly from
                                                   # [this, num_random_moves] (eval_reset stays fixed; 0 = fixed length)
+    slidingpuzzle_random_moves_zipf: float = 0.0  # slidingpuzzle-*, min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
     # algorithm

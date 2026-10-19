@@ -10,6 +10,8 @@
 #   MIN_RANDOM_MOVES=k  > 0: each training scramble's length is drawn uniformly from [k, NUM_RANDOM_MOVES]
 #                       (eval/test_* scrambles stay fixed at EVAL_NUM_RANDOM_MOVES; eval/train_* episodes use the mix;
 #                       default 0 = fixed length)
+#   RANDOM_MOVES_ZIPF=s  MIN_RANDOM_MOVES > 0: draw the length with p(k) ∝ k^-s instead of uniformly (default 0 = uniform;
+#                       s = 1 puts ~half of [1, 200] on k <= 10)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
@@ -97,7 +99,7 @@
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
 GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$EPISODE_LENGTH}"
-NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; MIN_RANDOM_MOVES="${MIN_RANDOM_MOVES:-0}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
+NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; MIN_RANDOM_MOVES="${MIN_RANDOM_MOVES:-0}"; RANDOM_MOVES_ZIPF="${RANDOM_MOVES_ZIPF:-0}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
@@ -226,6 +228,11 @@ esac
 [[ "$MIN_RANDOM_MOVES" =~ ^[0-9]+$ ]] && (( MIN_RANDOM_MOVES <= NUM_RANDOM_MOVES )) \
   || { echo "MIN_RANDOM_MOVES must be an integer in [0, NUM_RANDOM_MOVES=$NUM_RANDOM_MOVES], got $MIN_RANDOM_MOVES"; exit 1; }
 (( MIN_RANDOM_MOVES > 0 )) && { ARM_FLAGS+=(--slidingpuzzle_min_random_moves="$MIN_RANDOM_MOVES"); RUN+="_rmin${MIN_RANDOM_MOVES}"; }
+awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s + 0 == s && s >= 0) }' || { echo "RANDOM_MOVES_ZIPF must be >= 0, got $RANDOM_MOVES_ZIPF"; exit 1; }
+if awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s > 0) }'; then
+  (( MIN_RANDOM_MOVES > 0 )) || { echo "RANDOM_MOVES_ZIPF > 0 needs MIN_RANDOM_MOVES > 0"; exit 1; }
+  ARM_FLAGS+=(--slidingpuzzle_random_moves_zipf="$RANDOM_MOVES_ZIPF"); RUN+="_rzipf${RANDOM_MOVES_ZIPF}"
+fi
 [[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"
 case "$MLP_TYPE" in
   swiglu) ;;
