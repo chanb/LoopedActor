@@ -156,6 +156,8 @@ class Args:
     input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
     input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
     halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
+    halt_kl_max: float = 0.0              # fprm_mem_halt: > 0 caps beta at alpha * log(this), so a pass never halts with h >= 1/2
+                                          # while KL(pi_i || pi_{i-1}) > this (0 = no cap; must be >= halt_kl)
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
@@ -430,6 +432,7 @@ def main(args: Args):
             min_think_iters=args.min_think_iters,
             halt_kl=args.halt_kl,
             halt_alpha_min=args.halt_alpha_min,
+            halt_kl_max=args.halt_kl_max,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_explore=args.halt_explore,

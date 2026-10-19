@@ -7,7 +7,7 @@ hard rule KL_i <= halt_kl, pass i halts with probability
 
 so h_i -> 1 as the policy stops changing (KL_i -> 0) and h_i -> 0 while thinking still changes its mind. beta_i is a
 learned bias plus (`halt_beta_head`) a zero-initialized Dense on the rms-normed newest thought of pass i, i.e.
-state-dependent. alpha = 1, beta = log(halt_kl) at initialization, so h_i = 1/2 exactly at the old threshold
+state-dependent, capped at alpha * log(halt_kl_max) so h_i < 1/2 while KL_i > halt_kl_max (`halt_kl_max` > 0). alpha = 1, beta = log(halt_kl) at initialization, so h_i = 1/2 exactly at the old threshold
 KL_i = halt_kl. KL_i is stop-gradient'ed.
 
 The think time c is an action of the joint policy:
@@ -81,6 +81,7 @@ class FPRMMemHaltActorValue(nn.Module):
     min_think_iters: int = 2
     halt_kl: float = 1e-3          # initialization only: h_i = 1/2 at KL_i = halt_kl (beta = log halt_kl, alpha = 1)
     halt_alpha_min: float = 0.0    # floor on alpha (TPO otherwise drives alpha -> 0: KL-blind, constant-hazard halting)
+    halt_kl_max: float = 0.0       # > 0: cap beta at alpha * log(this): never h_i >= 1/2 while KL_i > this (0 = no cap)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
     halt_explore: float = 0.0      # rollouts (halt_key): mix this much of a uniform think time into p(c | s)
@@ -98,6 +99,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.max_think_iters >= 1, self.max_think_iters
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
         assert 0.0 <= self.halt_alpha_min < 1.0, self.halt_alpha_min
+        assert self.halt_kl_max == 0.0 or self.halt_kl_max >= self.halt_kl, (self.halt_kl_max, self.halt_kl)
         assert 0.0 <= self.halt_explore <= 1.0, self.halt_explore
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
@@ -219,6 +221,8 @@ class FPRMMemHaltActorValue(nn.Module):
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
         alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
+        if self.halt_kl_max > 0:
+            beta_t = jnp.minimum(beta_t, alpha * math.log(self.halt_kl_max))
         halt_logit = beta_t - alpha * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
         min_iters = 1 if T == 1 else max(self.min_think_iters, 2)
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]

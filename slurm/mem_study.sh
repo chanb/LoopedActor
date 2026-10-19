@@ -31,6 +31,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
+[[ -n "${HALT_KL_MAX:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL_MAX=${HALT_KL_MAX}"; MEM_STUDY_TAG+="_hklmax${HALT_KL_MAX}"; }
 [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
 case "${HALT_UPDATE:-joint}" in
