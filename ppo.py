@@ -81,6 +81,8 @@ class Args:
     slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
     slidingpuzzle_eval_episode_length: int = 0    # slidingpuzzle-*: steps per evaluation-scramble (eval/test_*) episode;
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
+    slidingpuzzle_min_random_moves: int = 0       # slidingpuzzle-*: > 0 draws each training scramble length uniformly from
+                                                  # [this, num_random_moves] (eval_reset stays fixed; 0 = fixed length)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
     # algorithm

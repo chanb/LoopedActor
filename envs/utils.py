@@ -55,6 +55,8 @@ def make_env(args):
         config.grid_size = int(sp.group(1))
         config.episode_length = getattr(args, 'slidingpuzzle_episode_length', 40)
         config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
+        config.min_random_moves = getattr(args, 'slidingpuzzle_min_random_moves', 0)
+        assert config.min_random_moves <= config.num_random_moves, (config.min_random_moves, config.num_random_moves)
         eval_moves = getattr(args, 'slidingpuzzle_eval_num_random_moves', 0)
         config.eval_num_random_moves = eval_moves if eval_moves > 0 else config.num_random_moves
         # Evaluation-scramble (eval_reset) episodes: 0 = the training episode length.

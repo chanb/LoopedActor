@@ -22,12 +22,15 @@
 #               != 1.0; slurm job names get _gc<g> when g != 0.999)
 #   VALUE_AT_MAX_ITERS=1  value from the MAX_THINK_ITERS-th pass's latent (train.sh adds _vT to the run name; slurm job
 #               names get _vT; mem / iso_mem only)
+#   MIN_RANDOM_MOVES  slidingpuzzle: training scrambles of a uniform length in [k, NUM_RANDOM_MOVES] (train.sh adds
+#               _rmin<k> to the run name; slurm job names get _rmin<k>; other envs ignore it)
 #   HALT_KL     mem configs' policy-KL halting threshold (default 1e-3; train.sh adds _hkl<k> to mem run names when
 #               != 1e-3; slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
 MEM_STUDY_TAG=""   # appended to slurm job names
+[[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }

@@ -8,7 +8,8 @@ in the bottom-right corner.
 Instances are generated procedurally (no level bank), as jumanji's RandomWalkGenerator does: starting
 from the solved board, the blank makes `num_random_moves` uniformly random valid moves (immediate
 reversals allowed, so the scramble can be shallower than its length and occasionally solved).
-Training resets (`reset`) use `num_random_moves`, evaluation resets (`eval_reset`) use
+Training resets (`reset`) use `num_random_moves` (or, with `min_random_moves` > 0, a length drawn uniformly
+from [min_random_moves, num_random_moves] per reset), evaluation resets (`eval_reset`) always use the fixed
 `eval_num_random_moves` (default: the same, as in Stoix; raise it to evaluate on deeper scrambles).
 
 Observation: per-cell one-hot of the tile id (channel k = tile k, channel 0 = blank), cell-major flat
@@ -44,6 +45,7 @@ def default_config() -> config_dict.ConfigDict:
         episode_length=40,
         eval_episode_length=40,    # eval_reset (eval/test_*) episodes; set by make_env (envs/utils.py)
         num_random_moves=10,       # training scramble length
+        min_random_moves=0,        # > 0: each training reset draws its length uniformly from [this, num_random_moves] (0 = fixed)
         eval_num_random_moves=10,  # evaluation scramble length
         step_penalty=0.0,          # 0 = sparse reward (jumanji SparseRewardFn)
         solve_reward=1.0,
@@ -84,16 +86,18 @@ class SlidingPuzzleEnv:
         new_puzzle = puzzle.at[blank[0], blank[1]].set(tile).at[target[0], target[1]].set(BLANK)
         return jnp.where(ok, new_puzzle, puzzle), target, ok
 
-    def scramble(self, rng, num_moves):
-        """Random walk of the blank from the solved board (jumanji RandomWalkGenerator)."""
-        def body(carry, key):
-            puzzle, blank = carry
+    def scramble(self, rng, num_moves, length=None):
+        """Random walk of the blank from the solved board (jumanji RandomWalkGenerator). `length` (traced,
+        <= num_moves) stops the walk early; None walks all num_moves steps."""
+        def body(carry, x):
+            (puzzle, blank), (i, key) = carry, x
             valid = jnp.all((blank + MOVES >= 0) & (blank + MOVES < self.m), axis=-1)
             action = jax.random.choice(key, 4, p=valid / valid.sum())
-            puzzle, blank, _ = self.move(puzzle, blank, action)
-            return (puzzle, blank), None
+            new_puzzle, new_blank, _ = self.move(puzzle, blank, action)
+            keep = i < (num_moves if length is None else length)
+            return (jnp.where(keep, new_puzzle, puzzle), jnp.where(keep, new_blank, blank)), None
         start = (self.solved, jnp.array([self.m - 1, self.m - 1], jnp.int32))
-        (puzzle, blank), _ = jax.lax.scan(body, start, jax.random.split(rng, num_moves))
+        (puzzle, blank), _ = jax.lax.scan(body, start, (jnp.arange(num_moves), jax.random.split(rng, num_moves)))
         return SlidingPuzzleData(puzzle=puzzle, blank=blank)
 
     def _make_state(self, rng, data: SlidingPuzzleData):
@@ -106,7 +110,12 @@ class SlidingPuzzleEnv:
 
     def reset(self, rng: jax.Array) -> State:
         rng, key = jax.random.split(rng)
-        return self._make_state(rng, self.scramble(key, self._config.num_random_moves))
+        cfg = self._config
+        if cfg.min_random_moves <= 0:
+            return self._make_state(rng, self.scramble(key, cfg.num_random_moves))
+        rng, key_len = jax.random.split(rng)
+        length = jax.random.randint(key_len, (), cfg.min_random_moves, cfg.num_random_moves + 1)
+        return self._make_state(rng, self.scramble(key, cfg.num_random_moves, length))
 
     def eval_reset(self, rng: jax.Array) -> State:
         rng, key = jax.random.split(rng)
