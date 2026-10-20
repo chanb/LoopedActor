@@ -26,7 +26,8 @@ depended on it would bias the halting gradient.
 
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
 plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
-'halt_beta_t' (beta_i, [T, B]).
+'halt_beta_t' (beta_i, [T, B]), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
+passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
 """
 
 import math
@@ -42,6 +43,7 @@ from models.fprm import (
     STOP_CONVERGED,
     STOP_ITERATION_CAP,
     STOP_NONFINITE,
+    compute_residuals,
     make_latent_init,
     rms_norm,
 )
@@ -191,6 +193,7 @@ class FPRMMemHaltActorValue(nn.Module):
             finite = (jnp.all(jnp.isfinite(logits), axis=-1) & jnp.isfinite(value)
                       & jnp.all(jnp.isfinite(out), axis=-1) & jnp.all(jnp.isfinite(z_cells), axis=(-2, -1)))
             z_cells = jnp.where(finite[:, None, None], z_cells, z)
+            latent_res, _, _ = compute_residuals(z, z_cells, jnp.ones(z.shape[:2], bool), cfg.eps)
             out = jnp.where(finite[:, None], out, token)
             logits = jnp.where(finite[:, None], logits, logits_prev)
             value = jnp.where(finite, value, value_prev)
@@ -202,12 +205,12 @@ class FPRMMemHaltActorValue(nn.Module):
             kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1 (no previous policy) is forced h = 0 below
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
-            return carry, (logits, value, beta, kl, nonfinite)
+            return carry, (logits, value, beta, kl, nonfinite, latent_res)
 
         if self.remat:
             body = jax.checkpoint(body, prevent_cse=False)
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
-        _, (logits_t, value_t, beta_t, kl_t, nonfinite_t) = jax.lax.scan(body, init, jnp.arange(T))
+        _, (logits_t, value_t, beta_t, kl_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
         alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
@@ -239,6 +242,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_alpha', alpha)
         self.sow('intermediates', 'halt_beta_t', beta_t)
+        self.sow('intermediates', 'latent_residual_t', latent_res_t)
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
         reason = jnp.where(nonfinite, STOP_NONFINITE, reason)

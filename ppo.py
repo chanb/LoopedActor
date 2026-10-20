@@ -634,6 +634,12 @@ def main(args: Args):
             # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
+            # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
+            res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
+            c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)
+            halt_metrics['latent_res_at_c'] = jnp.mean(jnp.take_along_axis(res_t, c_idx[None], axis=0))
+            mean_res = jnp.mean(res_t, axis=-1)
+            halt_metrics.update({f'latent_res_{i + 1}': mean_res[i] for i in range(mean_res.shape[0])})
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
         policy_loss, v_loss, entropy_loss, approx_kl = ppo_terms(
@@ -663,81 +669,45 @@ def main(args: Args):
     @jax.jit
     def learn_step(training_state, data, key_sgd):
 
-        def _learn_step(carry, unused_t):
+        def _train_minibatch_step(training_state, key_loss, data):
+            if use_loss_scale:
+                scale = training_state.loss_scale
 
-            def _train_minibatch_step(carry, data):
-                training_state, key, kl_stop = carry
-                key, key_loss = jax.random.split(key)
+                def scaled_loss(*a):
+                    loss, aux = compute_ppo_loss(*a)
+                    return loss * scale, aux
 
-                if use_loss_scale:
-                    scale = training_state.loss_scale
-
-                    def scaled_loss(*a):
-                        loss, aux = compute_ppo_loss(*a)
-                        return loss * scale, aux
-
-                    (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
-                        training_state.params, obs_normalizer(training_state), data, key_loss
-                    )
-                    grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
-                    finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
-                    # Zero a nonfinite gradient so the (discarded) update below stays finite.
-                    grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
-                else:
-                    (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                        training_state.params, obs_normalizer(training_state), data, key_loss
-                    )
-                grad_norm = optax.global_norm(grads)  # pre-clip
-                metrics['grad_norm'] = grad_norm
-                if args.max_grad_norm > 0.0:
-                    metrics['grad_clip_frac'] = (grad_norm > args.max_grad_norm).astype(jnp.float32)
-                new_training_state = training_state.apply_gradients(grads=grads)
-                if use_loss_scale:
-                    # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
-                    # consecutive finite steps.
-                    new_training_state = jax.tree_util.tree_map(
-                        lambda new, old: jnp.where(finite, new, old), new_training_state, training_state
-                    )
-                    good = jnp.where(finite, training_state.loss_scale_good_steps + 1, 0)
-                    grow = good >= args.loss_scale_period
-                    new_scale = jnp.where(finite, jnp.where(grow, scale * 2.0, scale), jnp.maximum(scale / 2.0, 1.0))
-                    new_training_state = new_training_state.replace(
-                        loss_scale=new_scale, loss_scale_good_steps=jnp.where(grow, 0, good)
-                    )
-                    metrics['loss_scale'] = scale
-                    metrics['nonfinite_grad_frac'] = (~finite).astype(jnp.float32)
-                if args.target_kl > 0.0:
-                    # Once approx_kl exceeds the target, skip every remaining
-                    # minibatch update until the next rollout.
-                    new_training_state = jax.tree_util.tree_map(
-                        lambda new, old: jnp.where(kl_stop, old, new),
-                        new_training_state,
-                        training_state,
-                    )
-                    metrics['kl_stop_frac'] = kl_stop.astype(jnp.float32)
-                    kl_stop = kl_stop | (metrics['approx_kl'] > args.target_kl)
-                training_state = new_training_state
-
-                return (training_state, key, kl_stop), metrics
-
-            training_state, data, value_targets, advantages, key, kl_stop = carry
-            key, key_perm, key_grad = jax.random.split(key, 3)
-
-            def shuffle_and_reshape(x: jnp.ndarray):
-                x = jax.random.permutation(key_perm, x)
-                x = jnp.reshape(x, (args.num_minibatches_per_rollout, -1) + x.shape[2:])
-                return x
-
-            batch_data = (data, value_targets, advantages)
-            shuffled_batch_data = jax.tree_util.tree_map(shuffle_and_reshape, batch_data)
-
-            (training_state, _, kl_stop), metrics = jax.lax.scan(
-                _train_minibatch_step,
-                (training_state, key_grad, kl_stop),
-                shuffled_batch_data,
-                length=args.num_minibatches_per_rollout,
-            )
-            return (training_state, data, value_targets, advantages, key, kl_stop), metrics
+                (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
+                    training_state.params, obs_normalizer(training_state), data, key_loss
+                )
+                grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
+                finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
+                # Zero a nonfinite gradient so the (discarded) update below stays finite.
+                grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
+            else:
+                (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
+                    training_state.params, obs_normalizer(training_state), data, key_loss
+                )
+            grad_norm = optax.global_norm(grads)  # pre-clip
+            metrics['grad_norm'] = grad_norm
+            if args.max_grad_norm > 0.0:
+                metrics['grad_clip_frac'] = (grad_norm > args.max_grad_norm).astype(jnp.float32)
+            new_training_state = training_state.apply_gradients(grads=grads)
+            if use_loss_scale:
+                # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
+                # consecutive finite steps.
+                new_training_state = jax.tree_util.tree_map(
+                    lambda new, old: jnp.where(finite, new, old), new_training_state, training_state
+                )
+                good = jnp.where(finite, training_state.loss_scale_good_steps + 1, 0)
+                grow = good >= args.loss_scale_period
+                new_scale = jnp.where(finite, jnp.where(grow, scale * 2.0, scale), jnp.maximum(scale / 2.0, 1.0))
+                new_training_state = new_training_state.replace(
+                    loss_scale=new_scale, loss_scale_good_steps=jnp.where(grow, 0, good)
+                )
+                metrics['loss_scale'] = scale
+                metrics['nonfinite_grad_frac'] = (~finite).astype(jnp.float32)
+            return new_training_state, metrics
 
         # calculate gae
         terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
@@ -770,13 +740,45 @@ def main(args: Args):
         if args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        (training_state, _, _, _, _, _), metrics = jax.lax.scan(
-            _learn_step,
-            (training_state, data, value_targets, advantages, key_sgd,
-             jnp.zeros((), bool)),
-            (),
-            length=args.num_epochs_per_rollout,
-        )
+        # Epochs of shuffled minibatch updates. With target_kl > 0, the first update whose approx_kl exceeds the target is
+        # the last one of this rollout: both loops exit, so the skipped updates are never computed. Metrics are the mean
+        # over the updates that ran; kl_stop_frac is the fraction skipped.
+        batch_data = (data, value_targets, advantages)
+        num_updates = args.num_epochs_per_rollout * args.num_minibatches_per_rollout
+        minibatch = jax.tree_util.tree_map(
+            lambda x: x.reshape((args.num_minibatches_per_rollout, -1) + x.shape[2:])[0], batch_data)
+        metric_shapes = jax.eval_shape(_train_minibatch_step, training_state, key_sgd, minibatch)[1]
+        zero_metrics = jax.tree_util.tree_map(lambda s: jnp.zeros(s.shape, s.dtype), metric_shapes)
+
+        def _epoch(carry):
+            training_state, key, kl_stop, epoch, n, metric_sum = carry
+            key, key_perm, key_grad = jax.random.split(key, 3)
+            shuffled_batch_data = jax.tree_util.tree_map(
+                lambda x: jax.random.permutation(key_perm, x).reshape(
+                    (args.num_minibatches_per_rollout, -1) + x.shape[2:]),
+                batch_data)
+
+            def _minibatch(carry):
+                training_state, key, kl_stop, i, n, metric_sum = carry
+                key, key_loss = jax.random.split(key)
+                training_state, metrics = _train_minibatch_step(
+                    training_state, key_loss, jax.tree_util.tree_map(lambda x: x[i], shuffled_batch_data))
+                if args.target_kl > 0.0:
+                    kl_stop = metrics['approx_kl'] > args.target_kl
+                metric_sum = jax.tree_util.tree_map(jnp.add, metric_sum, metrics)
+                return training_state, key, kl_stop, i + 1, n + 1, metric_sum
+
+            training_state, _, kl_stop, _, n, metric_sum = jax.lax.while_loop(
+                lambda c: (c[3] < args.num_minibatches_per_rollout) & ~c[2], _minibatch,
+                (training_state, key_grad, kl_stop, 0, n, metric_sum))
+            return training_state, key, kl_stop, epoch + 1, n, metric_sum
+
+        training_state, _, _, _, n, metric_sum = jax.lax.while_loop(
+            lambda c: (c[3] < args.num_epochs_per_rollout) & ~c[2], _epoch,
+            (training_state, key_sgd, jnp.zeros((), bool), 0, 0, zero_metrics))
+        metrics = jax.tree_util.tree_map(lambda s: s / n, metric_sum)
+        if args.target_kl > 0.0:
+            metrics['kl_stop_frac'] = 1.0 - n / num_updates
 
         return training_state, metrics
 
