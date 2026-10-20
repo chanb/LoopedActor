@@ -12,10 +12,12 @@ KL_i = halt_kl. KL_i is stop-gradient'ed.
 
 The think time c is an action of the joint policy:
 
-    p(c = n | s) = h_n * prod_{i<n} (1 - h_i),    h_i = 0 for i < max(min_think_iters, 2), h_T = 1 (T = max_think_iters)
+    p(c = n | s) = h_n * prod_{i<n} (1 - h_i),    h_i = 0 for i < min_think_iters, h_T = 1 (T = max_think_iters)
     log p(c, a | s) = log p(c | s) + log pi_c(a | s)
 
-(pass 1 has no previous policy, so it never halts unless T = 1). All T passes are always executed (as in fprm_mem);
+Pass 1 is compared against pi_0 = uniform, but KL(pi_1 || uniform) = log A - H(pi_1) measures confidence, not
+convergence, so it gets its own unconstrained slope: h_1 = sigmoid(beta_1 + alpha_1 * log KL_1), alpha_1 = 0 at init
+(alpha_1 > 0: halt after one pass when confident). All T passes are always executed (as in fprm_mem);
 the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
@@ -114,6 +116,7 @@ class FPRMMemHaltActorValue(nn.Module):
         # Halting: alpha = halt_alpha_min + softplus(halt_alpha_raw) (= 1 at init); beta from a zero-kernel Dense (= log halt_kl at init).
         a0 = 1.0 - self.halt_alpha_min
         self.halt_alpha_raw = self.param('halt_alpha_raw', nn.initializers.constant(math.log(math.expm1(a0))), ())
+        self.halt_alpha1 = self.param('halt_alpha1', nn.initializers.zeros, ())  # pass 1's slope, any sign
         self.halt_beta = nn.Dense(
             1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.constant(math.log(self.halt_kl)),
         )
@@ -202,7 +205,7 @@ class FPRMMemHaltActorValue(nn.Module):
             lp_new = jax.nn.log_softmax(logits, axis=-1)
             lp_prev = jax.nn.log_softmax(logits_prev, axis=-1)
             kl = jnp.sum(jnp.exp(lp_new) * (lp_new - lp_prev), axis=-1)
-            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1 (no previous policy) is forced h = 0 below
+            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: KL(pi_1 || uniform), logits_init = 0
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
             return carry, (logits, value, beta, kl, nonfinite, latent_res)
@@ -214,8 +217,9 @@ class FPRMMemHaltActorValue(nn.Module):
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
         alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
-        halt_logit = beta_t - alpha * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
-        min_iters = 1 if T == 1 else max(self.min_think_iters, 2)
+        slope = jnp.where(jnp.arange(T)[:, None] == 0, -self.halt_alpha1, alpha)
+        halt_logit = beta_t - slope * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
+        min_iters = 1 if T == 1 else self.min_think_iters
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]
         log_pc_b = log_pc.T  # [B, T]
 
