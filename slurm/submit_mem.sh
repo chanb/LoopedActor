@@ -33,6 +33,14 @@ SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 read -r -a ENVS <<< "${ENVS:-$MEM_STUDY_ENVS}"
 read -r -a SEEDS <<< "${SEEDS:-$MEM_STUDY_SEEDS}"
 COMMON="$MEM_STUDY_COMMON"
+# Write every train.sh setting set in this shell (GRID, EPISODE_LENGTH, NUM_RANDOM_MOVES, ...) into the commands, so a run
+# does not depend on inheriting it through sbatch's environment, and dry runs / slurm logs show the full settings.
+# Per-config settings (MAX_THINK_ITERS, DISCOUNT_COMPUTE, ...) come later in each command and still take precedence.
+for _v in $(grep -oh '\${[A-Z_][A-Z0-9_]*:-' "${SCRIPT_DIR}"/../*/scripts/train.sh | sed 's/^\${//; s/:-$//' | sort -u); do
+  case "$_v" in PRINT_RUN_DIR|WANDB_MODE|WANDB_PROJECT|XLA_PYTHON_CLIENT_MEM_FRACTION) continue ;; esac   # set per command
+  [[ -n "${!_v+x}" && " ${COMMON} " != *" ${_v}="* ]] && COMMON+=" ${_v}=${!_v}"
+done
+unset _v
 CONFIGS=("${MEM_STUDY_CONFIGS[@]}")   # experiment definitions: slurm/mem_study.sh
 
 # Packing, from the measured costs in slurm/mem_study.sh:
