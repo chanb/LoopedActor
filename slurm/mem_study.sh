@@ -8,8 +8,7 @@
 #               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE
-#               (joint|all_c|tpo) / HALT_TPO_ETA (tpo only) / HALT_EXPLORE / HALT_EXTEND / HALT_EXTEND_BACK are read by train.sh
+#               (every pass runs); HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -35,18 +34,8 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
-[[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
-[[ -n "${HALT_KL_MAX:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL_MAX=${HALT_KL_MAX}"; MEM_STUDY_TAG+="_hklmax${HALT_KL_MAX}"; }
 [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
-case "${HALT_UPDATE:-joint}" in
-  all_c) MEM_STUDY_COMMON+=" HALT_UPDATE=all_c"; MEM_STUDY_TAG+="_hallc" ;;
-  tpo) MEM_STUDY_COMMON+=" HALT_UPDATE=tpo"; MEM_STUDY_TAG+="_htpo"
-       [[ -n "${HALT_TPO_ETA:-}" ]] && { MEM_STUDY_COMMON+=" HALT_TPO_ETA=${HALT_TPO_ETA}"; MEM_STUDY_TAG+="_heta${HALT_TPO_ETA}"; } ;;
-esac
-[[ -n "${HALT_EXPLORE:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXPLORE=${HALT_EXPLORE}"; MEM_STUDY_TAG+="_hex${HALT_EXPLORE}"; }
-[[ -n "${HALT_EXTEND:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXTEND=${HALT_EXTEND}"; MEM_STUDY_TAG+="_hext${HALT_EXTEND}"; }
-[[ -n "${HALT_EXTEND_BACK:-}" ]] && { MEM_STUDY_COMMON+=" HALT_EXTEND_BACK=${HALT_EXTEND_BACK}"; MEM_STUDY_TAG+="_hextb${HALT_EXTEND_BACK}"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then

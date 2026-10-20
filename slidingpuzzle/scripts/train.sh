@@ -33,18 +33,8 @@
 #   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3);
 #                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_ALPHA_MIN=a    mem_halt: floor on the KL slope alpha, in [0, 1) (default 0 = no floor)
-#   HALT_KL_MAX=k       mem_halt: cap beta so no pass halts with h >= 1/2 while the policy KL > k, k >= HALT_KL (default 0 = no cap)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_UPDATE=joint|all_c|tpo  mem_halt: PPO ratio of the sampled (c, a) (joint, default), or every think time c from the
-#                       one sampled action via Q(s, c, a) = DISCOUNT_COMPUTE^(c-1) Q_env(s, a) (all_c; see ppo.py), or
-#                       Target Policy Optimization on p(c|s) + PPO on the sampled c's readout (tpo; see ppo.py)
-#   HALT_TPO_ETA=eta    mem_halt, HALT_UPDATE=tpo: target temperature in batch-advantage-std units (default 1.0; the run
-#                       name gets _heta<eta> when != 1.0)
-#   HALT_EXPLORE=e      mem_halt, HALT_UPDATE=all_c|tpo: rollouts sample c from (1 - e) p(c|s) + e * Uniform (default 0)
-#   HALT_EXTEND=k       mem_halt, HALT_UPDATE=tpo: the action loss also trains the readouts pi_c', c - j <= c' <= c + k, not only pi_c
-#   HALT_EXTEND_BACK=j  (--halt_train_k / --halt_train_j; both default 0)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per board cell, flat = one token per observation value,
 #                         conv = 3x3 conv, one token per output channel
@@ -105,8 +95,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_KL_MAX="${HALT_KL_MAX:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
-HALT_UPDATE="${HALT_UPDATE:-joint}"; HALT_EXPLORE="${HALT_EXPLORE:-0}"; HALT_EXTEND="${HALT_EXTEND:-0}"; HALT_EXTEND_BACK="${HALT_EXTEND_BACK:-0}"; HALT_TPO_ETA="${HALT_TPO_ETA:-1.0}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -142,10 +131,6 @@ esac
 if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a + 0 == a && a >= 0 && a < 1) }' || { echo "HALT_ALPHA_MIN must be in [0, 1), got $HALT_ALPHA_MIN"; exit 1; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a > 0) }' && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_amin${HALT_ALPHA_MIN}"; }
-  awk -v k="$HALT_KL_MAX" -v h="$HALT_KL" 'BEGIN { exit !(k + 0 == k && (k == 0 || k >= h)) }' || { echo "HALT_KL_MAX must be 0 or >= HALT_KL ($HALT_KL), got $HALT_KL_MAX"; exit 1; }
-  awk -v k="$HALT_KL_MAX" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--halt_kl_max="$HALT_KL_MAX"); RUN+="_hklmax${HALT_KL_MAX}"; }
   case "$HALT_BETA_HEAD" in
     0) ;;
     1) ARM_FLAGS+=(--halt_beta_head); RUN+="_bh" ;;
@@ -156,27 +141,7 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  case "$HALT_UPDATE" in
-    joint) ;;
-    all_c) ARM_FLAGS+=(--halt_update=all_c); RUN+="_hallc" ;;
-    tpo)
-      awk -v e="$HALT_TPO_ETA" 'BEGIN { exit !(e + 0 == e && e > 0) }' || { echo "HALT_TPO_ETA must be > 0, got $HALT_TPO_ETA"; exit 1; }
-      ARM_FLAGS+=(--halt_update=tpo --halt_tpo_eta="$HALT_TPO_ETA"); RUN+="_htpo"
-      awk -v e="$HALT_TPO_ETA" 'BEGIN { exit !(e != 1) }' && RUN+="_heta${HALT_TPO_ETA}" ;;
-    *) echo "HALT_UPDATE must be joint, all_c or tpo, got $HALT_UPDATE"; exit 1 ;;
-  esac
-  awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e + 0 == e && e >= 0 && e <= 1) }' || { echo "HALT_EXPLORE must be in [0, 1], got $HALT_EXPLORE"; exit 1; }
-  if awk -v e="$HALT_EXPLORE" 'BEGIN { exit !(e > 0) }'; then
-    [[ "$HALT_UPDATE" == all_c || "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXPLORE > 0 needs HALT_UPDATE=all_c or tpo"; exit 1; }
-    ARM_FLAGS+=(--halt_explore="$HALT_EXPLORE"); RUN+="_hex${HALT_EXPLORE}"
-  fi
-  [[ "$HALT_EXTEND" =~ ^[0-9]+$ && "$HALT_EXTEND_BACK" =~ ^[0-9]+$ ]] || { echo "HALT_EXTEND / HALT_EXTEND_BACK must be integers >= 0"; exit 1; }
-  if (( HALT_EXTEND > 0 || HALT_EXTEND_BACK > 0 )); then
-    [[ "$HALT_UPDATE" == tpo ]] || { echo "HALT_EXTEND / HALT_EXTEND_BACK > 0 need HALT_UPDATE=tpo"; exit 1; }
-    ARM_FLAGS+=(--halt_train_k="$HALT_EXTEND" --halt_train_j="$HALT_EXTEND_BACK"); RUN+="_hext${HALT_EXTEND}"
-    (( HALT_EXTEND_BACK > 0 )) && RUN+="_hextb${HALT_EXTEND_BACK}"
-  fi
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_KL_MAX / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_UPDATE / HALT_TPO_ETA / HALT_EXPLORE (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_BETA_HEAD / HALT_HEAD_GRAD (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
