@@ -78,7 +78,10 @@ unset _t _ve _gc _sfx _am _amv _amn
 # lightsout is refit to the L40S runs of looped_actor_gamma_ablation (5x4, T = 1..16, GPU-hours per run with 2-3 runs
 # per GPU): ~1.25-1.5x the old "0.25 1.0" at every T, which timed out the T=16 jobs; "0.3 1.35" stays within SAFETY.
 declare -A MEM_STUDY_HOURS=(  # "<hours at T=1> <hours at T=4>"
-  [lightsout]="0.3 1.35" [slidingpuzzle]="0.6 2.2" [rushhour]="1.9 7.9" [sokoban]="3.7 15.6")
+  [lightsout]="0.3 1.35" [slidingpuzzle]="0.6 2.2" [rushhour]="1.9 7.9" [sokoban]="3.7 15.6"
+  # slidingpuzzle with GRID=4 / GRID=5 (L40S runs of looped_actor_slidingpuzzle). The cost is far from linear in T
+  # (T=4 ~ T=8), so the line goes through T=4 and T=16 and overestimates T=1 and T=8 rather than underestimate T=2-4.
+  [slidingpuzzle4]="1.25 1.85" [slidingpuzzle5]="2.2 3.1")
 declare -A MEM_STUDY_GPU_FRACTION=(  # XLA memory fraction per run on a ~45GiB L40S: >= 2x the measured peak, room for T > 4
   [lightsout]=0.08 [slidingpuzzle]=0.08 [rushhour]=0.10 [sokoban]=0.15)
 declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
@@ -87,7 +90,8 @@ declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
 mem_study_hours() {  # mem_study_hours <env> <cap>: estimated hours of one run alone
   # (measured with 4 epochs and 100M steps; ~95% of the time is the update, which scales with NUM_EPOCHS; all of it
   # scales with NUM_TIMESTEPS)
-  local h1 h4; read -r h1 h4 <<< "${MEM_STUDY_HOURS[$1]}"
+  local key="$1"; [[ -n "${MEM_STUDY_HOURS[$1${GRID:-}]:-}" ]] && key="$1${GRID}"
+  local h1 h4; read -r h1 h4 <<< "${MEM_STUDY_HOURS[$key]}"
   awk -v a="$h1" -v b="$h4" -v t="$2" -v e="${NUM_EPOCHS:-4}" -v n="${NUM_TIMESTEPS:-100000000}" \
     'BEGIN { printf "%.2f", (a + (b - a) * (t - 1) / 3) * (0.05 + 0.95 * e / 4) * n / 1e8 }'
 }
