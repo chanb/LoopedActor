@@ -110,7 +110,8 @@ class Args:
                                           # board size); off: the models see raw observations and checkpoints store an identity normalizer
     # stabilization (all off by default)
     max_grad_norm: float = 0.0            # 0 = no gradient clipping
-    target_kl: float = 0.0                # 0 = no KL early stop; else skip remaining minibatch updates in a rollout once approx_kl exceeds this
+    target_kl: float = 0.0                # 0 = no KL early stop; else skip remaining minibatch updates in a rollout once approx_kl_action
+                                          # (KL of the action policy pi_c(a|s) only, not the think time c) exceeds this
     anneal_lr: bool = False               # linearly decay lr to 0 over training
 
     # model
@@ -227,11 +228,13 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
                 return policy_dist.mode(), {'value': value, 'compute_time': compute_time}
 
             actions = policy_dist.sample(seed=key_sample)
-            log_prob = policy_dist.log_prob(actions)
+            action_log_prob = policy_dist.log_prob(actions)
+            log_prob = action_log_prob
             if stochastic_halt:
                 log_prob = log_prob + inter['intermediates']['halt_log_prob'][0]
             extras = {
                 'log_prob': log_prob,
+                'action_log_prob': action_log_prob,  # log pi_c(a|s) alone (= log_prob without stochastic halting)
                 'value': value,
                 'compute_time': compute_time,
             }
@@ -589,7 +592,8 @@ def main(args: Args):
 
         def ppo_terms(policy_dist, baseline, halt_log_prob=0.0):
             # Policy function loss (stochastic halting: joint log p(c|s) + log pi_c(a|s))
-            target_action_log_probs = policy_dist.log_prob(data.action) + halt_log_prob
+            target_pi_log_probs = policy_dist.log_prob(data.action)
+            target_action_log_probs = target_pi_log_probs + halt_log_prob
             rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
             surrogate_loss1 = rho_s * advantages
             surrogate_loss2 = (jnp.clip(rho_s, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
@@ -604,12 +608,13 @@ def main(args: Args):
             entropy = jnp.mean(policy_dist.entropy())
             entropy_loss = args.entropy_cost * -entropy
 
-            # k3 estimator of KL(behaviour || target), Schulman (2020).
-            log_rho = target_action_log_probs - behaviour_action_log_probs
-            approx_kl = jax.lax.stop_gradient(
-                jnp.mean(jnp.exp(log_rho) - 1.0 - log_rho)
-            )
-            return policy_loss, v_loss, entropy_loss, approx_kl
+            # k3 estimator of KL(behaviour || target), Schulman (2020): of the joint (c, a) policy, and of the action
+            # policy pi_c(a|s) alone (at the replayed c; the target_kl early stop uses this one).
+            def k3(log_rho):
+                return jax.lax.stop_gradient(jnp.mean(jnp.exp(log_rho) - 1.0 - log_rho))
+            approx_kl = k3(target_action_log_probs - behaviour_action_log_probs)
+            approx_kl_action = k3(target_pi_log_probs - data.extras['policy_extras']['action_log_prob'])
+            return policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action
 
         # PPO loss on the final actor / value readout. Halted examples freeze
         # inside the network, so their readout is the one they halted at.
@@ -642,7 +647,7 @@ def main(args: Args):
             halt_metrics.update({f'latent_res_{i + 1}': mean_res[i] for i in range(mean_res.shape[0])})
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
-        policy_loss, v_loss, entropy_loss, approx_kl = ppo_terms(
+        policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
             distrax.Categorical(logits=logits), values, halt_log_prob
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
@@ -658,6 +663,7 @@ def main(args: Args):
             'v_loss': v_loss,
             'entropy_loss': entropy_loss,
             'approx_kl': approx_kl,
+            'approx_kl_action': approx_kl_action,
             'think_iters': jnp.mean(think_iters.astype(jnp.float32)),
             # Mean predicted value vs. mean (lambda-return) target: a growing gap shows expectile optimism.
             'value_mean': jnp.mean(values),
@@ -740,7 +746,7 @@ def main(args: Args):
         if args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Epochs of shuffled minibatch updates. With target_kl > 0, the first update whose approx_kl exceeds the target is
+        # Epochs of shuffled minibatch updates. With target_kl > 0, the first update whose approx_kl_action exceeds the target is
         # the last one of this rollout: both loops exit, so the skipped updates are never computed. Metrics are the mean
         # over the updates that ran; kl_stop_frac is the fraction skipped.
         batch_data = (data, value_targets, advantages)
@@ -764,7 +770,7 @@ def main(args: Args):
                 training_state, metrics = _train_minibatch_step(
                     training_state, key_loss, jax.tree_util.tree_map(lambda x: x[i], shuffled_batch_data))
                 if args.target_kl > 0.0:
-                    kl_stop = metrics['approx_kl'] > args.target_kl
+                    kl_stop = metrics['approx_kl_action'] > args.target_kl
                 metric_sum = jax.tree_util.tree_map(jnp.add, metric_sum, metrics)
                 return training_state, key, kl_stop, i + 1, n + 1, metric_sum
 

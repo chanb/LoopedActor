@@ -48,7 +48,8 @@
 #   DYNAMIC_LOSS_SCALE=0|1  COMPUTE_DTYPE=float16: dynamic loss scaling against fp16 gradient underflow (default 1)
 #   NORMALIZE_OBS=0|1  running mean/std observation normalization (default 0 = raw observations; runs before this
 #                       option always normalized)
-#   TARGET_KL=k         stop a rollout's remaining minibatch updates once approx_kl > k (default 0 = off; skipped updates
+#   TARGET_KL=k         stop a rollout's remaining minibatch updates once approx_kl_action > k (the action policy's KL only, not the
+#                       think time's; default 0 = off; skipped updates
 #                       are not computed, so this also saves time; training/kl_stop_frac = fraction skipped)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
 #   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
