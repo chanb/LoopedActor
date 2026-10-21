@@ -36,6 +36,7 @@
 #                       (default 0; pair with MIN_THINK_ITERS=1)
 #   HALT_BETA_FIXED=0|1  mem_halt: beta = log(HALT_RES) is fixed, not learned (h = 1/2 at r = HALT_RES; default 0)
 #   HALT_ALPHA_SIGNED=0|1  mem_halt: unconstrained residual slope alpha, may go negative (default 0; needs HALT_ALPHA_MIN=0)
+#   RUN_TAG=t           appended to the run name before _s<seed> (default none)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       the residual against the initial latent)
 # (No TOKENIZER option: Lights Out uses the per-cell press head, which needs the cell tokenizer.)
@@ -246,6 +247,7 @@ esac
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
+[[ -n "${RUN_TAG:-}" ]] && RUN+="_${RUN_TAG}"
 RUN+="_s${SEED}"
 [[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.

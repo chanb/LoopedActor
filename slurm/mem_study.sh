@@ -36,6 +36,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
+[[ -n "${RUN_TAG:-}" ]] && MEM_STUDY_TAG+="_${RUN_TAG}"   # train.sh adds _<RUN_TAG> to run names (forwarded by submit_mem.sh)
 [[ -n "${HALT_RES:-}" ]] && { MEM_STUDY_COMMON+=" HALT_RES=${HALT_RES}"; MEM_STUDY_TAG+="_hres${HALT_RES}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
