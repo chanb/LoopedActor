@@ -162,6 +162,8 @@ class Args:
     halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
+    halt_threshold_param: bool = False    # fprm_mem_halt: learn the halting threshold log KL* itself (h = sigmoid(alpha (log KL* - log KL)));
+                                          # False: beta - alpha log KL, whose threshold beta / alpha moves with the slope
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -412,6 +414,7 @@ def main(args: Args):
             halt_alpha_min=args.halt_alpha_min,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
+            halt_threshold_param=args.halt_threshold_param,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -639,6 +642,10 @@ def main(args: Args):
             # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
+            # Halting inputs in log10: KL_i = KL(pi_i || pi_{i-1}) per pass (pass 1: vs uniform) and the threshold KL* (pass >= 2).
+            log10_kl = jnp.mean(inter['intermediates']['halt_log_kl_t'][0], axis=-1) / np.log(10)
+            halt_metrics.update({f'halt_log10_kl_{i + 1}': log10_kl[i] for i in range(log10_kl.shape[0])})
+            halt_metrics['halt_log10_kl_star'] = jnp.mean(inter['intermediates']['halt_log_kl_star_t'][0][1:]) / np.log(10)
             # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
             res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)

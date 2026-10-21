@@ -8,7 +8,10 @@ hard rule KL_i <= halt_kl, pass i halts with probability
 so h_i -> 1 as the policy stops changing (KL_i -> 0) and h_i -> 0 while thinking still changes its mind. beta_i is a
 learned bias plus (`halt_beta_head`) a zero-initialized Dense on the rms-normed newest thought of pass i, i.e.
 state-dependent. alpha = 1, beta = log(halt_kl) at initialization, so h_i = 1/2 exactly at the old threshold
-KL_i = halt_kl. KL_i is stop-gradient'ed.
+KL_i = halt_kl. KL_i is stop-gradient'ed. Equivalently h_i = sigmoid(alpha * (log KL* - log KL_i)) with the threshold
+KL* = exp(beta_i / alpha), so lowering the slope alpha also lowers KL*. `halt_threshold_param` instead learns
+log KL* = beta_i directly (h_i = sigmoid(alpha * (beta_i - log KL_i))): alpha then sets only the sharpness around a
+threshold of its own. Both are the same function at initialization.
 
 The think time c is an action of the joint policy:
 
@@ -28,7 +31,8 @@ depended on it would bias the halting gradient.
 
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
 plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
-'halt_beta_t' (beta_i, [T, B]), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
+'halt_beta_t' (beta_i, [T, B]), 'halt_log_kl_t' (log KL_i, [T, B]), 'halt_log_kl_star_t' (log KL*, [T, B]; pass 1
+uses its own slope, so its entry is only meaningful from pass 2), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
 passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
 """
 
@@ -82,6 +86,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_alpha_min: float = 0.0    # floor on alpha, so halting always depends on KL_i (alpha -> 0 is state-blind halting)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
+    halt_threshold_param: bool = False  # learn the threshold log KL* = beta_i directly (alpha: sharpness only); False: beta_i / alpha
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -218,7 +223,15 @@ class FPRMMemHaltActorValue(nn.Module):
 
         alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
         slope = jnp.where(jnp.arange(T)[:, None] == 0, -self.halt_alpha1, alpha)
-        halt_logit = beta_t - slope * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
+        log_kl_t = jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
+        # Pass i >= 2: h_i = sigmoid(alpha * (log KL* - log KL_i)); pass 1 keeps its own unconstrained slope.
+        if self.halt_threshold_param:
+            log_kl_star_t = beta_t
+            bias_t = jnp.where(jnp.arange(T)[:, None] == 0, beta_t, alpha * beta_t)
+        else:
+            log_kl_star_t = beta_t / alpha
+            bias_t = beta_t
+        halt_logit = bias_t - slope * log_kl_t
         min_iters = 1 if T == 1 else self.min_think_iters
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]
         log_pc_b = log_pc.T  # [B, T]
@@ -246,6 +259,8 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_alpha', alpha)
         self.sow('intermediates', 'halt_beta_t', beta_t)
+        self.sow('intermediates', 'halt_log_kl_t', log_kl_t)
+        self.sow('intermediates', 'halt_log_kl_star_t', log_kl_star_t)
         self.sow('intermediates', 'latent_residual_t', latent_res_t)
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
