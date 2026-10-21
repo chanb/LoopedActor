@@ -30,19 +30,18 @@
 #   CELL_ENCODER_ITERS=N  perceiver / iso_perceiver: looped board encoder - the cells go N times through their own
 #                       FPRM core before thinking; latent layer l reads its last layer-l output (default 0 = off)
 #   RIM_HALT_THRESH=r   rim: halt once ||sep_s - sep_{s-1}|| / ||sep_s|| < r (default 0.1)
-#   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3);
-#                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
+#   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3)
+#   HALT_RES=r          mem_halt: initialization only (h_i = 1/2 at latent residual r_i = r; default 0.1)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_ALPHA_MIN=a    mem_halt: floor on the KL slope alpha, in [0, 1) (default 0 = no floor)
+#   HALT_ALPHA_MIN=a    mem_halt: floor on the residual slope alpha, in [0, 1) (default 0 = no floor)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_LOOKAHEAD=0|1  mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c, so c = 1 is a real convergence test
+#   HALT_LOOKAHEAD=0|1  mem_halt: halt on the latent residual of pass c+1 and act with pi_c, so c = 1 is a real convergence test
 #                       (default 0; pair with MIN_THINK_ITERS=1)
-#   HALT_BETA_FIXED=0|1  mem_halt: beta = log(HALT_KL) is fixed, not learned (h = 1/2 at KL = HALT_KL; default 0)
-#   HALT_ALPHA_SIGNED=0|1  mem_halt: unconstrained KL slope alpha, may go negative (default 0; needs HALT_ALPHA_MIN=0)
-#   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), i.e. under the acting policy with HALT_LOOKAHEAD=1 (default 0)
+#   HALT_BETA_FIXED=0|1  mem_halt: beta = log(HALT_RES) is fixed, not learned (h = 1/2 at r = HALT_RES; default 0)
+#   HALT_ALPHA_SIGNED=0|1  mem_halt: unconstrained residual slope alpha, may go negative (default 0; needs HALT_ALPHA_MIN=0)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
-#                       KL(pi_1 || uniform))
+#                       the residual against the initial latent)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per board cell, flat = one token per observation value,
 #                         conv = 3x3 conv, one token per output channel
@@ -86,7 +85,7 @@
 #   mem       : fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other, readout
 #               from the newest thought), cap 16 passes, policy-KL halting (1e-3)
 #   iso_mem   : the same, always runs the full 16 passes (no halting)
-#   mem_halt  : mem with stochastic learned halting, c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i); the PPO
+#   mem_halt  : mem with stochastic learned halting, c ~ p(c|s) from h_i = sigmoid(beta - alpha log r_i), r_i the latent residual between passes; the PPO
 #               ratio uses log p(c|s) + log pi_c(a|s); value from the last pass (models/fprm_mem_halt.py)
 #   rim       : RiM-style - each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts
 #               once the SEP latent converges (relative change < RIM_HALT_THRESH), cap 16 steps
@@ -103,8 +102,8 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
-HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_LOOKAHEAD="${HALT_LOOKAHEAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; HALT_ALPHA_SIGNED="${HALT_ALPHA_SIGNED:-0}"; HALT_BETA_FIXED="${HALT_BETA_FIXED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_KL="${HALT_KL:-1e-3}"; HALT_RES="${HALT_RES:-0.1}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_LOOKAHEAD="${HALT_LOOKAHEAD:-0}"; HALT_ALPHA_SIGNED="${HALT_ALPHA_SIGNED:-0}"; HALT_BETA_FIXED="${HALT_BETA_FIXED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -127,8 +126,9 @@ case "$ARM" in
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
-  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=latent_residual --halt_residual_thresh="$HALT_RES")
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}"
+             [[ "$HALT_RES" != 0.1 ]] && RUN+="_hres${HALT_RES}" ;;
   rim)       ARM_FLAGS=(--architecture=fprm_rim --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=latent_residual --halt_residual_thresh="$RIM_HALT_THRESH")
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}"
              [[ "$RIM_HALT_THRESH" != 0.1 ]] && RUN+="_ht${RIM_HALT_THRESH}" ;;
@@ -136,7 +136,7 @@ case "$ARM" in
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
 esac
-[[ "$ARM" =~ ^(looped|cot|perceiver|mem|mem_halt)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
+[[ "$ARM" =~ ^(looped|cot|perceiver|mem)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
 [[ "$MIN_THINK_ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "MIN_THINK_ITERS must be an integer >= 1, got $MIN_THINK_ITERS"; exit 1; }
 [[ "$MIN_THINK_ITERS" != 2 ]] && { ARM_FLAGS+=(--min_think_iters="$MIN_THINK_ITERS"); RUN+="_minit${MIN_THINK_ITERS}"; }
 if [[ "$ARM" == mem_halt ]]; then
@@ -159,11 +159,6 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_lookahead); RUN+="_look" ;;
     *) echo "HALT_LOOKAHEAD must be 0 or 1, got $HALT_LOOKAHEAD"; exit 1 ;;
   esac
-  case "$HALT_KL_REVERSE" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
-    *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
-  esac
   case "$HALT_ALPHA_SIGNED" in
     0) ;;
     1) ARM_FLAGS+=(--halt_alpha_signed); RUN+="_asgn" ;;
@@ -174,7 +169,7 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_beta_fixed); RUN+="_bfix" ;;
     *) echo "HALT_BETA_FIXED must be 0 or 1, got $HALT_BETA_FIXED"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED / HALT_BETA_FIXED (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_ALPHA_SIGNED / HALT_BETA_FIXED (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \

@@ -119,8 +119,8 @@ class Args:
     # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
     # 'fprm_perceiver' — Perceiver AR-style latent CoT: latents (from <BOT>) attend to the cell tokens + earlier latents at every layer
     # 'fprm_mem'       — fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other; readout from the newest thought)
-    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i) (learned alpha, beta);
-    #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_kl only initializes beta
+    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log r_i), r_i the latent residual between passes (learned alpha, beta);
+    #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_residual_thresh only initializes beta
     # 'fprm_rim'       — RiM-style: each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts when the
     #                    SEP latent converges (--halt_criterion latent_residual) or by policy KL (kl)
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
@@ -159,13 +159,12 @@ class Args:
                                             # iteration's layer-l output)
     input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
     input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
-    halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
+    halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the latent-residual slope alpha (alpha = this + softplus(.), 1 at init)
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
-    halt_lookahead: bool = False          # fprm_mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c (c = 1 is a real convergence test)
-    halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i) (with halt_lookahead: under the acting policy)
-    halt_beta_fixed: bool = False         # fprm_mem_halt: beta = log(halt_kl) is fixed, not learned (h = 1/2 at KL = halt_kl)
-    halt_alpha_signed: bool = False       # fprm_mem_halt: the KL slope alpha is an unconstrained scalar (may go negative; needs halt_alpha_min=0)
+    halt_lookahead: bool = False          # fprm_mem_halt: halt on the latent residual of pass c+1 and act with pi_c (c = 1 is a real convergence test)
+    halt_beta_fixed: bool = False         # fprm_mem_halt: beta = log(halt_residual_thresh) is fixed, not learned (h = 1/2 at r = halt_residual_thresh)
+    halt_alpha_signed: bool = False       # fprm_mem_halt: the residual slope alpha is an unconstrained scalar (may go negative; needs halt_alpha_min=0)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -405,19 +404,18 @@ def main(args: Args):
             value_at_max_iters=args.value_at_max_iters,
         )
     elif args.architecture == 'fprm_mem_halt':
-        assert args.halt_criterion == 'kl', "fprm_mem_halt supports only halt_criterion='kl'"
+        assert args.halt_criterion == 'latent_residual', "fprm_mem_halt supports only halt_criterion='latent_residual'"
         actor_critic_network = FPRMMemHaltActorValue(
             m=env.m,
             n=env.n,
             config=fprm_config,
             max_think_iters=args.max_think_iters,
             min_think_iters=args.min_think_iters,
-            halt_kl=args.halt_kl,
+            halt_res=args.halt_residual_thresh,
             halt_alpha_min=args.halt_alpha_min,
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_lookahead=args.halt_lookahead,
-            halt_kl_reverse=args.halt_kl_reverse,
             halt_alpha_signed=args.halt_alpha_signed,
             halt_beta_fixed=args.halt_beta_fixed,
             output_dim_1=action_size,
@@ -644,13 +642,10 @@ def main(args: Args):
                 'halt_alpha': inter['intermediates']['halt_alpha'][0],
                 'halt_beta': jnp.mean(inter['intermediates']['halt_beta_t'][0]),
             }
-            # Per-pass means, each in its own wandb section: h_i (forced 0 before min_think_iters, 1 at the cap),
-            # log10 of the policy KL_i between passes i and i-1 (KL spans decades, so the mean of the log) and the
-            # latent residual (below).
+            # Per-pass means, each in its own wandb section: h_i (forced 0 before min_think_iters, 1 at the cap) and
+            # the latent residual (below).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob/pass_{i + 1:02d}': mean_h[i] for i in range(mean_h.shape[0])})
-            log_kl = jnp.mean(jnp.log10(jnp.maximum(inter['intermediates']['policy_kl_t'][0], 0.0) + 1e-10), axis=-1)
-            halt_metrics.update({f'halt_log10_kl/pass_{i + 1:02d}': log_kl[i] for i in range(log_kl.shape[0])})
             # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
             res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)

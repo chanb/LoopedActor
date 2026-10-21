@@ -52,8 +52,8 @@ def build_module(args, m, n):
         return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                  thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_mem_halt':
-        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=1 if args.halt_lookahead else 2, halt_kl=args.halt_kl,
-                                     halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, halt_lookahead=args.halt_lookahead, halt_kl_reverse=args.halt_kl_reverse, halt_alpha_signed=args.halt_alpha_signed, halt_beta_fixed=args.halt_beta_fixed,
+        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=1 if args.halt_lookahead else 2, halt_res=args.halt_residual_thresh,
+                                     halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, halt_lookahead=args.halt_lookahead, halt_alpha_signed=args.halt_alpha_signed, halt_beta_fixed=args.halt_beta_fixed,
                                      thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_perceiver':
         return FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
@@ -122,13 +122,12 @@ def main():
     ap.add_argument('--halt_beta_head', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_beta_head')
     ap.add_argument('--halt_beta_fixed', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_beta_fixed')
     ap.add_argument('--halt_alpha_signed', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_alpha_signed')
-    ap.add_argument('--halt_kl_reverse', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_kl_reverse')
     ap.add_argument('--halt_lookahead', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_lookahead (and --min_think_iters 1)')
     ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
                     help='fprm_mem_halt: think time c = argmax p(c|s) (the training eval), c ~ p(c|s), or --halt_fixed for every state')
     ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
     ap.add_argument('--rim_halt', default='latent', choices=['latent', 'kl'], help='fprm_rim: halting rule (latent = SEP convergence)')
-    ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent: the checkpoint\'s threshold')
+    ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent / fprm_mem_halt: the checkpoint\'s threshold')
     ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
     ap.add_argument('--input_grid_conv', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --input_grid_conv')
     ap.add_argument('--input_grid_conv_depth', type=int, default=1, help='fprm_cot / fprm_perceiver: the checkpoint\'s --input_grid_conv_depth')

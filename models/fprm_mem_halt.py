@@ -1,38 +1,36 @@
-"""`fprm_mem` with stochastic, learned halting driven by the policy KL between consecutive passes.
+"""`fprm_mem` with stochastic, learned halting driven by the latent distance between consecutive passes.
 
-The trunk is exactly `fprm_mem` (looped board + thought memory, `mem_core`); only halting differs. Instead of the
-hard rule KL_i <= halt_kl, pass i halts with probability
+The trunk is exactly `fprm_mem` (looped board + thought memory, `mem_core`); only halting differs. Pass i halts with
+probability
 
-    h_i = sigmoid(beta_i - alpha * log KL_i),     KL_i = KL(pi_i || pi_{i-1}),  alpha = halt_alpha_min + softplus(.) > 0
+    h_i = sigmoid(beta_i - alpha * log r_i),     r_i = max-token residual(z_{i-1}, z_i),  alpha = halt_alpha_min + softplus(.) > 0
 
-so h_i -> 1 as the policy stops changing (KL_i -> 0) and h_i -> 0 while thinking still changes its mind. beta_i is a
+where z_i are the cell latents after pass i and r_i is fprm's halt_criterion='latent_residual' distance
+(max over tokens of |z_i - z_{i-1}|_inf / |z_i|_inf). h_i -> 1 as the latent stops moving (r_i -> 0). beta_i is a
 learned bias plus (`halt_beta_head`) a zero-initialized Dense on the rms-normed newest thought of pass i, i.e.
-state-dependent. alpha = 1, beta = log(halt_kl) at initialization, so h_i = 1/2 exactly at the old threshold
-KL_i = halt_kl. KL_i is stop-gradient'ed.
+state-dependent. alpha = 1, beta = log(halt_res) at initialization, so h_i = 1/2 exactly at r_i = halt_res. r_i is
+stop-gradient'ed.
 
 The think time c is an action of the joint policy:
 
     p(c = n | s) = h_n * prod_{i<n} (1 - h_i),    h_i = 0 for i < min_think_iters, h_T = 1 (T = max_think_iters)
     log p(c, a | s) = log p(c | s) + log pi_c(a | s)
 
-Pass 1 is compared against pi_0 = uniform, but KL(pi_1 || uniform) = log A - H(pi_1) measures confidence, not
-convergence, so it gets its own unconstrained slope: h_1 = sigmoid(beta_1 + alpha_1 * log KL_1), alpha_1 = 0 at init
-(alpha_1 > 0: halt after one pass when confident). All T passes are always executed (as in fprm_mem);
-the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
+Pass 1 is compared against the initial latent z_0, which measures how far one pass moves the latent, not convergence,
+so it gets its own unconstrained slope: h_1 = sigmoid(beta_1 + alpha_1 * log r_1), alpha_1 = 0 at init. All T passes
+are always executed (as in fprm_mem); the readout of pass c is selected afterwards, so passes after c get no gradient
+from the actor loss.
 
 `halt_lookahead`: the halting decision after pass n+1 acts with the previous pass, i.e.
-h_n = sigmoid(beta_{n+1} - alpha * log KL_{n+1}) for n < T, so c = n means "pi_{n+1} agrees with pi_n, act with pi_n".
-c = 1 is then decided by a real convergence test KL(pi_2 || pi_1) (use min_think_iters = 1) and the uniform-comparison
-slope alpha_1 is unused; 'fp_residual' and 'halt_beta_t' are the shifted (pass c+1) values.
+h_n = sigmoid(beta_{n+1} - alpha * log r_{n+1}) for n < T, so c = n means "z_{n+1} agrees with z_n, act with pi_n".
+c = 1 is then decided by a real convergence test r_2 (use min_think_iters = 1) and the slope alpha_1 is unused;
+'fp_residual' and 'halt_beta_t' are the shifted (pass c+1) values.
 
 `halt_alpha_signed`: alpha is a raw learned scalar (1 at init) instead of halt_alpha_min + softplus(.), so the learned
-rule may also be "halt while the policy still changes" (alpha < 0); halt_alpha_min must be 0.
+rule may also be "halt while the latent still moves" (alpha < 0); halt_alpha_min must be 0.
 
-`halt_beta_fixed`: beta = log(halt_kl) is a constant, not learned, so h_i = 1/2 exactly at KL_i = halt_kl throughout
-training and only alpha * log KL_i moves halting (a learned beta can lower compute state-blindly).
-
-`halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead. With halt_lookahead this takes the expectation under pi_c, the
-policy that acts (as the forward KL does without lookahead); the two agree to second order for small policy changes.
+`halt_beta_fixed`: beta = log(halt_res) is a constant, not learned, so h_i = 1/2 exactly at r_i = halt_res throughout
+training and only alpha * log r_i moves halting (a learned beta can lower compute state-blindly).
 
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
@@ -40,10 +38,9 @@ Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollou
 The value is read out from the last pass (fprm_mem's `value_at_max_iters`): since c is an action, a baseline that
 depended on it would bias the halting gradient.
 
-Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
+Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = r_c)
 plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
-'halt_beta_t' (beta_i, [T, B]), 'policy_kl_t' (KL_i by pass, [T, B], not shifted by halt_lookahead), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
-passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
+'halt_beta_t' (beta_i, [T, B]), 'latent_residual_t' (r_i by pass, [T, B], not shifted by halt_lookahead).
 """
 
 import math
@@ -68,7 +65,7 @@ from models.fprm_thinker import tokenize
 from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
 
 _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the gradients NaN-free)
-_KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
+_RES_EPS = 1e-10  # floor inside log r (r may round to 0)
 
 
 def halt_log_probs(halt_logit, min_iters):
@@ -85,21 +82,20 @@ def halt_log_probs(halt_logit, min_iters):
 
 
 class FPRMMemHaltActorValue(nn.Module):
-    """fprm_mem trunk with the stochastic KL-sigmoid halting policy (see the module docstring)."""
+    """fprm_mem trunk with the stochastic latent-residual-sigmoid halting policy (see the module docstring)."""
 
     m: int = 3
     n: int = 3
     config: FPRMConfig = FPRMConfig()
     max_think_iters: int = 8
     min_think_iters: int = 2
-    halt_kl: float = 1e-3          # initialization only: h_i = 1/2 at KL_i = halt_kl (beta = log halt_kl, alpha = 1)
-    halt_alpha_min: float = 0.0    # floor on alpha, so halting always depends on KL_i (alpha -> 0 is state-blind halting)
+    halt_res: float = 0.1          # initialization only: h_i = 1/2 at r_i = halt_res (beta = log halt_res, alpha = 1)
+    halt_alpha_min: float = 0.0    # floor on alpha, so halting always depends on r_i (alpha -> 0 is state-blind halting)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
-    halt_lookahead: bool = False   # halt on KL(pi_{c+1} || pi_c) and act with pi_c (see the module docstring)
-    halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
+    halt_lookahead: bool = False   # halt on r_{c+1} and act with pi_c (see the module docstring)
     halt_alpha_signed: bool = False  # alpha is an unconstrained scalar (see the module docstring)
-    halt_beta_fixed: bool = False  # beta = log(halt_kl), not learned (see the module docstring)
+    halt_beta_fixed: bool = False  # beta = log(halt_res), not learned (see the module docstring)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -112,7 +108,7 @@ class FPRMMemHaltActorValue(nn.Module):
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
-        assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
+        assert self.halt_res > 0, 'halt_res initializes beta = log(halt_res)'
         assert 0.0 <= self.halt_alpha_min < 1.0, self.halt_alpha_min
         assert not (self.halt_alpha_signed and self.halt_alpha_min > 0), 'halt_alpha_min floors a positive alpha'
         assert not (self.halt_beta_fixed and self.halt_beta_head), 'halt_beta_fixed has no beta head'
@@ -133,13 +129,13 @@ class FPRMMemHaltActorValue(nn.Module):
             bias_init=nn.initializers.zeros,
         )
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
-        # Halting: alpha = halt_alpha_min + softplus(halt_alpha_raw) (= 1 at init); beta from a zero-kernel Dense (= log halt_kl at init).
+        # Halting: alpha = halt_alpha_min + softplus(halt_alpha_raw) (= 1 at init); beta from a zero-kernel Dense (= log halt_res at init).
         a0 = 1.0 - self.halt_alpha_min
         raw0 = 1.0 if self.halt_alpha_signed else math.log(math.expm1(a0))
         self.halt_alpha_raw = self.param('halt_alpha_raw', nn.initializers.constant(raw0), ())
         self.halt_alpha1 = self.param('halt_alpha1', nn.initializers.zeros, ())  # pass 1's slope, any sign
         self.halt_beta = nn.Dense(
-            1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.constant(math.log(self.halt_kl)),
+            1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.constant(math.log(self.halt_res)),
         )
         self.latent_init = make_latent_init(self.config)
 
@@ -187,7 +183,7 @@ class FPRMMemHaltActorValue(nn.Module):
                 beta_in = last_latent if self.halt_head_grad else jax.lax.stop_gradient(last_latent)
                 beta = jnp.squeeze(beta_in @ beta_p['kernel'] + beta_p['bias'], axis=-1)
             elif self.halt_beta_fixed:
-                beta = jnp.full((B,), math.log(self.halt_kl))
+                beta = jnp.full((B,), math.log(self.halt_res))
             else:
                 beta = jnp.broadcast_to(beta_p['bias'][0], (B,))
             return logits, value, beta.astype(jnp.float32)
@@ -224,36 +220,29 @@ class FPRMMemHaltActorValue(nn.Module):
             logits = jnp.where(finite[:, None], logits, logits_prev)
             value = jnp.where(finite, value, value_prev)
             beta = jnp.where(finite, beta, 0.0)
-
-            lp_new = jax.nn.log_softmax(logits, axis=-1)
-            lp_prev = jax.nn.log_softmax(logits_prev, axis=-1)
-            if self.halt_kl_reverse:
-                lp_new, lp_prev = lp_prev, lp_new
-            kl = jnp.sum(jnp.exp(lp_new) * (lp_new - lp_prev), axis=-1)
-            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: against uniform, logits_init = 0
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
-            return carry, (logits, value, beta, kl, nonfinite, latent_res)
+            return carry, (logits, value, beta, nonfinite, latent_res)
 
         if self.remat:
             body = jax.checkpoint(body, prevent_cse=False)
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
-        _, (logits_t, value_t, beta_t, kl_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
-        # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
+        _, (logits_t, value_t, beta_t, nonfinite_t, res_t) = jax.lax.scan(body, init, jnp.arange(T))
+        # logits_t [T, B, A]; value_t, beta_t, nonfinite_t, res_t [T, B]
 
-        self.sow('intermediates', 'policy_kl_t', kl_t)
+        self.sow('intermediates', 'latent_residual_t', res_t)
         if self.halt_alpha_signed:
             alpha = self.halt_alpha_raw
         else:
             alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
         if self.halt_lookahead:
-            # Row n holds pass n+1's KL and beta; the last row is a forced halt (h_T = 1), so its values are unused.
-            kl_t = jnp.concatenate([kl_t[1:], kl_t[-1:]], axis=0)
+            # Row n holds pass n+1's residual and beta; the last row is a forced halt (h_T = 1), so its values are unused.
+            res_t = jnp.concatenate([res_t[1:], res_t[-1:]], axis=0)
             beta_t = jnp.concatenate([beta_t[1:], beta_t[-1:]], axis=0)
             slope = alpha
         else:
             slope = jnp.where(jnp.arange(T)[:, None] == 0, -self.halt_alpha1, alpha)
-        halt_logit = beta_t - slope * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
+        halt_logit = beta_t - slope * jnp.log(res_t + _RES_EPS)
         min_iters = 1 if T == 1 else self.min_think_iters
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]
         log_pc_b = log_pc.T  # [B, T]
@@ -269,7 +258,7 @@ class FPRMMemHaltActorValue(nn.Module):
         logits = jnp.take_along_axis(logits_t, idx[None, :, None], axis=0)[0]
         halt_log_prob = jnp.take_along_axis(log_pc_b, idx[:, None], axis=-1)[:, 0]
         halt_entropy = -jnp.sum(jnp.exp(log_pc_b) * log_pc_b, axis=-1)
-        kl_c = jnp.take_along_axis(kl_t.T, idx[:, None], axis=-1)[:, 0]
+        res_c = jnp.take_along_axis(res_t.T, idx[:, None], axis=-1)[:, 0]
         nonfinite = jnp.take_along_axis(nonfinite_t.T, idx[:, None], axis=-1)[:, 0]
 
         logits = logits.reshape(input_shape[:-1] + (-1,))
@@ -281,12 +270,11 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_alpha', alpha)
         self.sow('intermediates', 'halt_beta_t', beta_t)
-        self.sow('intermediates', 'latent_residual_t', latent_res_t)
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
         reason = jnp.where(nonfinite, STOP_NONFINITE, reason)
         self.sow('intermediates', 'fp_iterations', c)
-        self.sow('intermediates', 'fp_residual', kl_c)
+        self.sow('intermediates', 'fp_residual', res_c)
         self.sow('intermediates', 'fp_converged', reason == STOP_CONVERGED)
         self.sow('intermediates', 'fp_stop_reason', reason)
 

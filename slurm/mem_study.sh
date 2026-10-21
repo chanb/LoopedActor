@@ -8,7 +8,7 @@
 #               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED / HALT_BETA_FIXED are read by train.sh
+#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_ALPHA_SIGNED / HALT_BETA_FIXED are read by train.sh
 #   HALT_ALPHA_MINS  alpha floors swept over the mem_halt configs, crossed with the rest (e.g. "0 0.1 0.25 0.5"; config
 #               and slurm job names get _amin<a>; other arms are not multiplied). Use instead of HALT_ALPHA_MIN, not with it
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
@@ -36,12 +36,12 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
+[[ -n "${HALT_RES:-}" ]] && { MEM_STUDY_COMMON+=" HALT_RES=${HALT_RES}"; MEM_STUDY_TAG+="_hres${HALT_RES}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
 [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
 [[ "${HALT_LOOKAHEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_LOOKAHEAD=1"; MEM_STUDY_TAG+="_look"; }
-[[ "${HALT_KL_REVERSE:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_KL_REVERSE=1"; MEM_STUDY_TAG+="_rkl"; }
 [[ "${HALT_ALPHA_SIGNED:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_SIGNED=1"; MEM_STUDY_TAG+="_asgn"; }
 [[ "${HALT_BETA_FIXED:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_FIXED=1"; MEM_STUDY_TAG+="_bfix"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
