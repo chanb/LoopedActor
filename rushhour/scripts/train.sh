@@ -25,6 +25,7 @@
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
 #   HALT_LOOKAHEAD=0|1  mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c, so c = 1 is a real convergence test
 #                       (default 0; pair with MIN_THINK_ITERS=1)
+#   HALT_ALPHA_SIGNED=0|1  mem_halt: unconstrained KL slope alpha, may go negative (default 0; needs HALT_ALPHA_MIN=0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), i.e. under the acting policy with HALT_LOOKAHEAD=1 (default 0)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       KL(pi_1 || uniform))
@@ -85,7 +86,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_LOOKAHEAD="${HALT_LOOKAHEAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_LOOKAHEAD="${HALT_LOOKAHEAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; HALT_ALPHA_SIGNED="${HALT_ALPHA_SIGNED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -144,7 +145,12 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
     *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE (shared study settings)
+  case "$HALT_ALPHA_SIGNED" in
+    0) ;;
+    1) ARM_FLAGS+=(--halt_alpha_signed); RUN+="_asgn" ;;
+    *) echo "HALT_ALPHA_SIGNED must be 0 or 1, got $HALT_ALPHA_SIGNED"; exit 1 ;;
+  esac
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \

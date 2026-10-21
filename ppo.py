@@ -164,6 +164,7 @@ class Args:
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_lookahead: bool = False          # fprm_mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c (c = 1 is a real convergence test)
     halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i) (with halt_lookahead: under the acting policy)
+    halt_alpha_signed: bool = False       # fprm_mem_halt: the KL slope alpha is an unconstrained scalar (may go negative; needs halt_alpha_min=0)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -416,6 +417,7 @@ def main(args: Args):
             halt_head_grad=args.halt_head_grad,
             halt_lookahead=args.halt_lookahead,
             halt_kl_reverse=args.halt_kl_reverse,
+            halt_alpha_signed=args.halt_alpha_signed,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
