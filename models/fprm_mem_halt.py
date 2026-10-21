@@ -25,6 +25,9 @@ h_n = sigmoid(beta_{n+1} - alpha * log KL_{n+1}) for n < T, so c = n means "pi_{
 c = 1 is then decided by a real convergence test KL(pi_2 || pi_1) (use min_think_iters = 1) and the uniform-comparison
 slope alpha_1 is unused; 'fp_residual' and 'halt_beta_t' are the shifted (pass c+1) values.
 
+`halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead. With halt_lookahead this takes the expectation under pi_c, the
+policy that acts (as the forward KL does without lookahead); the two agree to second order for small policy changes.
+
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
 
@@ -88,6 +91,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
     halt_lookahead: bool = False   # halt on KL(pi_{c+1} || pi_c) and act with pi_c (see the module docstring)
+    halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -210,8 +214,10 @@ class FPRMMemHaltActorValue(nn.Module):
 
             lp_new = jax.nn.log_softmax(logits, axis=-1)
             lp_prev = jax.nn.log_softmax(logits_prev, axis=-1)
+            if self.halt_kl_reverse:
+                lp_new, lp_prev = lp_prev, lp_new
             kl = jnp.sum(jnp.exp(lp_new) * (lp_new - lp_prev), axis=-1)
-            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: KL(pi_1 || uniform), logits_init = 0
+            kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: against uniform, logits_init = 0
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
             return carry, (logits, value, beta, kl, nonfinite, latent_res)

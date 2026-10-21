@@ -163,6 +163,7 @@ class Args:
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_lookahead: bool = False          # fprm_mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c (c = 1 is a real convergence test)
+    halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i) (with halt_lookahead: under the acting policy)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -414,6 +415,7 @@ def main(args: Args):
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_lookahead=args.halt_lookahead,
+            halt_kl_reverse=args.halt_kl_reverse,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
