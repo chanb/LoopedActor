@@ -28,6 +28,9 @@ slope alpha_1 is unused; 'fp_residual' and 'halt_beta_t' are the shifted (pass c
 `halt_alpha_signed`: alpha is a raw learned scalar (1 at init) instead of halt_alpha_min + softplus(.), so the learned
 rule may also be "halt while the policy still changes" (alpha < 0); halt_alpha_min must be 0.
 
+`halt_beta_fixed`: beta = log(halt_kl) is a constant, not learned, so h_i = 1/2 exactly at KL_i = halt_kl throughout
+training and only alpha * log KL_i moves halting (a learned beta can lower compute state-blindly).
+
 `halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead. With halt_lookahead this takes the expectation under pi_c, the
 policy that acts (as the forward KL does without lookahead); the two agree to second order for small policy changes.
 
@@ -39,7 +42,7 @@ depended on it would bias the halting gradient.
 
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
 plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_alpha',
-'halt_beta_t' (beta_i, [T, B]), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
+'halt_beta_t' (beta_i, [T, B]), 'policy_kl_t' (KL_i by pass, [T, B], not shifted by halt_lookahead), 'latent_residual_t' (the max-token residual of the cell latents between consecutive
 passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
 """
 
@@ -96,6 +99,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_lookahead: bool = False   # halt on KL(pi_{c+1} || pi_c) and act with pi_c (see the module docstring)
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     halt_alpha_signed: bool = False  # alpha is an unconstrained scalar (see the module docstring)
+    halt_beta_fixed: bool = False  # beta = log(halt_kl), not learned (see the module docstring)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -111,6 +115,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.halt_kl > 0, 'halt_kl initializes beta = log(halt_kl)'
         assert 0.0 <= self.halt_alpha_min < 1.0, self.halt_alpha_min
         assert not (self.halt_alpha_signed and self.halt_alpha_min > 0), 'halt_alpha_min floors a positive alpha'
+        assert not (self.halt_beta_fixed and self.halt_beta_head), 'halt_beta_fixed has no beta head'
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -181,6 +186,8 @@ class FPRMMemHaltActorValue(nn.Module):
             if self.halt_beta_head:
                 beta_in = last_latent if self.halt_head_grad else jax.lax.stop_gradient(last_latent)
                 beta = jnp.squeeze(beta_in @ beta_p['kernel'] + beta_p['bias'], axis=-1)
+            elif self.halt_beta_fixed:
+                beta = jnp.full((B,), math.log(self.halt_kl))
             else:
                 beta = jnp.broadcast_to(beta_p['bias'][0], (B,))
             return logits, value, beta.astype(jnp.float32)
@@ -234,6 +241,7 @@ class FPRMMemHaltActorValue(nn.Module):
         _, (logits_t, value_t, beta_t, kl_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
+        self.sow('intermediates', 'policy_kl_t', kl_t)
         if self.halt_alpha_signed:
             alpha = self.halt_alpha_raw
         else:

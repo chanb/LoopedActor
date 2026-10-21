@@ -164,6 +164,7 @@ class Args:
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_lookahead: bool = False          # fprm_mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c (c = 1 is a real convergence test)
     halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i) (with halt_lookahead: under the acting policy)
+    halt_beta_fixed: bool = False         # fprm_mem_halt: beta = log(halt_kl) is fixed, not learned (h = 1/2 at KL = halt_kl)
     halt_alpha_signed: bool = False       # fprm_mem_halt: the KL slope alpha is an unconstrained scalar (may go negative; needs halt_alpha_min=0)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
@@ -418,6 +419,7 @@ def main(args: Args):
             halt_lookahead=args.halt_lookahead,
             halt_kl_reverse=args.halt_kl_reverse,
             halt_alpha_signed=args.halt_alpha_signed,
+            halt_beta_fixed=args.halt_beta_fixed,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -642,15 +644,19 @@ def main(args: Args):
                 'halt_alpha': inter['intermediates']['halt_alpha'][0],
                 'halt_beta': jnp.mean(inter['intermediates']['halt_beta_t'][0]),
             }
-            # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
+            # Per-pass means, each in its own wandb section: h_i (forced 0 before min_think_iters, 1 at the cap),
+            # log10 of the policy KL_i between passes i and i-1 (KL spans decades, so the mean of the log) and the
+            # latent residual (below).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
-            halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
+            halt_metrics.update({f'halt_prob/pass_{i + 1:02d}': mean_h[i] for i in range(mean_h.shape[0])})
+            log_kl = jnp.mean(jnp.log10(jnp.maximum(inter['intermediates']['policy_kl_t'][0], 0.0) + 1e-10), axis=-1)
+            halt_metrics.update({f'halt_log10_kl/pass_{i + 1:02d}': log_kl[i] for i in range(log_kl.shape[0])})
             # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
             res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)
             halt_metrics['latent_res_at_c'] = jnp.mean(jnp.take_along_axis(res_t, c_idx[None], axis=0))
             mean_res = jnp.mean(res_t, axis=-1)
-            halt_metrics.update({f'latent_res_{i + 1}': mean_res[i] for i in range(mean_res.shape[0])})
+            halt_metrics.update({f'latent_res/pass_{i + 1:02d}': mean_res[i] for i in range(mean_res.shape[0])})
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
         policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
@@ -844,7 +850,7 @@ def main(args: Args):
                 'training/data_collection_time_fraction': data_collect_step_time / training_step_time,
                 'training/learning_time_fraction': learn_step_time / training_step_time,
                 'training/env_steps': training_state.env_steps,
-                **{f'training/{name}': value for name, value in metrics.items()},
+                **{name if '/' in name else f'training/{name}': value for name, value in metrics.items()},  # 'a/b': own section
             }
 
             metrics = evaluator.run_evaluation(

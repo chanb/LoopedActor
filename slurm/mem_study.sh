@@ -8,7 +8,7 @@
 #               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED are read by train.sh
+#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED / HALT_BETA_FIXED are read by train.sh
 #   HALT_ALPHA_MINS  alpha floors swept over the mem_halt configs, crossed with the rest (e.g. "0 0.1 0.25 0.5"; config
 #               and slurm job names get _amin<a>; other arms are not multiplied). Use instead of HALT_ALPHA_MIN, not with it
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
@@ -43,6 +43,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ "${HALT_LOOKAHEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_LOOKAHEAD=1"; MEM_STUDY_TAG+="_look"; }
 [[ "${HALT_KL_REVERSE:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_KL_REVERSE=1"; MEM_STUDY_TAG+="_rkl"; }
 [[ "${HALT_ALPHA_SIGNED:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_SIGNED=1"; MEM_STUDY_TAG+="_asgn"; }
+[[ "${HALT_BETA_FIXED:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_FIXED=1"; MEM_STUDY_TAG+="_bfix"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then
