@@ -119,8 +119,8 @@ class Args:
     # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
     # 'fprm_perceiver' — Perceiver AR-style latent CoT: latents (from <BOT>) attend to the cell tokens + earlier latents at every layer
     # 'fprm_mem'       — fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other; readout from the newest thought)
-    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i) (learned alpha, beta);
-    #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_kl only initializes beta
+    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(Dense(rms_norm(thought_i))) (a learned
+    #                    halting head on the newest thought); the PPO ratio uses the joint log p(c|s) + log pi_c(a|s)
     # 'fprm_rim'       — RiM-style: each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts when the
     #                    SEP latent converges (--halt_criterion latent_residual) or by policy KL (kl)
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
@@ -159,11 +159,7 @@ class Args:
                                             # iteration's layer-l output)
     input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
     input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
-    halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
-    halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
-    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
-    halt_threshold_param: bool = False    # fprm_mem_halt: learn the halting threshold log KL* itself (h = sigmoid(alpha (log KL* - log KL)));
-                                          # False: beta - alpha log KL, whose threshold beta / alpha moves with the slope
+    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the halting head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -403,18 +399,13 @@ def main(args: Args):
             value_at_max_iters=args.value_at_max_iters,
         )
     elif args.architecture == 'fprm_mem_halt':
-        assert args.halt_criterion == 'kl', "fprm_mem_halt supports only halt_criterion='kl'"
         actor_critic_network = FPRMMemHaltActorValue(
             m=env.m,
             n=env.n,
             config=fprm_config,
             max_think_iters=args.max_think_iters,
             min_think_iters=args.min_think_iters,
-            halt_kl=args.halt_kl,
-            halt_alpha_min=args.halt_alpha_min,
-            halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
-            halt_threshold_param=args.halt_threshold_param,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -636,16 +627,14 @@ def main(args: Args):
             halt_entropy = jnp.mean(inter['intermediates']['halt_entropy'][0])
             halt_metrics = {
                 'halt_entropy': halt_entropy,
-                'halt_alpha': inter['intermediates']['halt_alpha'][0],
-                'halt_beta': jnp.mean(inter['intermediates']['halt_beta_t'][0]),
+                'halt_logit': jnp.mean(inter['intermediates']['halt_logit_t'][0]),
             }
             # Mean h_i per pass (forced 0 before min_think_iters, 1 at the cap).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob_{i + 1}': mean_h[i] for i in range(mean_h.shape[0])})
-            # Halting inputs in log10: KL_i = KL(pi_i || pi_{i-1}) per pass (pass 1: vs uniform) and the threshold KL* (pass >= 2).
+            # Diagnostic (not used by halting): log10 KL_i = KL(pi_i || pi_{i-1}) per pass (pass 1: vs uniform).
             log10_kl = jnp.mean(inter['intermediates']['halt_log_kl_t'][0], axis=-1) / np.log(10)
             halt_metrics.update({f'halt_log10_kl_{i + 1}': log10_kl[i] for i in range(log10_kl.shape[0])})
-            halt_metrics['halt_log10_kl_star'] = jnp.mean(inter['intermediates']['halt_log_kl_star_t'][0][1:]) / np.log(10)
             # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
             res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)

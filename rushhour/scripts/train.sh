@@ -17,16 +17,10 @@
 #   CELL_ENCODER_ITERS=N  perceiver / iso_perceiver: looped board encoder - the cells go N times through their own
 #                       FPRM core before thinking; latent layer l reads its last layer-l output (default 0 = off)
 #   RIM_HALT_THRESH=r   rim: halt once ||sep_s - sep_{s-1}|| / ||sep_s|| < r (default 0.1)
-#   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3);
-#                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
+#   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_ALPHA_MIN=a    mem_halt: floor on the KL slope alpha, in [0, 1) (default 0 = no floor)
-#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
-#   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_THRESHOLD_PARAM=0|1  mem_halt: learn the halting threshold log KL* itself, h = sigmoid(alpha (log KL* - log KL))
-#                       (alpha then sets only the sharpness; default 0: beta - alpha log KL, threshold beta / alpha)
-#   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
-#                       KL(pi_1 || uniform))
+#   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
+#   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
@@ -67,7 +61,7 @@
 #   mem       : fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other, readout
 #               from the newest thought), cap 16 passes, policy-KL halting (1e-3)
 #   iso_mem   : the same, always runs the full 16 passes (no halting)
-#   mem_halt  : mem with stochastic learned halting, c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i); the PPO
+#   mem_halt  : mem with stochastic learned halting, c ~ p(c|s) from h_i = sigmoid(Dense(rms_norm(thought_i))); the PPO
 #               ratio uses log p(c|s) + log pi_c(a|s); value from the last pass (models/fprm_mem_halt.py)
 #   rim       : RiM-style - each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts
 #               once the SEP latent converges (relative change < RIM_HALT_THRESH), cap 16 steps
@@ -84,7 +78,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_THRESHOLD_PARAM="${HALT_THRESHOLD_PARAM:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -106,7 +100,7 @@ case "$ARM" in
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
-  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
+  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS")
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   rim)       ARM_FLAGS=(--architecture=fprm_rim --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=latent_residual --halt_residual_thresh="$RIM_HALT_THRESH")
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}"
@@ -115,30 +109,22 @@ case "$ARM" in
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
 esac
-[[ "$ARM" =~ ^(looped|cot|perceiver|mem|mem_halt)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
+[[ "$ARM" =~ ^(looped|cot|perceiver|mem)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
 [[ "$MIN_THINK_ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "MIN_THINK_ITERS must be an integer >= 1, got $MIN_THINK_ITERS"; exit 1; }
 [[ "$MIN_THINK_ITERS" != 2 ]] && { ARM_FLAGS+=(--min_think_iters="$MIN_THINK_ITERS"); RUN+="_minit${MIN_THINK_ITERS}"; }
 if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a + 0 == a && a >= 0 && a < 1) }' || { echo "HALT_ALPHA_MIN must be in [0, 1), got $HALT_ALPHA_MIN"; exit 1; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a > 0) }' && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_amin${HALT_ALPHA_MIN}"; }
-  case "$HALT_BETA_HEAD" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_beta_head); RUN+="_bh" ;;
-    *) echo "HALT_BETA_HEAD must be 0 or 1, got $HALT_BETA_HEAD"; exit 1 ;;
-  esac
   case "$HALT_HEAD_GRAD" in
     0) ;;
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  case "$HALT_THRESHOLD_PARAM" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_threshold_param); RUN+="_hthr" ;;
-    *) echo "HALT_THRESHOLD_PARAM must be 0 or 1, got $HALT_THRESHOLD_PARAM"; exit 1 ;;
-  esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_THRESHOLD_PARAM (shared study settings)
+  RUN+="_hlat"   # latent halting head (distinguishes these runs from the earlier KL-halting mem_halt runs)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD (shared study settings)
+for _v in HALT_ALPHA_MIN HALT_BETA_HEAD HALT_THRESHOLD_PARAM HALT_SIGNAL; do   # removed with KL-driven halting in mem_halt
+  [[ -z "${!_v:-}" ]] || { echo "$_v was removed (mem_halt halts from its latent only); unset it"; exit 1; }
+done
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \

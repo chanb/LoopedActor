@@ -8,9 +8,8 @@
 #               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_THRESHOLD_PARAM are read by train.sh
-#   HALT_ALPHA_MINS  alpha floors swept over the mem_halt configs, crossed with the rest (e.g. "0 0.1 0.25 0.5"; config
-#               and slurm job names get _amin<a>; other arms are not multiplied). Use instead of HALT_ALPHA_MIN, not with it
+#               (every pass runs); halting from a head on the newest thought (config / job names get _hlat);
+#               HALT_ENTROPY_COST / HALT_HEAD_GRAD are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -32,15 +31,12 @@ MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
 MEM_STUDY_TAG=""   # appended to slurm job names
-[[ -n "${HALT_ALPHA_MINS:-}" && -n "${HALT_ALPHA_MIN:-}" ]] && { echo "set HALT_ALPHA_MINS or HALT_ALPHA_MIN, not both" >&2; return 1; }
+[[ -z "${HALT_ALPHA_MINS:-}" ]] || { echo "HALT_ALPHA_MINS was removed (mem_halt halts from its latent only)" >&2; return 1; }
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
-[[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
-[[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
-[[ "${HALT_THRESHOLD_PARAM:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_THRESHOLD_PARAM=1"; MEM_STUDY_TAG+="_hthr"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then
@@ -56,16 +52,11 @@ for _ve in ${VALUE_EXPECTILES:-0.5}; do
   for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_mem"); done
   for _t in ${MEM_ITERS-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem"); done
   for _t in ${ISO_RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("iso_rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_rim"); done
-  for _t in ${MEM_HALT_ITERS-}; do
-    for _am in ${HALT_ALPHA_MINS:--}; do   # "-": no sweep (HALT_ALPHA_MIN, if set, is in MEM_STUDY_COMMON)
-      _amv=""; _amn=""; [[ "$_am" != - ]] && { _amv=" HALT_ALPHA_MIN=${_am}"; _amn="_amin${_am}"; }
-      MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}${_amn}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc}${_amv} mem_halt")
-    done
-  done
+  for _t in ${MEM_HALT_ITERS-}; do MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}_hlat|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem_halt"); done
   for _t in ${RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} rim"); done
 done
 done
-unset _t _ve _gc _sfx _am _amv _amn
+unset _t _ve _gc _sfx
 
 # Measured cost of one run alone (bf16, GELU, each env's train.sh settings: 1024 envs x 64 steps, 64 minibatches x 4
 # epochs, 100M steps; RTX A4500 - the L40S should be at least as fast):
@@ -91,7 +82,7 @@ declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
 mem_study_hours() {  # mem_study_hours <env> <cap>: estimated hours of one run alone
   # (measured with 4 epochs and 100M steps; ~95% of the time is the update, which scales with NUM_EPOCHS; all of it
   # scales with NUM_TIMESTEPS)
-  local key="$1"; [[ -n "${MEM_STUDY_HOURS[$1${GRID:-}]:-}" ]] && key="$1${GRID}"
+  local key="$1"; [[ -n "${MEM_STUDY_HOURS[$1${GRID:-}]:-}" ]] && key="$1${GRID:-}"
   local h1 h4; read -r h1 h4 <<< "${MEM_STUDY_HOURS[$key]}"
   awk -v a="$h1" -v b="$h4" -v t="$2" -v e="${NUM_EPOCHS:-4}" -v n="${NUM_TIMESTEPS:-100000000}" \
     'BEGIN { printf "%.2f", (a + (b - a) * (t - 1) / 3) * (0.05 + 0.95 * e / 4) * n / 1e8 }'

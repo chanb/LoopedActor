@@ -75,7 +75,7 @@ completed() {  # completed <env> <env vars> <arm> <seed>: the run's train.log re
   # (every train.sh passes --num_eval_steps=100; a resubmitted run appends to the same train.log)
   local dir
   dir="$(env ${COMMON} $2 PRINT_RUN_DIR=1 bash "${SCRIPT_DIR}/../$1/scripts/train.sh" "$3" "$4" "${OUT_ROOT}/$1")" \
-    || { echo "could not get the run directory of $1 $3 seed $4 ($2)" >&2; exit 1; }
+    || { echo "could not get the run directory of $1 $3 seed $4 ($2): ${dir}" >&2; exit 1; }
   grep -q '^Evaluation step 100:' "${dir}/train.log" 2>/dev/null
 }
 
