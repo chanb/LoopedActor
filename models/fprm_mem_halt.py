@@ -20,6 +20,11 @@ convergence, so it gets its own unconstrained slope: h_1 = sigmoid(beta_1 + alph
 (alpha_1 > 0: halt after one pass when confident). All T passes are always executed (as in fprm_mem);
 the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
 
+`halt_lookahead`: the halting decision after pass n+1 acts with the previous pass, i.e.
+h_n = sigmoid(beta_{n+1} - alpha * log KL_{n+1}) for n < T, so c = n means "pi_{n+1} agrees with pi_n, act with pi_n".
+c = 1 is then decided by a real convergence test KL(pi_2 || pi_1) (use min_think_iters = 1) and the uniform-comparison
+slope alpha_1 is unused; 'fp_residual' and 'halt_beta_t' are the shifted (pass c+1) values.
+
 Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollout, 1-indexed) > `halt_key` given
 (rollout: c ~ p(c | s)) > neither (evaluation: c = argmax p(c | s)).
 
@@ -82,6 +87,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_alpha_min: float = 0.0    # floor on alpha, so halting always depends on KL_i (alpha -> 0 is state-blind halting)
     halt_beta_head: bool = False    # beta_i = bias + Dense(rms_norm(thought_i)) (state-dependent); False: a learned scalar
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the beta head's input
+    halt_lookahead: bool = False   # halt on KL(pi_{c+1} || pi_c) and act with pi_c (see the module docstring)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -217,7 +223,13 @@ class FPRMMemHaltActorValue(nn.Module):
         # logits_t [T, B, A]; value_t, beta_t, kl_t, nonfinite_t [T, B]
 
         alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
-        slope = jnp.where(jnp.arange(T)[:, None] == 0, -self.halt_alpha1, alpha)
+        if self.halt_lookahead:
+            # Row n holds pass n+1's KL and beta; the last row is a forced halt (h_T = 1), so its values are unused.
+            kl_t = jnp.concatenate([kl_t[1:], kl_t[-1:]], axis=0)
+            beta_t = jnp.concatenate([beta_t[1:], beta_t[-1:]], axis=0)
+            slope = alpha
+        else:
+            slope = jnp.where(jnp.arange(T)[:, None] == 0, -self.halt_alpha1, alpha)
         halt_logit = beta_t - slope * jnp.log(jnp.maximum(kl_t, 0.0) + _KL_EPS)
         min_iters = 1 if T == 1 else self.min_think_iters
         log_pc, h_t = halt_log_probs(halt_logit, min_iters)  # [T, B]

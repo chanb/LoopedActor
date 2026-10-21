@@ -52,8 +52,9 @@ def build_module(args, m, n):
         return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                  thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_mem_halt':
-        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                     halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, thought_norm=args.thought_norm, **kw)
+        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=1 if args.halt_lookahead else 2, halt_kl=args.halt_kl,
+                                     halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, halt_lookahead=args.halt_lookahead,
+                                     thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_perceiver':
         return FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                        thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth,
@@ -119,6 +120,7 @@ def main():
                     help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
     ap.add_argument('--halt_alpha_min', type=float, default=0.0, help='fprm_mem_halt: the checkpoint\'s --halt_alpha_min')
     ap.add_argument('--halt_beta_head', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_beta_head')
+    ap.add_argument('--halt_lookahead', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_lookahead (and --min_think_iters 1)')
     ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
                     help='fprm_mem_halt: think time c = argmax p(c|s) (the training eval), c ~ p(c|s), or --halt_fixed for every state')
     ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
