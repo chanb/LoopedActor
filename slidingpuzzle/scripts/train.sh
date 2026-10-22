@@ -36,11 +36,10 @@
 #   HALT_ALPHA_MIN=a    mem_halt: floor on the KL slope alpha, in [0, 1) (default 0 = no floor)
 #   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_LOOKAHEAD=0|1  mem_halt: halt on KL(pi_{c+1} || pi_c) and act with pi_c, so c = 1 is a real convergence test
-#                       (default 0; pair with MIN_THINK_ITERS=1)
-#   HALT_BETA_FIXED=0|1  mem_halt: beta = log(HALT_KL) is fixed, not learned (h = 1/2 at KL = HALT_KL; default 0)
-#   HALT_ALPHA_SIGNED=0|1  mem_halt: unconstrained KL slope alpha, may go negative (default 0; needs HALT_ALPHA_MIN=0)
-#   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), i.e. under the acting policy with HALT_LOOKAHEAD=1 (default 0)
+#   HALT_THRESHOLD_FIXED=0|1  mem_halt: h = 1/2 at KL = HALT_KL throughout training; alpha only sets sharpness (default 0;
+#                       pair with HALT_ALPHA_MIN > 0, as alpha -> 0 makes every h = 1/2)
+#   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
+#                       (mem_halt always halts with lookahead: on KL(pi_{c+1} || pi_c), acting with pi_c; run names get _look)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       KL(pi_1 || uniform))
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
@@ -104,7 +103,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_LOOKAHEAD="${HALT_LOOKAHEAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; HALT_ALPHA_SIGNED="${HALT_ALPHA_SIGNED:-0}"; HALT_BETA_FIXED="${HALT_BETA_FIXED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; HALT_THRESHOLD_FIXED="${HALT_THRESHOLD_FIXED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -154,27 +153,18 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  case "$HALT_LOOKAHEAD" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_lookahead); RUN+="_look" ;;
-    *) echo "HALT_LOOKAHEAD must be 0 or 1, got $HALT_LOOKAHEAD"; exit 1 ;;
-  esac
+  RUN+="_look"  # always lookahead; keeps run names apart from the earlier non-lookahead mem_halt runs
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
     *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
   esac
-  case "$HALT_ALPHA_SIGNED" in
+  case "$HALT_THRESHOLD_FIXED" in
     0) ;;
-    1) ARM_FLAGS+=(--halt_alpha_signed); RUN+="_asgn" ;;
-    *) echo "HALT_ALPHA_SIGNED must be 0 or 1, got $HALT_ALPHA_SIGNED"; exit 1 ;;
+    1) ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_kthr" ;;
+    *) echo "HALT_THRESHOLD_FIXED must be 0 or 1, got $HALT_THRESHOLD_FIXED"; exit 1 ;;
   esac
-  case "$HALT_BETA_FIXED" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_beta_fixed); RUN+="_bfix" ;;
-    *) echo "HALT_BETA_FIXED must be 0 or 1, got $HALT_BETA_FIXED"; exit 1 ;;
-  esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_LOOKAHEAD / HALT_KL_REVERSE / HALT_ALPHA_SIGNED / HALT_BETA_FIXED (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / HALT_THRESHOLD_FIXED (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
