@@ -23,11 +23,15 @@ Choice of c in `__call__`: `halt_steps` given (the PPO loss: the c of the rollou
 The value is read out from the last pass (fprm_mem's `value_at_max_iters`): since c is an action, a baseline that
 depended on it would bias the halting gradient.
 
+`geometric_prior_kl` is PonderNet's regularizer KL(p(. | s) || p_G) with a truncated geometric prior
+p_G(n) ∝ lam (1 - lam)^(n-1), n = 1..T, on every think time (also those after the sampled c, which the PPO loss does
+not reach); ppo.py adds it with weight halt_prior_cost.
+
 Diagnostics only (no effect on halting): KL_i = KL(pi_i || pi_{i-1}) between consecutive readouts (pass 1: against
 the uniform policy) and the latent residual between consecutive passes.
 
 Sown intermediates: those of fprm_mem ('logits'/'value' at the chosen c, 'fp_iterations' = c, 'fp_residual' = KL_c)
-plus 'halt_log_prob' (log p(c | s)), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_logit_t'
+plus 'halt_log_prob' (log p(c | s)), 'halt_log_pc' (log p(c = n | s) for n = 1..T, [B, T]), 'halt_entropy' (H(p(. | s))), 'halt_prob' (h_i, [T, B]), 'halt_logit_t'
 (the halting logit, [T, B]), 'halt_log_kl_t' (log KL_i, [T, B]) and 'latent_residual_t' (the max-token residual of the
 cell latents between consecutive passes, as fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the
 initial latent).
@@ -67,6 +71,13 @@ def halt_log_probs(halt_logit, min_iters):
     # sum_{i<n} log(1 - h_i), as a shifted cumsum (subtracting log_not_h would cancel catastrophically against _NEG).
     survive = jnp.concatenate([jnp.zeros_like(log_not_h[:1]), jnp.cumsum(log_not_h[:-1], axis=0)], axis=0)
     return log_h + survive, jnp.exp(log_h)
+
+
+def geometric_prior_kl(log_pc, lam):
+    """KL(p(. | s) || p_G) per example, log_pc [..., T]; p_G(n) ∝ lam (1 - lam)^(n-1) truncated to n = 1..T."""
+    log_q = jnp.arange(log_pc.shape[-1]) * jnp.log1p(-lam)  # log lam cancels in the normalization
+    log_q = log_q - jax.scipy.special.logsumexp(log_q)
+    return jnp.sum(jnp.exp(log_pc) * (log_pc - log_q), axis=-1)  # forced-zero p(c) (log = _NEG) contribute 0
 
 
 class FPRMMemHaltActorValue(nn.Module):
@@ -227,6 +238,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'value', value)
         self.sow('intermediates', 'halt_log_prob', halt_log_prob.reshape(input_shape[:-1]))
         self.sow('intermediates', 'halt_entropy', halt_entropy.reshape(input_shape[:-1]))
+        self.sow('intermediates', 'halt_log_pc', log_pc_b.reshape(input_shape[:-1] + (T,)))
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_logit_t', halt_logit)
         self.sow('intermediates', 'halt_log_kl_t', log_kl_t)

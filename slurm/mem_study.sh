@@ -9,7 +9,7 @@
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
 #               (every pass runs); halting from a head on the newest thought (config / job names get _hlat);
-#               HALT_ENTROPY_COST / HALT_HEAD_GRAD are read by train.sh
+#               HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_PRIOR_COST / HALT_PRIOR_LAMBDA are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -37,6 +37,7 @@ MEM_STUDY_TAG=""   # appended to slurm job names
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
+[[ -n "${HALT_PRIOR_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_PRIOR_COST=${HALT_PRIOR_COST} HALT_PRIOR_LAMBDA=${HALT_PRIOR_LAMBDA:-0.1}"; MEM_STUDY_TAG+="_hpc${HALT_PRIOR_COST}_hpl${HALT_PRIOR_LAMBDA:-0.1}"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then

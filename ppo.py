@@ -41,7 +41,7 @@ from models.fprm_thinker import FPRMThinkerActorValue
 from models.fprm_cot_thinker import FPRMCoTThinkerActorValue
 from models.fprm_perceiver import FPRMPerceiverActorValue
 from models.fprm_mem import FPRMMemActorValue
-from models.fprm_mem_halt import FPRMMemHaltActorValue
+from models.fprm_mem_halt import FPRMMemHaltActorValue, geometric_prior_kl
 from models.fprm_rim import FPRMRiMActorValue
 from models.transformer_baseline import TransformerActorValue
 
@@ -161,6 +161,8 @@ class Args:
     input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the halting head
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_prior_cost: float = 0.0          # fprm_mem_halt: weight of KL(p(c|s) || truncated geometric(halt_prior_lambda)) (PonderNet)
+    halt_prior_lambda: float = 0.1        # fprm_mem_halt: the geometric prior's per-pass halting probability (mean c ~ 1/lambda)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
 
@@ -399,6 +401,7 @@ def main(args: Args):
             value_at_max_iters=args.value_at_max_iters,
         )
     elif args.architecture == 'fprm_mem_halt':
+        assert 0.0 < args.halt_prior_lambda < 1.0, args.halt_prior_lambda
         actor_critic_network = FPRMMemHaltActorValue(
             m=env.m,
             n=env.n,
@@ -641,8 +644,11 @@ def main(args: Args):
             halt_metrics['latent_res_at_c'] = jnp.mean(jnp.take_along_axis(res_t, c_idx[None], axis=0))
             mean_res = jnp.mean(res_t, axis=-1)
             halt_metrics.update({f'latent_res_{i + 1}': mean_res[i] for i in range(mean_res.shape[0])})
+            # PonderNet prior over every think time, including those after the sampled c.
+            halt_prior_kl = jnp.mean(geometric_prior_kl(inter['intermediates']['halt_log_pc'][0], args.halt_prior_lambda))
+            halt_metrics['halt_prior_kl'] = halt_prior_kl
         else:
-            halt_log_prob, halt_entropy = 0.0, 0.0
+            halt_log_prob, halt_entropy, halt_prior_kl = 0.0, 0.0, 0.0
         policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
             distrax.Categorical(logits=logits), values, halt_log_prob
         )
@@ -650,7 +656,7 @@ def main(args: Args):
 
         think_iters = inter['intermediates']['fp_iterations'][0]
 
-        total_loss = policy_loss + v_loss + entropy_loss
+        total_loss = policy_loss + v_loss + entropy_loss + args.halt_prior_cost * halt_prior_kl
 
         return total_loss, {
             **halt_metrics,

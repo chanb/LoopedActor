@@ -33,6 +33,8 @@
 #   HALT_KL=k           looped / cot / perceiver / mem: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
+#   HALT_PRIOR_COST=c  mem_halt: weight of KL(p(c|s) || truncated geometric prior) (PonderNet; default 0 = off)
+#   HALT_PRIOR_LAMBDA=l  mem_halt: the prior's per-pass halting probability, in (0, 1) (default 0.1; mean c ~ 1/l)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2)
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
 #                         cell = one token per board cell, flat = one token per observation value,
@@ -95,7 +97,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_PRIOR_COST="${HALT_PRIOR_COST:-0}"; HALT_PRIOR_LAMBDA="${HALT_PRIOR_LAMBDA:-0.1}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -138,8 +140,11 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
+  awk -v c="$HALT_PRIOR_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_PRIOR_COST must be >= 0, got $HALT_PRIOR_COST"; exit 1; }
+  awk -v l="$HALT_PRIOR_LAMBDA" 'BEGIN { exit !(l + 0 == l && l > 0 && l < 1) }' || { echo "HALT_PRIOR_LAMBDA must be in (0, 1), got $HALT_PRIOR_LAMBDA"; exit 1; }
+  awk -v c="$HALT_PRIOR_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_prior_cost="$HALT_PRIOR_COST" --halt_prior_lambda="$HALT_PRIOR_LAMBDA"); RUN+="_hpc${HALT_PRIOR_COST}_hpl${HALT_PRIOR_LAMBDA}"; }
   RUN+="_hlat"   # latent halting head (distinguishes these runs from the earlier KL-halting mem_halt runs)
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_PRIOR_COST / HALT_PRIOR_LAMBDA (shared study settings)
 for _v in HALT_ALPHA_MIN HALT_BETA_HEAD HALT_THRESHOLD_PARAM HALT_SIGNAL; do   # removed with KL-driven halting in mem_halt
   [[ -z "${!_v:-}" ]] || { echo "$_v was removed (mem_halt halts from its latent only); unset it"; exit 1; }
 done
