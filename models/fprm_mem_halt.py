@@ -20,19 +20,23 @@ iteration cap.
 `halting=False` (the `fprm_mem` architecture, arm iso_mem): no halting head; every example runs all max_think_iters
 passes and acts with the last one (c = T).
 
-`halting=True` (`fprm_mem_halt`): halting is a chain of decisions: at a decision pass n a head picks k in 0..K (K = `halt_max_skip`) more passes from
+`halting=True` (`fprm_mem_halt`): halting is a chain of decisions. At a decision pass n a head picks k in 0..K
+(K = `halt_max_skip`) more passes: k = 0 halts and acts with pi_n; k > 0 runs k passes without deciding and decides again
+at n + k; any n + k >= T stops at the cap (c = T). The first decision is at min_think_iters. K = 1 is a yes/no halt at
+every pass (h_n = p_n(0)); K = 4 can skip up to 4 passes at once.
 
-    p_n(k) = softmax(Dense([rms_norm(readout_{n+1}), log S_{n+1}]))_k,   S_i = KL(pi_i || pi_{i-1}) by default
-
-zero-initialized, so k is uniform at init. k = 0 halts and acts with pi_n: c = n means "pass n+1 agrees with pass n,
-act with pi_n" (lookahead), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). k > 0
-runs k passes without deciding and decides again at n + k; any n + k >= T stops at the cap (c = T). The first decision
-is at min_think_iters. K = 1 is a yes/no halt at every pass (h_n = p_n(0)); K = 4 can skip up to 4 passes at once.
-S_i is stop-gradient'ed, and so is the readout input unless `halt_head_grad`.
-
-`halt_signal` picks S: 'kl' (above), 'latent' (the max-token latent residual r_i of the cells between passes i-1 and i)
-or 'none' (softmax(Dense(rms_norm(readout_n))), a plain learned halting head as in ACT / PonderNet, with no
-lookahead). Lookahead applies only to the convergence signals 'kl' and 'latent'.
+What a decision at pass n reads. Let h_n be the latent at the readout head (the readout token's output at pass n, from
+which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergence test compares and its distance S:
+  'kl':     z_n = pi_n,  S_{n+1} = KL(pi_{n+1} || pi_n)
+  'latent': z_n = h_n,   S_{n+1} = ||h_{n+1} - h_n||   (L2)
+`halt_head` picks the head, each a one-hidden-layer GELU MLP (width `halt_head_width`) with K + 1 outputs and a
+zero-initialized output layer, so k is uniform at init:
+  'none':     p_n = softmax(MLP(rms_norm(h_n)))                      no signal, no lookahead (ACT / PonderNet style)
+  'distance': p_n = softmax(MLP((log S_{n+1} - log threshold) / 5))  threshold = halt_kl ('kl') or halt_res ('latent')
+  'raw':      p_n = softmax(MLP([z_n, z_{n+1}]))                     z = probability vectors or rms_norm(h)
+'distance' and 'raw' look one pass ahead: pass n+1 is computed, and if the head halts, pass n acts (c = n means "pass
+n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
+stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
 
 Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose latent is carried between passes like the
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
@@ -45,16 +49,6 @@ the cap count as one outcome), so the rollout stores the decision passes (`halt_
 K = 1 the path is determined by c and log p(path) = log p(c | s). Evaluation takes the most likely path (a max-product
 recursion over passes; for K = 1 the most likely c), and 'halt_entropy' is the exact entropy of the path (= H(c) for
 K = 1), from the probability r_n of reaching a decision at pass n: H = sum_n r_n H(p_n).
-
-`halt_signal_head` ('kl' / 'latent' only) sets how the signal of pass n+1 enters the halting logit(s): 1 output in
-K + 1 outputs added to the head's logits. Every MLP has one tanh hidden layer of width `halt_signal_width` and a
-zero-initialized output layer.
-  'linear': log S times a row of the head's Dense, as above.
-  'mlp': linear + g(log S), an MLP of the scalar alone with input (log S - log threshold) / 5. At init it is the
-    linear head; it can learn any shape in log S.
-  'raw': g(inputs) in place of the scalar term, from what the signal is computed from: [pi_n, pi_{n+1}] (the two
-    probability vectors, 'kl') or, per cell, [rms_norm(z_n), rms_norm(z_{n+1})] max-pooled over cells after the hidden
-    layer ('latent'). Inputs are stop-gradient'ed unless halt_head_grad.
 
 `halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead, the expectation under pi_{i-1}, i.e. under pi_c, the policy that
 acts; the two directions agree to second order for small policy changes.
@@ -75,7 +69,8 @@ The value is read out from the last pass: since c is an action, a baseline that 
 halting gradient.
 
 Sown intermediates: 'logits'/'value' (at the chosen c), 'fp_iterations' (= c), 'fp_residual' (S_{c+1}, the signal that
-decided the halt; KL_T without halting), 'fp_converged' / 'fp_stop_reason', with halting also 'halt_log_prob'
+decided the halt; KL_T without halting), 'fp_converged' / 'fp_stop_reason', 'halt_signal_t' (S_i by pass, [T, B],
+unshifted), with halting also 'halt_log_prob'
 (log p(path | s)), 'halt_entropy', 'halt_path', 'halt_prob' (p_n(0), [T, B]) and 'halt_step_probs' (p_n(k),
 [T, B, K + 1]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
 against uniform) and 'latent_residual_t' (the max-token residual of the cell latents between consecutive passes, as
@@ -190,7 +185,7 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
 
 _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the gradients NaN-free)
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
-_SIG_SCALE = 5.0  # halt_signal_head='mlp' input: (log S - log threshold) / this, ~[-3, 2] over S in [1e-10, 10]
+_SIG_SCALE = 5.0  # halt_head='distance' input: (log S - log threshold) / this, ~[-3, 2] over S in [1e-10, 10]
 
 
 def step_path_log_prob(lp, mask, c):
@@ -282,16 +277,16 @@ class FPRMMemHaltActorValue(nn.Module):
     max_think_iters: int = 8
     min_think_iters: int = 2
     halting: bool = True           # False: no halting head, always act with pass max_think_iters (iso_mem)
-    halt_kl: float = 1e-3          # halt_signal_head='mlp': KL at the center of the MLP's input range
+    halt_kl: float = 1e-3          # halt_head='distance', 'kl': the KL at the center of the MLP's input range
     halt_max_skip: int = 1         # K: each decision picks k in 0..K more passes (1: halt yes/no at every pass)
-    halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the head's readout input
+    halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the head's h / pi inputs
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     stable_kl: bool = False        # KL_i without the fp32 rounding floor (see the module docstring)
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
-    halt_signal: str = 'kl'        # 'kl' | 'latent' | 'none' (see the module docstring)
-    halt_res: float = 0.1          # halt_signal='latent', halt_signal_head='mlp': residual at the center of the MLP's input range
-    halt_signal_head: str = 'linear'  # 'linear' | 'mlp' | 'raw': how the signal enters halting (see the module docstring)
-    halt_signal_width: int = 32       # hidden width of the 'mlp' / 'raw' signal heads
+    halt_signal: str = 'kl'        # 'kl' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
+    halt_res: float = 0.1          # halt_head='distance', 'latent': the L2 distance at the center of the MLP's input range
+    halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' (see the module docstring)
+    halt_head_width: int = 32      # hidden width of the halting MLP
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
@@ -306,16 +301,13 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         assert not self.halting or (self.halt_kl > 0 and self.halt_res > 0 and self.halt_max_skip >= 1)
-        assert self.halt_signal in ('kl', 'latent', 'none'), self.halt_signal
+        assert self.halt_signal in ('kl', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
-        assert self.halt_signal_head in ('linear', 'mlp', 'raw'), self.halt_signal_head
+        assert self.halt_head in ('none', 'distance', 'raw'), self.halt_head
         if self.halting:
-            self.halt_steps_head = nn.Dense(self.halt_max_skip + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
-        if self.halting and self.halt_signal_head != 'linear':
-            assert self.halt_signal != 'none', 'the signal head needs a signal'
-            self.halt_signal_hidden = nn.Dense(  # 'mlp': spread the tanh centers over the input range
-                self.halt_signal_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_signal_head == 'mlp' else 0.0))
-            self.halt_signal_out = nn.Dense(self.halt_max_skip + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
+            self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
+                self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
+            self.halt_out = nn.Dense(self.halt_max_skip + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -336,14 +328,13 @@ class FPRMMemHaltActorValue(nn.Module):
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
         self.latent_init = make_latent_init(self.config)
 
-    def _signal_mlp(self, x, pool=False):
-        """g(x) [..., outputs] from the signal head's input x [..., in] (pool: x is [B, P, in], max-pooled over P)."""
-        p_in, p_out = self.variables['params']['halt_signal_hidden'], self.variables['params']['halt_signal_out']
-        hid = jnp.tanh(x @ p_in['kernel'] + p_in['bias'])
-        return (jnp.max(hid, axis=1) if pool else hid) @ p_out['kernel'] + p_out['bias']
+    def _halt_mlp(self, x):
+        """The halting head's logits of k [..., K + 1] from its input x [..., in]."""
+        p_in, p_out = self.variables['params']['halt_hidden'], self.variables['params']['halt_out']
+        return jax.nn.gelu(x @ p_in['kernel'] + p_in['bias']) @ p_out['kernel'] + p_out['bias']
 
     @property
-    def halt_threshold(self):  # halt_signal_head='mlp': the signal at the center of the MLP's input range
+    def halt_threshold(self):  # halt_head='distance': the signal at the center of the MLP's input range
         return {'kl': self.halt_kl, 'latent': self.halt_res}[self.halt_signal]
 
     def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None):
@@ -373,13 +364,10 @@ class FPRMMemHaltActorValue(nn.Module):
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
             if self.halting:
-                self.halt_steps_head(jnp.zeros((1, H + 1)))
-            if self.halting and self.halt_signal_head != 'linear':
-                n_in = 1 if self.halt_signal_head == 'mlp' else 2 * (self.output_dim_1 if self.halt_signal == 'kl' else H)
-                self.halt_signal_out(self.halt_signal_hidden(jnp.zeros((1, n_in))))
+                n_in = {'none': H, 'distance': 1, 'raw': 2 * (self.output_dim_1 if self.halt_signal == 'kl' else H)}[self.halt_head]
+                self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
         params = self.variables['params']
         core_p, actor_p, value_p = params['core'], params['actor_head'], params['value_head']
-        steps_p = params['halt_steps_head'] if self.halting else None
 
         sep = self.readout_token == 'sep'
         sep_in = jnp.broadcast_to(self.sep, (B, 1, H))
@@ -404,32 +392,18 @@ class FPRMMemHaltActorValue(nn.Module):
         logits_init = jnp.zeros((B, self.output_dim_1), cells.dtype)
         value_init = jnp.zeros((B,), cells.dtype)
 
-        def halt_head(z, z_cells, out, logits_prev, logits, kl, latent_res, finite):
-            """Logits of k at this pass [B, K + 1] from [rms_norm(readout latent), log S_i] (S: KL or latent residual)."""
-            raw = self.halt_signal_head == 'raw'
-            if raw:  # g of what the signal is computed from: both policies ('kl') or both passes' cell latents ('latent')
-                sg = (lambda v: v) if self.halt_head_grad else jax.lax.stop_gradient
-                if self.halt_signal == 'kl':
-                    g = self._signal_mlp(sg(jnp.concatenate([jax.nn.softmax(logits_prev, -1), jax.nn.softmax(logits, -1)], -1).astype(jnp.float32)))
-                else:
-                    zz = jnp.concatenate([rms_norm(z[:, :P], eps=cfg.rms_norm_eps), rms_norm(z_cells[:, :P], eps=cfg.rms_norm_eps)], -1)
-                    g = self._signal_mlp(sg(zz).astype(jnp.float32), pool=True)
-                g = jnp.where(finite[:, None], g, 0.0)
-            lat = rms_norm(z_cells[:, P] if sep else out, eps=cfg.rms_norm_eps)
-            lat = lat if self.halt_head_grad else jax.lax.stop_gradient(lat)
-            # = [lat, log S] @ kernel, without the H + 1 concat (XLA GPU miscompiled it at batch > 1)
-            sig = jax.lax.stop_gradient(latent_res).astype(jnp.float32) if self.halt_signal == 'latent' else kl
-            log_sig = jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None].astype(lat.dtype)
-            w = steps_p['kernel']
-            logits_k = lat @ w[:-1] + steps_p['bias']
-            if raw:
-                logits_k = logits_k + g.astype(logits_k.dtype)
-            elif self.halt_signal != 'none':
-                logits_k = logits_k + log_sig * w[-1]
-            if self.halt_signal_head == 'mlp':
-                x = (log_sig.astype(jnp.float32) - math.log(self.halt_threshold)) / _SIG_SCALE
-                logits_k = logits_k + self._signal_mlp(x).astype(logits_k.dtype)
-            return jnp.where(finite[:, None], logits_k.astype(jnp.float32), 0.0)
+        def halt_head(h_prev, h, logits_prev, logits, sig, finite):
+            """Logits of k at this pass [B, K + 1] (row i; 'distance' / 'raw' are read by the decision at pass i - 1)."""
+            sg = (lambda v: v) if self.halt_head_grad else jax.lax.stop_gradient
+            if self.halt_head == 'none':
+                x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
+            elif self.halt_head == 'distance':
+                x = (jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None] - math.log(self.halt_threshold)) / _SIG_SCALE
+            elif self.halt_signal == 'kl':
+                x = sg(jnp.concatenate([jax.nn.softmax(logits_prev, -1), jax.nn.softmax(logits, -1)], -1))
+            else:
+                x = sg(jnp.concatenate([rms_norm(h_prev, eps=cfg.rms_norm_eps), rms_norm(h, eps=cfg.rms_norm_eps)], -1))
+            return jnp.where(finite[:, None], self._halt_mlp(x.astype(jnp.float32)), 0.0)
 
         def body(carry, i):
             # One pass (see the module docstring); never frozen. A nonfinite pass keeps the last finite state (and is flagged).
@@ -460,23 +434,29 @@ class FPRMMemHaltActorValue(nn.Module):
                 lp_q, lp_p = jax.nn.log_softmax(z_q, axis=-1), jax.nn.log_softmax(z_p, axis=-1)
                 kl = jnp.sum(jnp.exp(lp_q) * (lp_q - lp_p), axis=-1)
             kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: against uniform (logits_init = 0), unused
-            logits_k = (halt_head(z, z_cells, out, logits_prev, logits, kl, latent_res, finite) if self.halting
+            h_prev, h_new = (z[:, P], z_cells[:, P]) if sep else (token, out)  # latents at the readout head
+            if self.halt_signal == 'latent':  # L2; pass 1: against the initial latent, unused
+                sig = jnp.linalg.norm(jax.lax.stop_gradient(h_new - h_prev).astype(jnp.float32), axis=-1)
+            else:
+                sig = kl
+            logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite) if self.halting
                         else jnp.zeros((B, 1), jnp.float32))
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
-            return carry, (logits, value, logits_k, kl, nonfinite, latent_res)
+            return carry, (logits, value, logits_k, kl, sig, nonfinite, latent_res)
 
         if self.remat:
             body = jax.checkpoint(body, prevent_cse=False)
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
-        _, (logits_t, value_t, head_t, kl_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
-        # logits_t [T, B, A]; head_t [T, B, K + 1]; value_t, kl_t, nonfinite_t [T, B]
+        _, (logits_t, value_t, head_t, kl_t, sig_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
+        # logits_t [T, B, A]; head_t [T, B, K + 1]; value_t, kl_t, sig_t, nonfinite_t [T, B]
 
         self.sow('intermediates', 'policy_kl_t', kl_t)
+        self.sow('intermediates', 'halt_signal_t', sig_t)
         if self.halting:
-            c, sig_c = self._halt(head_t, kl_t, latent_res_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1])
+            c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1])
         else:
-            c, sig_c = jnp.full((B,), T, jnp.int32), kl_t[-1]
+            c, sig_c = jnp.full((B,), T, jnp.int32), sig_t[-1]
         idx = c - 1
         logits = jnp.take_along_axis(logits_t, idx[None, :, None], axis=0)[0]
         nonfinite = jnp.take_along_axis(nonfinite_t.T, idx[:, None], axis=-1)[:, 0]
@@ -496,10 +476,9 @@ class FPRMMemHaltActorValue(nn.Module):
 
         return (stable_softmax.Categorical if self.stable_softmax else distrax.Categorical)(logits=logits), value
 
-    def _halt(self, head_t, kl_t, latent_res_t, halt_key, halt_steps, halt_path, B, T, batch_shape):
+    def _halt(self, head_t, sig_t, halt_key, halt_steps, halt_path, B, T, batch_shape):
         """Halting: the think time c [B] and the signal that decided it; sows the halting intermediates."""
-        sig_t = jax.lax.stop_gradient(latent_res_t).astype(jnp.float32) if self.halt_signal == 'latent' else kl_t
-        if self.halt_signal != 'none':  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
+        if self.halt_head != 'none':  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
             head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
             sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
         lp_t = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(head_t)  # [T, B, K + 1]

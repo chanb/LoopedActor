@@ -20,24 +20,24 @@
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
 #   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3);
-#                       mem_halt with HALT_SIGNAL_HEAD=mlp: the KL at the center of the MLP's input
+#                       mem_halt with HALT_HEAD=distance: the KL at the center of the MLP's input
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
 #   STABLE_SOFTMAX=0|1  iso_mem / mem_halt: collapse-free log-softmax for the action policy (mem_halt also: the
 #                       halting head) (default 0, run names get _ssm)
-#   HALT_MAX_SKIP=K     mem_halt: each halting decision picks k in 0..K more passes from softmax(Dense([readout, log S]))
+#   HALT_MAX_SKIP=K     mem_halt: each halting decision picks k in 0..K more passes from softmax(MLP(...)) (HALT_HEAD)
 #                       (0 = halt; decide again after k passes; scored by the sampled decision path). K = 1 is a yes/no
 #                       halt at every pass (default 1; run names get _hk<K>)
-#   HALT_SIGNAL=kl|latent|none  mem_halt: halting signal S - policy KL, latent residual, or none (the readout only)
-#                       (default kl). kl / latent look ahead: decide on the signal of pass c+1, act with pi_c (_look)
-#   HALT_RES=r          mem_halt, HALT_SIGNAL=latent, HALT_SIGNAL_HEAD=mlp: the residual at the center of the MLP's input
-#                       (default 0.1)
-#   HALT_SIGNAL_HEAD=linear|mlp|raw  mem_halt, HALT_SIGNAL=kl|latent: the signal enters halting linearly in log S, plus
-#                       an MLP of log S (_shmlp), or only through an MLP of both policies / both passes' cell latents
-#                       (_shraw) (default linear)
-#   HALT_SIGNAL_WIDTH=W  mem_halt: hidden width of the mlp / raw signal heads (default 32; run names get W if not 32)
+#   HALT_HEAD=none|distance|raw  mem_halt: the halting head, a GELU MLP on the readout latent h_n (_hhnone), on log S_(n+1)
+#                       (_hhdist) or on [z_n, z_(n+1)] (_hhraw) (default distance). distance / raw look ahead: decide
+#                       on pass c+1, act with pi_c (_look)
+#   HALT_SIGNAL=kl|latent  mem_halt, HALT_HEAD=distance|raw: z = the policies, S = KL; or z = the readout latents h,
+#                       S = ||h_(n+1) - h_n|| (_hlat) (default kl)
+#   HALT_RES=r          mem_halt, HALT_SIGNAL=latent, HALT_HEAD=distance: the L2 distance at the center of the MLP's
+#                       input (default 0.1)
+#   HALT_HEAD_WIDTH=W   mem_halt: hidden width of the halting MLP (default 32; run names get W if not 32)
 #   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
 #                       run names get _rthought / _rsep)
@@ -79,7 +79,7 @@
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
 #   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
 #               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
-#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(Dense([readout, log KL])) pick how many more
+#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(MLP(...)) (HALT_HEAD) pick how many more
 #               passes to run; the PPO ratio uses log p(path|s) + log pi_c(a|s); value from the last pass
 #               (models/fprm_mem_halt.py)
 # Usage:
@@ -94,7 +94,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_RES="${HALT_RES:-0.1}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_SIGNAL_HEAD="${HALT_SIGNAL_HEAD:-linear}"; HALT_SIGNAL_WIDTH="${HALT_SIGNAL_WIDTH:-32}"; READOUT="${READOUT:-thought}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_RES="${HALT_RES:-0.1}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; READOUT="${READOUT:-thought}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -124,7 +124,12 @@ if [[ "$ARM" == mem_halt ]]; then
   esac
   [[ "$HALT_MAX_SKIP" =~ ^[1-9][0-9]*$ ]] || { echo "HALT_MAX_SKIP must be an integer >= 1, got $HALT_MAX_SKIP"; exit 1; }
   ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP"); RUN+="_hk${HALT_MAX_SKIP}"
-  [[ "$HALT_SIGNAL" != none ]] && RUN+="_look"
+  case "$HALT_HEAD" in
+    none|distance|raw) ARM_FLAGS+=(--halt_head="$HALT_HEAD" --halt_head_width="$HALT_HEAD_WIDTH"); RUN+="_hh${HALT_HEAD/distance/dist}"
+                       [[ "$HALT_HEAD_WIDTH" != 32 ]] && RUN+="${HALT_HEAD_WIDTH}"
+                       [[ "$HALT_HEAD" != none ]] && RUN+="_look" ;;
+    *) echo "HALT_HEAD must be none, distance or raw, got $HALT_HEAD"; exit 1 ;;
+  esac
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
@@ -138,14 +143,7 @@ if [[ "$ARM" == mem_halt ]]; then
   case "$HALT_SIGNAL" in
     kl) ;;
     latent) ARM_FLAGS+=(--halt_signal=latent --halt_res="$HALT_RES"); RUN+="_hlat"; [[ "$HALT_RES" != 0.1 ]] && RUN+="${HALT_RES}" ;;
-    none) ARM_FLAGS+=(--halt_signal=none); RUN+="_hnone" ;;
-    *) echo "HALT_SIGNAL must be kl, latent or none, got $HALT_SIGNAL"; exit 1 ;;
-  esac
-  case "$HALT_SIGNAL_HEAD" in
-    linear) ;;
-    mlp|raw) ARM_FLAGS+=(--halt_signal_head="$HALT_SIGNAL_HEAD" --halt_signal_width="$HALT_SIGNAL_WIDTH"); RUN+="_sh${HALT_SIGNAL_HEAD}"
-             [[ "$HALT_SIGNAL_WIDTH" != 32 ]] && RUN+="${HALT_SIGNAL_WIDTH}" ;;
-    *) echo "HALT_SIGNAL_HEAD must be linear, mlp or raw, got $HALT_SIGNAL_HEAD"; exit 1 ;;
+    *) echo "HALT_SIGNAL must be kl or latent (no signal: HALT_HEAD=none), got $HALT_SIGNAL"; exit 1 ;;
   esac
 fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / HALT_MAX_SKIP (shared study settings)
 if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then

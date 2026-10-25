@@ -30,8 +30,9 @@ def _with(params, name, **leaves):
 
 
 def _random_head(params, key=2, scale=1.0):
-    w = params['halt_steps_head']['kernel']
-    return _with(params, 'halt_steps_head', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape))
+    """The halting MLP's zero-initialized output layer made random, so the head is no longer uniform."""
+    w = params['halt_out']['kernel']
+    return _with(params, 'halt_out', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape))
 
 
 def _paths(T, n, K):
@@ -71,7 +72,7 @@ def test_can_halt_after_one_pass(K):
     net = _net(min_think_iters=1, halt_max_skip=K)
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     params = net.init(jax.random.PRNGKey(0), x)['params']
-    eager = _with(params, 'halt_steps_head', bias=jnp.zeros(K + 1).at[0].set(20.0))
+    eager = _with(params, 'halt_out', bias=jnp.zeros(K + 1).at[0].set(20.0))
     assert bool(jnp.all(_intermediates(net, eager, x)['fp_iterations'] == 1))
     assert bool(jnp.all(_intermediates(net, eager, x, halt_key=jax.random.PRNGKey(3))['fp_iterations'] == 1))
 
@@ -110,7 +111,7 @@ def test_best_path_and_entropy_match_enumeration(K, min_iters):
 
 @pytest.mark.parametrize('head_grad', [False, True])
 def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
-    net = _net(halt_head_grad=head_grad)
+    net = _net(halt_head='none', halt_head_grad=head_grad)  # reads h_n, so the trunk is reachable
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'], scale=0.3)
     path = jnp.array([_k1_path(2, 2, 4), _k1_path(3, 2, 4)])
@@ -121,7 +122,7 @@ def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
     g = jax.grad(halt_loss)(params)
     trunk = sum(float(jnp.sum(jnp.abs(v))) for v in jax.tree_util.tree_leaves(g['core']))
     assert (trunk > 0) == head_grad
-    assert float(jnp.sum(jnp.abs(g['halt_steps_head']['kernel']))) > 0
+    assert float(jnp.sum(jnp.abs(g['halt_hidden']['kernel']))) > 0
 
 
 @pytest.mark.parametrize('signal', ['kl', 'latent'])
@@ -131,34 +132,48 @@ def test_lookahead_halts_with_previous_pass(signal):
     net = _net(min_think_iters=1, halt_signal=signal)
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     params = net.init(jax.random.PRNGKey(0), x)['params']
-    eager = _with(params, 'halt_steps_head', bias=jnp.array([20.0, 0.0]))
+    eager = _with(params, 'halt_out', bias=jnp.array([20.0, 0.0]))
     inter = _intermediates(net, eager, x)
     assert bool(jnp.all(inter['fp_iterations'] == 1))
     one_pass = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=1, halt_signal=signal), eager, x)
     assert jnp.allclose(inter['logits'], one_pass['logits'], atol=1e-5)
-    sig = inter['policy_kl_t'] if signal == 'kl' else inter['latent_residual_t']
-    assert jnp.allclose(inter['fp_residual'], sig[1], atol=1e-6)
+    assert jnp.allclose(inter['fp_residual'], inter['halt_signal_t'][1], atol=1e-6)
 
 
 @pytest.mark.parametrize('K', [1, 4])
 @pytest.mark.parametrize('signal', ['kl', 'latent'])
-def test_head_looks_ahead(K, signal):
-    # The decision at pass n reads pass n+1's signal (KL or latent residual) through the head's last kernel row.
+def test_distance_head_reads_the_next_signal(K, signal):
+    # 'distance': the decision at pass n is softmax(MLP((log S_{n+1} - log threshold) / 5)), a GELU MLP of the scalar.
     net = _net(min_think_iters=1, halt_signal=signal, halt_max_skip=K)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
+    inter = _intermediates(net, params, x)
+    if signal == 'kl':
+        assert jnp.allclose(inter['halt_signal_t'], inter['policy_kl_t'])
+    thr = 1e-3 if signal == 'kl' else 0.1
+    u = (jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)[..., None] - math.log(thr)) / 5
+    hid, out = params['halt_hidden'], params['halt_out']
+    g = jax.nn.gelu(u @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
+    assert jnp.allclose(inter['halt_step_probs'][:-1], jax.nn.softmax(g, axis=-1), atol=1e-5)
+
+
+def test_latent_signal_is_l2_of_readout_latents():
+    # S_i = ||h_i - h_{i-1}|| with h the readout token's latent: finite and positive (the passes differ); the signal changes
+    # only S, not the passes (the same KLs).
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    net = _net(halt_signal='latent')
     params = net.init(jax.random.PRNGKey(0), x)['params']
-    w = params['halt_steps_head']['kernel']
-    v = jax.random.normal(jax.random.PRNGKey(2), (K + 1,))
-    inter = _intermediates(net, _with(params, 'halt_steps_head', kernel=jnp.zeros_like(w).at[-1].set(v)), x)
-    sig = inter['policy_kl_t'] if signal == 'kl' else inter['latent_residual_t']
-    want = jax.nn.softmax(jnp.log(jnp.maximum(sig[1:], 0.0) + 1e-10)[..., None] * v, axis=-1)
-    assert jnp.allclose(inter['halt_step_probs'][:-1], want, atol=1e-5)
+    sig = _intermediates(net, params, x)['halt_signal_t']
+    assert bool(jnp.all(jnp.isfinite(sig))) and bool(jnp.all(sig > 0))
+    # kl and latent see the same passes; only S differs
+    kl_net = _net(halt_signal='kl')
+    assert jnp.allclose(_intermediates(kl_net, params, x)['policy_kl_t'], _intermediates(net, params, x)['policy_kl_t'])
 
 
 @pytest.mark.parametrize('K', [1, 4])
 def test_no_lookahead_without_signal(K):
-    # halt_signal='none' (a plain halting head): the decision at pass 1 reads pass 1 only, as in a 1-pass net.
-    kw = dict(min_think_iters=1, halt_signal='none', halt_max_skip=K)
+    # halt_head='none' (a plain halting head on h_n): the decision at pass 1 reads pass 1 only, as in a 1-pass net.
+    kw = dict(min_think_iters=1, halt_head='none', halt_max_skip=K)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = _random_head(_net(**kw).init(jax.random.PRNGKey(0), x)['params'])
     four = _intermediates(_net(**kw), params, x)
@@ -212,8 +227,7 @@ def test_replay_matches_rollout(K):
 
 
 def test_halting_batched_jit():
-    # XLA GPU miscompiled the head's [latent, log KL] concat (H + 1 contraction) at batch > 1:
-    # "Reshape input and output shapes must be the same, got 1 -> 1x128". Run on GPU to cover it.
+    # Batched jit of the halting path sampling (an earlier head's concat was miscompiled by XLA GPU at batch > 1).
     net = FPRMMemHaltActorValue(m=5, n=5, config=FPRMConfig(num_layers=2), max_think_iters=4, min_think_iters=1,
                                 halt_max_skip=4, output_dim_1=4, action_head='readout')
     x = jax.random.normal(jax.random.PRNGKey(1), (8, 50))
@@ -238,45 +252,20 @@ def test_stable_softmax_and_kl():
 
 
 def _signal_head_case(K, signal, head):
-    kw = dict(min_think_iters=1, halt_max_skip=K, halt_signal=signal, halt_signal_head=head, halt_signal_width=8)
+    kw = dict(min_think_iters=1, halt_max_skip=K, halt_signal=signal, halt_head=head, halt_head_width=8)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = _net(**kw).init(jax.random.PRNGKey(0), x)['params']
-    out = params['halt_signal_out']
+    out = params['halt_out']
     out = {'kernel': jax.random.normal(jax.random.PRNGKey(2), out['kernel'].shape),
            'bias': jax.random.normal(jax.random.PRNGKey(3), out['bias'].shape)}
-    return kw, x, params, {**params, 'halt_signal_out': out}
+    return kw, x, params, {**params, 'halt_out': out}
 
 
 @pytest.mark.parametrize('K', [1, 4])
 @pytest.mark.parametrize('signal', ['kl', 'latent'])
-def test_signal_mlp_starts_as_linear(K, signal):
-    # Zero-initialized output layer: at init the MLP adds nothing to the linear-in-log-S head.
-    kw, x, params, _ = _signal_head_case(K, signal, 'mlp')
-    lin = {k: v for k, v in params.items() if not k.startswith('halt_signal_')}
-    lin_kw = {k: v for k, v in kw.items() if k != 'halt_signal_head'}
-    want = _intermediates(_net(**lin_kw), lin, x)['halt_step_probs']
-    assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'], want, atol=1e-6)
-
-
-@pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'latent'])
-def test_signal_mlp_reads_the_lookahead_signal(K, signal):
-    # The decision at pass n adds MLP(log S_{n+1}): tanh hidden layer on (log S - log threshold) / 5. The head's
-    # Dense is zero at init, so the logits are the MLP alone.
-    kw, x, _, params = _signal_head_case(K, signal, 'mlp')
-    inter = _intermediates(_net(**kw), params, x)
-    sig = inter['policy_kl_t'] if signal == 'kl' else inter['latent_residual_t']
-    thr = 1e-3 if signal == 'kl' else 0.1
-    log_s = jnp.log(jnp.maximum(sig[1:], 0.0) + 1e-10)[..., None]
-    hid, out = params['halt_signal_hidden'], params['halt_signal_out']
-    g = jnp.tanh((log_s - math.log(thr)) / 5 @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
-    assert jnp.allclose(inter['halt_step_probs'][:-1], jax.nn.softmax(g, axis=-1), atol=1e-5)
-
-
-@pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'latent'])
-def test_raw_signal_head_starts_uniform(K, signal):
-    kw, x, params, _ = _signal_head_case(K, signal, 'raw')
+@pytest.mark.parametrize('head', ['none', 'distance', 'raw'])
+def test_every_head_starts_uniform(K, signal, head):
+    kw, x, params, _ = _signal_head_case(K, signal, head)
     assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'], 1 / (K + 1), atol=1e-6)
 
 
@@ -287,8 +276,8 @@ def test_raw_kl_head_reads_both_policies(K):
     pi = [jax.nn.softmax(_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=n, **kw), params, x,
                                         halt_steps=jnp.full((3,), n), halt_path=jnp.zeros((3,), int))['logits'], -1)
           for n in (1, 2)]  # replaying c = n just selects pi_n
-    hid, out = params['halt_signal_hidden'], params['halt_signal_out']
-    g = jnp.tanh(jnp.concatenate(pi, -1) @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
+    hid, out = params['halt_hidden'], params['halt_out']
+    g = jax.nn.gelu(jnp.concatenate(pi, -1) @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
     assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'][0], jax.nn.softmax(g, -1), atol=1e-4)
 
 
@@ -302,7 +291,7 @@ def test_raw_latent_head_varies_and_trains():
     h = _intermediates(_net(**kw), params, x)['halt_prob'][:-1]
     assert float(jnp.max(h) - jnp.min(h)) > 1e-3
     g = jax.grad(halt_loss)(params)
-    assert float(jnp.sum(jnp.abs(g['halt_signal_hidden']['kernel']))) > 0
+    assert float(jnp.sum(jnp.abs(g['halt_hidden']['kernel']))) > 0
     assert sum(float(jnp.sum(jnp.abs(v))) for v in jax.tree_util.tree_leaves(g['core'])) == 0  # stop-gradient'ed inputs
 
 
@@ -314,7 +303,7 @@ def test_no_halting_acts_with_the_last_pass():
     assert not any(k.startswith('halt_') for k in params)
     iso = _intermediates(_net(halting=False), params, x)
     assert bool(jnp.all(iso['fp_iterations'] == 4)) and 'halt_log_prob' not in iso
-    head = _net().init(jax.random.PRNGKey(0), x)['params']['halt_steps_head']
-    forced = _intermediates(_net(), {**params, 'halt_steps_head': head}, x, halt_steps=jnp.full((3,), 4),
+    head = {k: v for k, v in _net().init(jax.random.PRNGKey(0), x)['params'].items() if k.startswith('halt_')}
+    forced = _intermediates(_net(), {**params, **head}, x, halt_steps=jnp.full((3,), 4),
                             halt_path=jnp.full((3,), _k1_path(4, 2, 4)))
     assert jnp.allclose(iso['logits'], forced['logits'], atol=1e-6) and jnp.allclose(iso['value'], forced['value'], atol=1e-6)

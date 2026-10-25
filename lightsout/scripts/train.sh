@@ -56,7 +56,7 @@
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
 #   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
 #               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
-#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(Dense([readout, log KL])) pick how many more
+#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(MLP(log KL_(n+1))) pick how many more
 #               passes to run; the PPO ratio uses log p(path|s) + log pi_c(a|s); value from the last pass
 #               (models/fprm_mem_halt.py)
 # Usage:
@@ -103,7 +103,7 @@ if [[ "$ARM" == mem_halt ]]; then
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
   [[ "$HALT_MAX_SKIP" =~ ^[1-9][0-9]*$ ]] || { echo "HALT_MAX_SKIP must be an integer >= 1, got $HALT_MAX_SKIP"; exit 1; }
-  ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP"); RUN+="_hk${HALT_MAX_SKIP}_look"  # always lookahead on the KL
+  ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP" --halt_head=distance); RUN+="_hk${HALT_MAX_SKIP}_hhdist_look"  # MLP of log KL, lookahead
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;

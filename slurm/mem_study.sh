@@ -18,7 +18,7 @@
 #   MIN_RANDOM_MOVES  slidingpuzzle: training scrambles of a uniform length in [k, NUM_RANDOM_MOVES] (train.sh adds
 #               _rmin<k> to the run name; slurm job names get _rmin<k>; other envs ignore it)
 #   RANDOM_MOVES_ZIPF  with MIN_RANDOM_MOVES: length k drawn with p(k) ∝ k^-s (default 0 = uniform; _rzipf<s>)
-#   HALT_KL     mem_halt configs' --halt_kl (only used by HALT_SIGNAL_HEAD=mlp; train.sh adds _hkl<k> when != 1e-3;
+#   HALT_KL     mem_halt configs' --halt_kl (the distance head's input center; train.sh adds _hkl<k> when != 1e-3;
 #               slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"

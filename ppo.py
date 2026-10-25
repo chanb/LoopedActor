@@ -148,12 +148,12 @@ class Args:
     stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
     stable_softmax: bool = False          # fprm_mem / fprm_mem_halt: collapse-free log-softmax for the action policy
                                            # (and, fprm_mem_halt only, the halting head)
-    halt_signal: str = 'kl'               # fprm_mem_halt: halting signal 'kl' | 'latent' (latent residual) | 'none' (learned head only)
+    halt_signal: str = 'kl'               # fprm_mem_halt: what the distance / raw heads compare: 'kl' (the policies) | 'latent' (the readout latents, L2)
     halt_max_skip: int = 1                # fprm_mem_halt: each halting decision picks 0..this more passes (0 = halt; 1 = yes/no at every pass)
     readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
-    halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent', halt_signal_head='mlp': residual at the center of the MLP's input
-    halt_signal_head: str = 'linear'      # fprm_mem_halt, kl / latent: 'linear' in log S | 'mlp' (+ an MLP of log S) | 'raw' (an MLP of both policies / both passes' cell latents)
-    halt_signal_width: int = 32           # fprm_mem_halt: hidden width of the 'mlp' / 'raw' signal heads
+    halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent', halt_head='distance': the L2 distance at the center of the MLP's input
+    halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw')
+    halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
 
@@ -354,8 +354,8 @@ def main(args: Args):
             stable_softmax=args.stable_softmax,
             halt_signal=args.halt_signal,
             halt_res=args.halt_res,
-            halt_signal_head=args.halt_signal_head,
-            halt_signal_width=args.halt_signal_width,
+            halt_head=args.halt_head,
+            halt_head_width=args.halt_head_width,
             readout_token=args.readout_token,
             halt_max_skip=args.halt_max_skip,
             output_dim_1=action_size,
