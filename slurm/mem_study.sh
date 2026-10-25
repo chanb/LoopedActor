@@ -59,11 +59,21 @@ unset _t _ve _gc _sfx
 # T is interpolated linearly through the T=1 and T=4 measurements (each think iteration is one more core call).
 # lightsout is refit to the L40S runs of looped_actor_gamma_ablation (5x4, T = 1..16, GPU-hours per run with 2-3 runs
 # per GPU): ~1.25-1.5x the old "0.25 1.0" at every T, which timed out the T=16 jobs; "0.3 1.35" stays within SAFETY.
-declare -A MEM_STUDY_HOURS=(  # "<hours at T=1> <hours at T=4>"
-  [lightsout]="0.3 1.35" [slidingpuzzle]="0.6 2.2" [rushhour]="1.9 7.9" [sokoban]="3.7 15.6"
-  # slidingpuzzle with GRID=4 / GRID=5 (L40S runs of looped_actor_slidingpuzzle). The cost is far from linear in T
-  # (T=4 ~ T=8), so the line goes through T=4 and T=16 and overestimates T=1 and T=8 rather than underestimate T=2-4.
-  [slidingpuzzle4]="1.25 1.85" [slidingpuzzle5]="2.2 3.1")
+declare -A MEM_STUDY_HOURS=(  # "<t0> <hours at t0> <t1> <hours at t1>"; mem_study_hours interpolates/extrapolates
+  # linearly through these two (cap, hours) points.
+  [lightsout]="1 0.3 4 1.35" [slidingpuzzle]="1 0.6 4 2.2" [rushhour]="1 1.9 4 7.9" [sokoban]="1 3.7 4 15.6"
+  # slidingpuzzle with GRID=4 / GRID=5 (L40S runs of looped_actor_slidingpuzzle): the cost is far from linear in T
+  # (T=4 ~ T=8), so these use far-apart anchor points instead of T=1/T=4.
+  [slidingpuzzle4]="4 1.25 16 1.85"
+  # slidingpuzzle5 refit 2026-10-25 from real wandb_mode=online training/sps on the running fprm_mem_halt
+  # (STABLE_SOFTMAX=1, bf16, gelu) jobs of the iso_mem readout sweep, both already at NUM_EPOCHS=2: T=8 steady sps
+  # ~4990 (seeds 2-3, pack2of3, 3-way GPU sharing) -> 7.34h incl. ~100 evals' overhead; T=16 steady sps ~2282
+  # (seed 1, pack1of3) -> 13.83h. Stored here as their NUM_EPOCHS=4-equivalent (/0.525), since mem_study_hours()
+  # re-applies the epoch scale on every call - storing the already-scaled NUM_EPOCHS=2 values directly would
+  # double-discount them for any NUM_EPOCHS=2 caller (as a first pass at this fix briefly did).
+  # The old "2.2 3.1" (T=4/T=16) pair was from an earlier/cheaper variant of this architecture and underestimated
+  # T=16 by >2x - it put pack1of3 (5xT16 + T8 + T4, 3-concurrent) at a 23:59:00 limit against a real ~27.6h need.
+  [slidingpuzzle5]="8 13.981 16 26.343")
 declare -A MEM_STUDY_GPU_FRACTION=(  # XLA memory fraction per run on a ~45GiB L40S: >= 2x the measured peak, room for T > 4
   [lightsout]=0.08 [slidingpuzzle]=0.08 [rushhour]=0.10 [sokoban]=0.15)
 declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
@@ -72,10 +82,11 @@ declare -A MEM_STUDY_HOST_GB=(  # host RAM per run (measured + headroom)
 mem_study_hours() {  # mem_study_hours <env> <cap>: estimated hours of one run alone
   # (measured with 4 epochs and 100M steps; ~95% of the time is the update, which scales with NUM_EPOCHS; all of it
   # scales with NUM_TIMESTEPS)
-  local key="$1"; [[ -n "${MEM_STUDY_HOURS[$1${GRID:-}]:-}" ]] && key="$1${GRID:-}"
-  local h1 h4; read -r h1 h4 <<< "${MEM_STUDY_HOURS[$key]}"
-  awk -v a="$h1" -v b="$h4" -v t="$2" -v e="${NUM_EPOCHS:-4}" -v n="${NUM_TIMESTEPS:-100000000}" \
-    'BEGIN { printf "%.2f", (a + (b - a) * (t - 1) / 3) * (0.05 + 0.95 * e / 4) * n / 1e8 }'
+  local key="$1"
+  [[ -n "${GRID:-}" && -n "${MEM_STUDY_HOURS[$1${GRID}]:-}" ]] && key="$1${GRID}"
+  local t0 h0 t1 h1; read -r t0 h0 t1 h1 <<< "${MEM_STUDY_HOURS[$key]}"
+  awk -v a="$h0" -v b="$h1" -v t="$2" -v t0="$t0" -v t1="$t1" -v e="${NUM_EPOCHS:-4}" -v n="${NUM_TIMESTEPS:-100000000}" \
+    'BEGIN { printf "%.2f", (a + (b - a) * (t - t0) / (t1 - t0)) * (0.05 + 0.95 * e / 4) * n / 1e8 }'
 }
 
 mem_study_cap() {  # mem_study_cap "<env vars>": the MAX_THINK_ITERS value in a config's env vars
