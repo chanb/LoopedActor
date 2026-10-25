@@ -133,6 +133,8 @@ class Args:
     tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
+    num_experts: int = 1                  # > 1: mixture-of-experts block MLP (fprm_mem / fprm_mem_halt; see FPRMConfig)
+    moe_top_k: int = 0                    # MoE routing: 0 = soft (all experts), k = top-k
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
                                           # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
@@ -143,6 +145,7 @@ class Args:
 
     # FPRM thinker
     fprm_d_model: int = 128
+    fprm_expansion: float = 4.0           # MLP hidden = expansion * d_model (* 2/3 for swiglu), rounded up to mlp_round_to
     fprm_num_heads: int = 4
     fprm_num_layers: int = 1
     max_think_iters: int = 8              # cap on core calls ("think iterations") per decision
@@ -164,6 +167,12 @@ class Args:
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_threshold_fixed: bool = False    # fprm_mem_halt: h = 1/2 at KL = halt_kl throughout (beta = alpha log halt_kl; alpha sets sharpness)
     halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), the expectation under the acting policy
+    stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
+    stable_softmax: bool = False          # fprm_mem_halt: collapse-free log-softmax for the policy and the steps halting head
+    halt_signal: str = 'kl'               # fprm_mem_halt: halting signal 'kl' | 'latent' (latent residual) | 'none' (learned head only)
+    halt_mode: str = 'binary'             # fprm_mem_halt: 'binary' (halt yes/no per pass) | 'steps' (predict 0..4 more passes per decision)
+    readout_token: str = 'thought'        # fprm_mem_halt: readout from the newest thought | 'sep' (a carried SEP token after the cells) | 'sep_mem' (SEP only, its K/V is the memory)
+    halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent': initialization only (h = 1/2 at residual = halt_res)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
 
@@ -240,6 +249,8 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
                 'value': value,
                 'compute_time': compute_time,
             }
+            if 'halt_path' in inter['intermediates']:  # halt_mode='steps': the loss replays the decision passes too
+                extras['halt_path'] = inter['intermediates']['halt_path'][0]
             return actions, extras
 
         return policy
@@ -323,10 +334,13 @@ def main(args: Args):
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
         d_model=args.fprm_d_model,
+        expansion=args.fprm_expansion,
         num_heads=args.fprm_num_heads,
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
+        num_experts=args.num_experts,
+        moe_top_k=args.moe_top_k,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
     )
@@ -415,7 +429,13 @@ def main(args: Args):
             halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_kl_reverse=args.halt_kl_reverse,
+            stable_kl=args.stable_kl,
+            stable_softmax=args.stable_softmax,
             halt_threshold_fixed=args.halt_threshold_fixed,
+            halt_signal=args.halt_signal,
+            halt_res=args.halt_res,
+            readout_token=args.readout_token,
+            halt_mode=args.halt_mode,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -467,18 +487,13 @@ def main(args: Args):
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
 
-    # Initialize evaluator
-    evaluator = Evaluator(
-        eval_env,
-        functools.partial(make_policy, deterministic=True),
-        num_eval_envs=args.num_eval_envs,
-        episode_length=episode_length,
-        test_eval_env=test_eval_env,
-        test_episode_length=test_episode_length,
-        key=key_eval,
-        discount_act=args.discount_act,
-        discount_compute=args.discount_compute,
-    )
+    # Evaluators: greedy (eval/: most likely action and think time) and sampled (eval_sample/: the rollout policy)
+    eval_kw = dict(num_eval_envs=args.num_eval_envs, episode_length=episode_length, test_eval_env=test_eval_env,
+                   test_episode_length=test_episode_length, discount_act=args.discount_act,
+                   discount_compute=args.discount_compute)
+    evaluator = Evaluator(eval_env, functools.partial(make_policy, deterministic=True), key=key_eval, **eval_kw)
+    sample_evaluator = Evaluator(eval_env, make_policy, key=jax.random.fold_in(key_eval, 1), prefix='eval_sample',
+                                 **eval_kw)
 
     def generate_unroll(env, env_state, policy, key, unroll_length, extra_fields):
         """Collect trajectories of given unroll_length."""
@@ -624,6 +639,8 @@ def main(args: Args):
         # inside the network, so their readout is the one they halted at.
         # Stochastic halting: replay the rollout's think time c.
         halt_kw = {'halt_steps': data.extras['policy_extras']['compute_time']} if stochastic_halt else {}
+        if 'halt_path' in data.extras['policy_extras']:
+            halt_kw['halt_path'] = data.extras['policy_extras']['halt_path']
         _, inter = actor_critic_network.apply(
             params, data.observation, normalizer_params,
             mutable=['intermediates'],
@@ -635,11 +652,15 @@ def main(args: Args):
         if stochastic_halt:
             halt_log_prob = inter['intermediates']['halt_log_prob'][0]
             halt_entropy = jnp.mean(inter['intermediates']['halt_entropy'][0])
-            halt_metrics = {
-                'halt_entropy': halt_entropy,
-                'halt_alpha': inter['intermediates']['halt_alpha'][0],
-                'halt_beta': jnp.mean(inter['intermediates']['halt_beta_t'][0]),
-            }
+            halt_metrics = {'halt_entropy': halt_entropy}
+            if 'halt_alpha' in inter['intermediates']:  # halt_mode='binary'
+                halt_metrics['halt_alpha'] = inter['intermediates']['halt_alpha'][0]
+                halt_metrics['halt_beta'] = jnp.mean(inter['intermediates']['halt_beta_t'][0])
+            else:  # halt_mode='steps': mean p(k) over passes and states, and the number of decisions per state
+                p_k = jnp.mean(inter['intermediates']['halt_step_probs'][0], axis=(0, 1))
+                halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
+                path = data.extras['policy_extras']['halt_path']
+                halt_metrics['halt_decisions'] = jnp.mean(jnp.sum((path[..., None] >> jnp.arange(32)) & 1, axis=-1).astype(jnp.float32))
             # Per-pass means, each in its own wandb section: h_i (forced 0 before min_think_iters, 1 at the cap),
             # log10 of the policy KL_i between passes i and i-1 (KL spans decades, so the mean of the log) and the
             # latent residual (below).
@@ -849,10 +870,9 @@ def main(args: Args):
                 **{name if '/' in name else f'training/{name}': value for name, value in metrics.items()},  # 'a/b': own section
             }
 
-            metrics = evaluator.run_evaluation(
-                policy_params={'policy': training_state.params, 'normalizer': obs_normalizer(training_state)},
-                training_metrics=metrics,
-            )
+            eval_params = {'policy': training_state.params, 'normalizer': obs_normalizer(training_state)}
+            metrics = evaluator.run_evaluation(policy_params=eval_params, training_metrics=metrics)
+            metrics = sample_evaluator.run_evaluation(policy_params=eval_params, training_metrics=metrics)
 
             print(f'\nEvaluation step {es}:\n')
             pprint.pprint(metrics)

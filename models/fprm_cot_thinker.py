@@ -53,6 +53,7 @@ import jax.numpy as jnp
 from models.fprm import (
     FPRMConfig,
     FPRMCore,
+    moe_swiglu,
     STOP_ACTIVE,
     STOP_CONVERGED,
     STOP_ITERATION_CAP,
@@ -104,8 +105,10 @@ def _qkv(params, x, cfg: FPRMConfig):
     return q, k, v
 
 
-def _swiglu(params, x):
-    """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU or GELU depending on which parameters exist."""
+def _swiglu(params, x, moe_top_k=0):
+    """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU, GELU or MoE depending on which parameters exist."""
+    if 'router' in params:  # num_experts > 1
+        return moe_swiglu(params, x, moe_top_k)
     if 'up_proj' in params:  # mlp_type='gelu'
         return jax.nn.gelu(x @ params['up_proj']['kernel'].astype(x.dtype)) @ params['down_proj']['kernel'].astype(x.dtype)
     gate, up = jnp.split(x @ params['gate_up_proj']['kernel'].astype(x.dtype), 2, axis=-1)

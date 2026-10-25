@@ -102,7 +102,7 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
                + jnp.einsum('bhqk,bkhd->bqhd', probs[..., N:], mem_v[i]))
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
-        h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
+        h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg.moe_top_k)
         thought_kv.append((k[:, -1], v[:, -1]))
     return h.astype(x.dtype), thought_kv
 

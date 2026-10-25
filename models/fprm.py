@@ -59,6 +59,11 @@ class FPRMConfig:
     # gives 384, 1 gives the intended 341.
     mlp_type: str = 'swiglu'
     mlp_round_to: int = 256
+    # Mixture of experts (swiglu only): num_experts > 1 replaces the MLP with that many experts of the same width, mixed
+    # by a linear router's softmax gates - all experts (moe_top_k = 0, soft routing: smooth in the input, so the looped
+    # map stays continuous) or the top-k renormalized. Every expert is computed (tiny models; no dispatch), no aux loss.
+    num_experts: int = 1
+    moe_top_k: int = 0
     softmax_temp: float = 1.0
     rms_norm_eps: float = 1e-5
     # Mixed precision: dtype of the block computation ('float32' | 'float16' | 'bfloat16'). Parameters stay float32,
@@ -180,6 +185,18 @@ def mlp_hidden_dim(cfg: FPRMConfig) -> int:
     return round_up_to_multiple(round(width), cfg.mlp_round_to)
 
 
+def moe_swiglu(params, x, top_k):
+    """Mixture-of-experts SwiGLU from the arrays router [H, E], gate_up_proj [E, H, 2I], down_proj [E, I, H]."""
+    gates = jax.nn.softmax((x @ params['router'].astype(x.dtype)).astype(jnp.float32), axis=-1)  # [..., E]
+    if top_k:
+        kth = jax.lax.top_k(gates, top_k)[0][..., -1:]
+        gates = jnp.where(gates >= kth, gates, 0.0)
+        gates = gates / jnp.sum(gates, axis=-1, keepdims=True)
+    gate, up = jnp.split(jnp.einsum('...h,ehi->...ei', x, params['gate_up_proj'].astype(x.dtype)), 2, axis=-1)
+    y = jnp.einsum('...ei,eih->...eh', jax.nn.silu(gate) * up, params['down_proj'].astype(x.dtype))
+    return jnp.einsum('...e,...eh->...h', gates.astype(x.dtype), y)
+
+
 class FPRMSwiGLU(nn.Module):
     """The block MLP: SwiGLU matching the public implementation (default), or a GELU MLP (config.mlp_type).
     Parameters: SwiGLU 'gate_up_proj' + 'down_proj'; GELU 'up_proj' + 'down_proj'."""
@@ -192,6 +209,21 @@ class FPRMSwiGLU(nn.Module):
         H = cfg.d_model
         inter = mlp_hidden_dim(cfg)
         cdt = jnp.dtype(cfg.compute_dtype)
+
+        if cfg.num_experts > 1:
+            assert cfg.mlp_type == 'swiglu' and 0 <= cfg.moe_top_k <= cfg.num_experts, (cfg.mlp_type, cfg.moe_top_k)
+            E = cfg.num_experts
+            init_in, init_out = trunc_normal_init(1.0 / math.sqrt(H)), trunc_normal_init(1.0 / math.sqrt(inter))
+            params = {
+                # zeros: uniform gates at init; top-k needs a random router to break the ties between experts
+                'router': self.param('router', nn.initializers.zeros if cfg.moe_top_k == 0
+                                     else nn.initializers.normal(0.02), (H, E)),
+                'gate_up_proj': self.param('gate_up_proj', lambda k, s: jax.vmap(init_in, (0, None))(
+                    jax.random.split(k, E), s[1:]), (E, H, 2 * inter)),
+                'down_proj': self.param('down_proj', lambda k, s: jax.vmap(init_out, (0, None))(
+                    jax.random.split(k, E), s[1:]), (E, inter, H)),
+            }
+            return moe_swiglu(params, x.astype(cdt), cfg.moe_top_k)
 
         if cfg.mlp_type == 'gelu':
             y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), dtype=cdt, name='up_proj')(x)

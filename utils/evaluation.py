@@ -65,10 +65,13 @@ class Evaluator:
         discount_compute: float = 1.0,
         test_eval_env=None,
         test_episode_length: int = None,
+        prefix: str = 'eval',
     ):
         """`eval_env` / `episode_length` run the train split; the test split (eval_reset) uses `test_eval_env` /
-        `test_episode_length` when given (a different episode budget), else the same."""
+        `test_episode_length` when given (a different episode budget), else the same. Metrics are logged as
+        `<prefix>/...`."""
         self._key = key
+        self._prefix = prefix
         self._eval_walltime = 0.0
         if test_eval_env is None:
             test_eval_env, test_episode_length = eval_env, episode_length
@@ -120,30 +123,31 @@ class Evaluator:
         epoch_eval_time = time.time() - t
 
         metrics = {}
+        p = self._prefix
 
         for split_name, state, returns, think in [("train", train_state, train_returns, train_think),
                                                   ("test", test_state, test_returns, test_think)]:
             eval_metrics = state.info['eval_metrics']
 
             for name, value in eval_metrics.episode_metrics.items():
-                metrics[f'eval/{split_name}_episode_{name}'] = np.mean(value)
+                metrics[f'{p}/{split_name}_episode_{name}'] = np.mean(value)
 
                 if name == "success":
-                    metrics[f'eval/{split_name}_episode_{name}_rate'] = np.mean(value > 0)
+                    metrics[f'{p}/{split_name}_episode_{name}_rate'] = np.mean(value > 0)
 
-            metrics[f'eval/{split_name}_avg_episode_length'] = np.mean(eval_metrics.episode_steps)
+            metrics[f'{p}/{split_name}_avg_episode_length'] = np.mean(eval_metrics.episode_steps)
 
             for name, value in returns.items():
-                metrics[f'eval/{split_name}_episode_{name}'] = np.mean(value)
+                metrics[f'{p}/{split_name}_episode_{name}'] = np.mean(value)
 
-            # Think iterations of the deterministic policy: mean per decision (over all decisions of the first
+            # Think iterations of the evaluated policy: mean per decision (over all decisions of the first
             # episodes, as training/think_iters), and mean total per episode.
-            metrics[f'eval/{split_name}_think_iters'] = float(np.sum(think['think_iters']) / max(np.sum(think['decisions']), 1.0))
-            metrics[f'eval/{split_name}_episode_think_iters'] = np.mean(think['think_iters'])
+            metrics[f'{p}/{split_name}_think_iters'] = float(np.sum(think['think_iters']) / max(np.sum(think['decisions']), 1.0))
+            metrics[f'{p}/{split_name}_episode_think_iters'] = np.mean(think['think_iters'])
 
-        metrics['eval/epoch_eval_time'] = epoch_eval_time
-        metrics['eval/sps'] = self._steps_per_eval / epoch_eval_time
+        metrics[f'{p}/epoch_eval_time'] = epoch_eval_time
+        metrics[f'{p}/sps'] = self._steps_per_eval / epoch_eval_time
         self._eval_walltime += epoch_eval_time
-        metrics['eval/walltime'] = self._eval_walltime
+        metrics[f'{p}/walltime'] = self._eval_walltime
 
         return {**training_metrics, **metrics}

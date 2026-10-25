@@ -14,7 +14,7 @@
 #                       s = 1 puts ~half of [1, 200] on k <= 10)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
-#   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
+#   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 0.999; 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
 #   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / cot / iso_cot / perceiver / iso_perceiver (default 16)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
@@ -39,7 +39,21 @@
 #   HALT_THRESHOLD_FIXED=0|1  mem_halt: h = 1/2 at KL = HALT_KL throughout training; alpha only sets sharpness (default 0;
 #                       pair with HALT_ALPHA_MIN > 0, as alpha -> 0 makes every h = 1/2)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
-#                       (mem_halt always halts with lookahead: on KL(pi_{c+1} || pi_c), acting with pi_c; run names get _look)
+#   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
+#   STABLE_SOFTMAX=0|1  mem_halt: collapse-free log-softmax for the policy / steps head (default 0, run names get _ssm)
+#                       (mem_halt with HALT_SIGNAL=kl|latent halts with lookahead: on the signal of pass c+1, acting with
+#                       pi_c; run names get _look, or _hsteps_look in steps mode. HALT_SIGNAL=none does not look ahead)
+#   HALT_SIGNAL=kl|latent|none  mem_halt: halting signal - policy KL, latent residual (h = 1/2 at HALT_RES at init), or
+#                       none (h = sigmoid(beta) only; pair with HALT_BETA_HEAD=1) (default kl)
+#   HALT_RES=r          mem_halt, HALT_SIGNAL=latent: initialization only (default 0.1)
+#   HALT_MODE=binary|steps  mem_halt: halt yes/no at every pass, or at each decision predict 0..4 more passes (0 = halt;
+#                       decide again after k passes; scored by the sampled decision path) (default binary)
+#   READOUT=thought|sep|sep_mem  mem_halt: read actions / value / halting from the newest thought, or from a carried SEP token
+#                (sep_mem: no thought tokens; queries are [cells, SEP] and SEP's K/V is the memory)
+#                       after the cells (thoughts then only feed the memory) (default thought)
+#   NUM_EXPERTS=E       mem / mem_halt: E > 1 = mixture-of-experts block MLP (default 1). The experts split the default
+#                       MLP width (512 at d=128): E experts of 512/E each, unless EXPANSION / MLP_ROUND_TO are given
+#   MOE_TOP_K=k         NUM_EXPERTS > 1: 0 = soft routing over all experts, k = top-k (default 0)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       KL(pi_1 || uniform))
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
@@ -47,6 +61,9 @@
 #                         conv = 3x3 conv, one token per output channel
 #   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
+#   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4; with
+#                       NUM_EXPERTS, the width of each expert: EXPANSION=1.5 MLP_ROUND_TO=128 gives 128)
+#                       (NUM_EXPERTS sets both when neither is given)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
 #                       64 -> 384, 1 -> 341)
 #   COMPUTE_DTYPE=float32|float16|bfloat16  block computation dtype (default float32). bfloat16: ~1.6-1.75x faster, fp32 range;
@@ -98,12 +115,13 @@ set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/slidingpuzzle}"; DEVICE="${4:-0}";
 GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$EPISODE_LENGTH}"
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; MIN_RANDOM_MOVES="${MIN_RANDOM_MOVES:-0}"; RANDOM_MOVES_ZIPF="${RANDOM_MOVES_ZIPF:-0}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
-DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
+DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.999}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"; INPUT_GRID_CONV="${INPUT_GRID_CONV:-0}"; INPUT_GRID_CONV_DEPTH="${INPUT_GRID_CONV_DEPTH:-1}"; STEP_GRID_CONV="${STEP_GRID_CONV:-0}"; NUM_INITIAL_LATENTS="${NUM_INITIAL_LATENTS:-1}"; CELL_ENCODER_ITERS="${CELL_ENCODER_ITERS:-0}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
+MLP_WIDTH_SET="${EXPANSION+1}${MLP_ROUND_TO+1}"
+MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 RIM_HALT_THRESH="${RIM_HALT_THRESH:-0.1}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; HALT_THRESHOLD_FIXED="${HALT_THRESHOLD_FIXED:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_THRESHOLD_FIXED="${HALT_THRESHOLD_FIXED:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_RES="${HALT_RES:-0.1}"; READOUT="${READOUT:-thought}"; HALT_MODE="${HALT_MODE:-binary}"; NUM_EXPERTS="${NUM_EXPERTS:-1}"; MOE_TOP_K="${MOE_TOP_K:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -153,18 +171,48 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  RUN+="_look"  # always lookahead; keeps run names apart from the earlier non-lookahead mem_halt runs
+  [[ "$HALT_MODE" == binary && "$HALT_SIGNAL" != none ]] && RUN+="_look"  # steps mode: _hsteps_look below
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
     *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
+  esac
+  case "$STABLE_KL" in
+    0) ;;
+    1) ARM_FLAGS+=(--stable_kl); RUN+="_skl" ;;
+    *) echo "STABLE_KL must be 0 or 1, got $STABLE_KL"; exit 1 ;;
+  esac
+  case "$STABLE_SOFTMAX" in
+    0) ;;
+    1) ARM_FLAGS+=(--stable_softmax); RUN+="_ssm" ;;
+    *) echo "STABLE_SOFTMAX must be 0 or 1, got $STABLE_SOFTMAX"; exit 1 ;;
   esac
   case "$HALT_THRESHOLD_FIXED" in
     0) ;;
     1) ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_kthr" ;;
     *) echo "HALT_THRESHOLD_FIXED must be 0 or 1, got $HALT_THRESHOLD_FIXED"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / HALT_THRESHOLD_FIXED (shared study settings)
+  case "$HALT_SIGNAL" in
+    kl) ;;
+    latent) ARM_FLAGS+=(--halt_signal=latent --halt_res="$HALT_RES"); RUN+="_hlat"; [[ "$HALT_RES" != 0.1 ]] && RUN+="${HALT_RES}" ;;
+    none) ARM_FLAGS+=(--halt_signal=none); RUN+="_hnone" ;;
+    *) echo "HALT_SIGNAL must be kl, latent or none, got $HALT_SIGNAL"; exit 1 ;;
+  esac
+  # Lookahead only with a convergence signal (kl / latent). Steps mode gained it and HALT_SIGNAL=none lost it on
+  # 2026-10-24 with the same flags, so those runs get their own wandb group (GROUP_SALT) and run names.
+  case "$HALT_MODE" in
+    binary) [[ "$HALT_SIGNAL" == none ]] && GROUP_SALT=" lookahead-v2" ;;
+    steps) ARM_FLAGS+=(--halt_mode=steps); RUN+="_hsteps"
+           [[ "$HALT_SIGNAL" != none ]] && RUN+="_look"; GROUP_SALT=" lookahead-v2" ;;
+    *) echo "HALT_MODE must be binary or steps, got $HALT_MODE"; exit 1 ;;
+  esac
+  case "$READOUT" in
+    thought) ;;
+    sep) ARM_FLAGS+=(--readout_token=sep); RUN+="_sep" ;;
+    sep_mem) ARM_FLAGS+=(--readout_token=sep_mem); RUN+="_sepmem" ;;
+    *) echo "READOUT must be thought, sep or sep_mem, got $READOUT"; exit 1 ;;
+  esac
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / STABLE_SOFTMAX / HALT_THRESHOLD_FIXED (shared study settings)
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_)?(cot|perceiver|mem)$ || "$ARM" == mem_halt ]] \
@@ -227,7 +275,19 @@ case "$MLP_TYPE" in
   gelu) ARM_FLAGS+=(--mlp_type=gelu); RUN+="_gelu" ;;
   *) echo "MLP_TYPE must be swiglu or gelu, got $MLP_TYPE"; exit 1 ;;
 esac
+[[ "$NUM_EXPERTS" =~ ^[1-9][0-9]*$ && "$MOE_TOP_K" =~ ^[0-9]+$ ]] || { echo "NUM_EXPERTS / MOE_TOP_K must be integers"; exit 1; }
+if [[ "$NUM_EXPERTS" != 1 ]]; then
+  [[ "$ARM" =~ ^(iso_)?mem(_halt)?$ ]] || { echo "NUM_EXPERTS > 1 needs arm mem, iso_mem or mem_halt"; exit 1; }
+  ARM_FLAGS+=(--num_experts="$NUM_EXPERTS" --moe_top_k="$MOE_TOP_K"); RUN+="_moe${NUM_EXPERTS}k${MOE_TOP_K}"
+  if [[ -z "$MLP_WIDTH_SET" ]]; then  # experts of 512 / E: hidden = EXPANSION * 128 (* 2/3 swiglu) = MLP_ROUND_TO
+    (( 512 % NUM_EXPERTS == 0 )) || { echo "NUM_EXPERTS must divide 512, got $NUM_EXPERTS"; exit 1; }
+    MLP_ROUND_TO=$(( 512 / NUM_EXPERTS ))
+    EXPANSION=$(awk -v w="$MLP_ROUND_TO" -v t="$MLP_TYPE" 'BEGIN { print w / 128 * (t == "swiglu" ? 1.5 : 1) }')
+  fi
+fi
 [[ "$MLP_ROUND_TO" =~ ^[1-9][0-9]*$ ]] || { echo "MLP_ROUND_TO must be a positive integer, got $MLP_ROUND_TO"; exit 1; }
+awk -v x="$EXPANSION" 'BEGIN { exit !(x + 0 == x && x > 0) }' || { echo "EXPANSION must be > 0, got $EXPANSION"; exit 1; }
+[[ "$EXPANSION" != 4 ]] && { ARM_FLAGS+=(--fprm_expansion="$EXPANSION"); RUN+="_x${EXPANSION}"; }
 [[ "$MLP_ROUND_TO" != 256 ]] && { ARM_FLAGS+=(--mlp_round_to="$MLP_ROUND_TO"); RUN+="_mr${MLP_ROUND_TO}"; }
 case "$COMPUTE_DTYPE" in
   float32) ;;
@@ -262,7 +322,7 @@ case "$VALUE_AT_MAX_ITERS" in
 esac
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
-[[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"
+[[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"  # suffix kept vs 1.0 so new runs never reuse the old 1.0 run dirs
 RUN+="_s${SEED}"
 [[ "${PRINT_RUN_DIR:-0}" == 1 ]] && { echo "$OUT/${RUN}"; exit 0; }   # just print the run directory (slurm/submit_mem.sh)
 # Every hyperparameter flag except the seed; hashed into the wandb group.
@@ -272,7 +332,7 @@ HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_l
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"
   --num_timesteps="$NUM_TIMESTEPS" --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
   "${ARM_FLAGS[@]}")
-GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}")"
+GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}${GROUP_SALT:-}")"
 export WANDB_MODE=${WANDB_MODE:-disabled}
 cd "$(dirname "$0")/../.."
 mkdir -p "$OUT/${RUN}"
