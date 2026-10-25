@@ -4,8 +4,6 @@
 #   ISO_ITERS   iso_mem caps (default "1 2 3 4")
 #   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2; an empty list
 #               (MEM_ITERS=) runs no mem configs, likewise ISO_ITERS=)
-#   ISO_RIM_ITERS, RIM_ITERS  iso_rim / rim caps (default empty = none; e.g. ISO_RIM_ITERS="1 2" ISO_ITERS= MEM_ITERS= runs
-#               only iso_rim). The time estimates below were measured for fprm_mem; rim's cost was not measured
 #   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
 #               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
 #               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / HALT_THRESHOLD_FIXED are read by train.sh
@@ -31,7 +29,7 @@
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
-MEM_STUDY_TAG=""   # appended to slurm job names
+MEM_STUDY_TAG="${MEM_STUDY_TAG:-}"   # appended to slurm job names (preserves a caller-set prefix/salt, if any)
 [[ -n "${HALT_ALPHA_MINS:-}" && -n "${HALT_ALPHA_MIN:-}" ]] && { echo "set HALT_ALPHA_MINS or HALT_ALPHA_MIN, not both" >&2; return 1; }
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
@@ -56,14 +54,12 @@ for _ve in ${VALUE_EXPECTILES:-0.5}; do
   _sfx=""; [[ "$_ve" != 0.5 ]] && _sfx+="_ve${_ve}"; [[ "$_gc" != 0.999 ]] && _sfx+="_gc${_gc}"
   for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_mem"); done
   for _t in ${MEM_ITERS-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem"); done
-  for _t in ${ISO_RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("iso_rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_rim"); done
   for _t in ${MEM_HALT_ITERS-}; do
     for _am in ${HALT_ALPHA_MINS:--}; do   # "-": no sweep (HALT_ALPHA_MIN, if set, is in MEM_STUDY_COMMON)
       _amv=""; _amn=""; [[ "$_am" != - ]] && { _amv=" HALT_ALPHA_MIN=${_am}"; _amn="_amin${_am}"; }
       MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}${_amn}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc}${_amv} mem_halt")
     done
   done
-  for _t in ${RIM_ITERS-}; do MEM_STUDY_CONFIGS+=("rim_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} rim"); done
 done
 done
 unset _t _ve _gc _sfx _am _amv _amn

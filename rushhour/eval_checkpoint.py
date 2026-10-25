@@ -8,7 +8,6 @@ Examples (repo root)
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/iso_flops_s1/checkpoints/<run>/params_101.pkl --arch multi_block --num_blocks 16
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl --max_iters 8   # test-time cap
-  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/cot_s1/checkpoints/<run>/params_101.pkl --arch fprm_cot
 """
 import argparse
 import json
@@ -25,28 +24,18 @@ from envs.rushhour_env import RushHourEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
-from models.fprm_perceiver import FPRMPerceiverActorValue  # noqa: E402
 from models.fprm_mem import FPRMMemActorValue  # noqa: E402
-from models.fprm_rim import FPRMRiMActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
+    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_mem', 'multi_block', 'single_block'])
+    ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3,
                     help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
-    ap.add_argument('--rim_halt', default='latent', choices=['latent', 'kl'], help='fprm_rim: halting rule (latent = SEP convergence)')
-    ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent: the checkpoint\'s threshold')
-    ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
-    ap.add_argument('--input_grid_conv', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --input_grid_conv')
-    ap.add_argument('--input_grid_conv_depth', type=int, default=1, help='fprm_cot / fprm_perceiver: the checkpoint\'s --input_grid_conv_depth')
-    ap.add_argument('--perceiver_step_grid_conv', action='store_true', help='fprm_perceiver: the checkpoint was trained with --perceiver_step_grid_conv')
-    ap.add_argument('--perceiver_num_initial_latents', type=int, default=1, help='fprm_perceiver: the checkpoint\'s --perceiver_num_initial_latents')
-    ap.add_argument('--perceiver_cell_encoder_iters', type=int, default=0, help='fprm_perceiver: the checkpoint\'s --perceiver_cell_encoder_iters')
+    ap.add_argument('--thought_norm', action='store_true', help='fprm_mem: the checkpoint was trained with --cot_thought_norm')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -66,21 +55,9 @@ def main():
     if args.arch == 'fprm':
         mod = FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                     halt_kl=args.halt_kl, **kw)
-    elif args.arch == 'fprm_cot':
-        mod = FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                       thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth, **kw)
-    elif args.arch == 'fprm_rim':
-        mod = FPRMRiMActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion=args.rim_halt,
-                                halt_residual_thresh=args.halt_residual_thresh, halt_kl=args.halt_kl, **{k: v for k, v in kw.items() if k not in ('tokenizer', 'tokenizer_conv_features')})
     elif args.arch == 'fprm_mem':
         mod = FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                 thought_norm=args.thought_norm, **kw)
-    elif args.arch == 'fprm_perceiver':
-        mod = FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                      thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth,
-                                       step_grid_conv=args.perceiver_step_grid_conv,
-                                       num_initial_latents=args.perceiver_num_initial_latents,
-                                       cell_encoder_iters=args.perceiver_cell_encoder_iters, **kw)
     else:
         mod = TransformerActorValue(num_blocks=args.num_blocks if args.arch == 'multi_block' else 1,
                                     **kw)
@@ -128,8 +105,8 @@ def main():
         print(f'{args.ckpt} {split:10s} n={n_lv:5d} success {succ.mean():.3f} think {results[split]["think"]:.2f} '
               f'conv {results[split]["converged"]:.3f} len {length.mean():.1f}', flush=True)
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{os.path.splitext(os.path.basename(args.ckpt))[0]}'
-                                   + (f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') and args.max_iters != 16 else '') + '.json')
-    json.dump(dict(ckpt=args.ckpt, arch=args.arch, max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_rim') else None, results=results),
+                                   + (f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_mem') and args.max_iters != 16 else '') + '.json')
+    json.dump(dict(ckpt=args.ckpt, arch=args.arch, max_iters=args.max_iters if args.arch in ('fprm', 'fprm_mem') else None, results=results),
               open(out, 'w'), indent=1)
     print('wrote', out)
 

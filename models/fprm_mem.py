@@ -44,6 +44,7 @@ import jax.numpy as jnp
 from models.fprm import (
     FPRMConfig,
     FPRMCore,
+    moe_swiglu,
     STOP_ACTIVE,
     STOP_CONVERGED,
     STOP_ITERATION_CAP,
@@ -51,9 +52,59 @@ from models.fprm import (
     make_latent_init,
     rms_norm,
 )
-from models.fprm_cot_thinker import _attn_softmax, _mixed_precision_input, _qkv, _residual_scales, _swiglu
+from models import stable_softmax
 from models.fprm_thinker import tokenize
 from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
+
+
+# ---------------------------------------------------------------------------
+# Functional FPRMCore block primitives (same math as models/fprm.py, on FPRMCore's parameters)
+# ---------------------------------------------------------------------------
+
+def _residual_scales(params, cfg: FPRMConfig):
+    """(a1, b1, a2, b2) of FPRMCore's coupled residual scaling."""
+    if not cfg.residual_scaling:
+        return 1.0, 1.0, 1.0, 1.0
+    a1 = jax.nn.sigmoid(params['alpha_1_logit'])
+    a2 = jax.nn.sigmoid(params['alpha_2_logit'])
+    two_l = 2 * cfg.num_layers
+    b2 = 1.0 - a2 * a1**two_l
+    b1 = b2 * (1.0 - a1) / (1.0 - a1**two_l + 1e-5)
+    return a1, b1, a2, b2
+
+
+def _mixed_precision_input(h, a1, b1, cfg: FPRMConfig):
+    """Cast the core's mixed input and residual scales to cfg.compute_dtype (as FPRMCore does); the caller casts the
+    core's output back to the carried latent's dtype."""
+    h = h.astype(cfg.compute_dtype)
+    if not isinstance(a1, float):
+        a1, b1 = a1.astype(h.dtype), b1.astype(h.dtype)
+    return h, a1, b1
+
+
+def _attn_softmax(logits):
+    """Attention softmax computed in float32, returned in the logits' dtype."""
+    return jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
+
+
+def _qkv(params, x, cfg: FPRMConfig):
+    """[..., H] -> q, k, v of shape [..., num_heads, head_dim], in cfg.compute_dtype."""
+    H = x.shape[-1]
+    x = x.astype(cfg.compute_dtype)
+    qkv = x @ params['qkv_proj']['kernel'].astype(x.dtype)
+    qkv = qkv.reshape(x.shape[:-1] + (3 * cfg.num_heads, H // cfg.num_heads))
+    q, k, v = jnp.split(qkv, 3, axis=-2)
+    return q, k, v
+
+
+def _swiglu(params, x, moe_top_k=0):
+    """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU, GELU or MoE depending on which parameters exist."""
+    if 'router' in params:  # num_experts > 1
+        return moe_swiglu(params, x, moe_top_k)
+    if 'up_proj' in params:  # mlp_type='gelu'
+        return jax.nn.gelu(x @ params['up_proj']['kernel'].astype(x.dtype)) @ params['down_proj']['kernel'].astype(x.dtype)
+    gate, up = jnp.split(x @ params['gate_up_proj']['kernel'].astype(x.dtype), 2, axis=-1)
+    return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel'].astype(x.dtype)
 
 
 @flax.struct.dataclass
@@ -127,6 +178,7 @@ class FPRMMemActorValue(nn.Module):
     value_at_max_iters: bool = False  # value from the last (max_think_iters-th) pass's latent instead of the halt pass's
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
+    stable_softmax: bool = False   # collapse-free log-softmax for the action policy (models/stable_softmax.py)
 
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
@@ -293,4 +345,4 @@ class FPRMMemActorValue(nn.Module):
         self.sow('intermediates', 'fp_converged', state.stop_reason == STOP_CONVERGED)
         self.sow('intermediates', 'fp_stop_reason', state.stop_reason)
 
-        return distrax.Categorical(logits=logits), value
+        return (stable_softmax.Categorical if self.stable_softmax else distrax.Categorical)(logits=logits), value

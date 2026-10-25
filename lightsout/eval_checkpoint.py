@@ -27,11 +27,8 @@ from envs.lightsout_env import LightsOutEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_cot_thinker import FPRMCoTThinkerActorValue  # noqa: E402
-from models.fprm_perceiver import FPRMPerceiverActorValue  # noqa: E402
 from models.fprm_mem import FPRMMemActorValue  # noqa: E402
 from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
-from models.fprm_rim import FPRMRiMActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
@@ -42,12 +39,6 @@ def build_module(args, m, n):
     if args.arch == 'fprm':
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                      halt_kl=args.halt_kl, **kw)
-    if args.arch == 'fprm_cot':
-        return FPRMCoTThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                        thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth, **kw)
-    if args.arch == 'fprm_rim':
-        return FPRMRiMActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion=args.rim_halt,
-                                 halt_residual_thresh=args.halt_residual_thresh, halt_kl=args.halt_kl, **{k: v for k, v in kw.items() if k not in ('tokenizer', 'tokenizer_conv_features')})
     if args.arch == 'fprm_mem':
         return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
                                  thought_norm=args.thought_norm, **kw)
@@ -55,12 +46,6 @@ def build_module(args, m, n):
         return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=args.min_think_iters, halt_kl=args.halt_kl,
                                      halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, halt_kl_reverse=args.halt_kl_reverse, halt_threshold_fixed=args.halt_threshold_fixed,
                                      thought_norm=args.thought_norm, **kw)
-    if args.arch == 'fprm_perceiver':
-        return FPRMPerceiverActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
-                                       thought_norm=args.thought_norm, input_grid_conv=args.input_grid_conv, input_grid_conv_depth=args.input_grid_conv_depth,
-                                       step_grid_conv=args.perceiver_step_grid_conv,
-                                       num_initial_latents=args.perceiver_num_initial_latents,
-                                       cell_encoder_iters=args.perceiver_cell_encoder_iters, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
@@ -114,8 +99,8 @@ def aggregate(per_dist, dists):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm / fprm_cot / fprm_perceiver: think-iteration cap at evaluation (training cap 16)')
+    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_mem', 'fprm_mem_halt', 'multi_block', 'single_block'])
+    ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3,
                     help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
     ap.add_argument('--halt_alpha_min', type=float, default=0.0, help='fprm_mem_halt: the checkpoint\'s --halt_alpha_min')
@@ -126,14 +111,7 @@ def main():
     ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
                     help='fprm_mem_halt: think time c = argmax p(c|s) (the training eval), c ~ p(c|s), or --halt_fixed for every state')
     ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
-    ap.add_argument('--rim_halt', default='latent', choices=['latent', 'kl'], help='fprm_rim: halting rule (latent = SEP convergence)')
-    ap.add_argument('--halt_residual_thresh', type=float, default=0.1, help='fprm_rim, --rim_halt latent: the checkpoint\'s threshold')
-    ap.add_argument('--thought_norm', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --cot_thought_norm')
-    ap.add_argument('--input_grid_conv', action='store_true', help='fprm_cot / fprm_perceiver: the checkpoint was trained with --input_grid_conv')
-    ap.add_argument('--input_grid_conv_depth', type=int, default=1, help='fprm_cot / fprm_perceiver: the checkpoint\'s --input_grid_conv_depth')
-    ap.add_argument('--perceiver_step_grid_conv', action='store_true', help='fprm_perceiver: the checkpoint was trained with --perceiver_step_grid_conv')
-    ap.add_argument('--perceiver_num_initial_latents', type=int, default=1, help='fprm_perceiver: the checkpoint\'s --perceiver_num_initial_latents')
-    ap.add_argument('--perceiver_cell_encoder_iters', type=int, default=0, help='fprm_perceiver: the checkpoint\'s --perceiver_cell_encoder_iters')
+    ap.add_argument('--thought_norm', action='store_true', help='fprm_mem / fprm_mem_halt: the checkpoint was trained with --cot_thought_norm')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -181,12 +159,12 @@ def main():
             print(f'{name:11s} success {s["success"]:.3f} think {s["think"]:.2f} conv {s["converged"]:.3f} len {s["mean_len"]:.1f}')
 
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
-    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim') and args.max_iters != 16 else ''
+    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_mem', 'fprm_mem_halt') and args.max_iters != 16 else ''
     if args.arch == 'fprm_mem_halt' and args.halt_mode != 'mode':
         tag += f'_{args.halt_mode}' + (str(args.halt_fixed) if args.halt_mode == 'fixed' else '')
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
     json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=T_train, eval_episode_length=T_eval,
-                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_cot', 'fprm_perceiver', 'fprm_mem', 'fprm_mem_halt', 'fprm_rim') else None,
+                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_mem', 'fprm_mem_halt') else None,
                    threshold=env.threshold, results={str(d): r for d, r in per_dist.items()}, summary=summary),
               open(out, 'w'), indent=1)
     print('wrote', out)

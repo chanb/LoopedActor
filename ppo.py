@@ -38,11 +38,8 @@ from utils.evaluation import Evaluator
 from envs.utils import make_env
 from models.fprm import FPRMConfig
 from models.fprm_thinker import FPRMThinkerActorValue
-from models.fprm_cot_thinker import FPRMCoTThinkerActorValue
-from models.fprm_perceiver import FPRMPerceiverActorValue
 from models.fprm_mem import FPRMMemActorValue
 from models.fprm_mem_halt import FPRMMemHaltActorValue
-from models.fprm_rim import FPRMRiMActorValue
 from models.transformer_baseline import TransformerActorValue
 
 
@@ -116,13 +113,9 @@ class Args:
 
     # model
     # 'fprm'         — looped FPRM with policy-KL adaptive halting
-    # 'fprm_cot'     — FPRM thinking by appending continuous thought tokens (implicit CoT, causal, KV-cached); policy-KL halting only
-    # 'fprm_perceiver' — Perceiver AR-style latent CoT: latents (from <BOT>) attend to the cell tokens + earlier latents at every layer
     # 'fprm_mem'       — fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other; readout from the newest thought)
     # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i) (learned alpha, beta);
     #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_kl only initializes beta
-    # 'fprm_rim'       — RiM-style: each step appends [grid-conv'd cell output latents, SEP] (block-causal, KV-cached); halts when the
-    #                    SEP latent converges (--halt_criterion latent_residual) or by policy KL (kl)
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
     # 'multi_block'  — num_blocks FPRM cores without weight tying (~num_blocks x params)
     architecture: str = 'fprm'
@@ -153,28 +146,21 @@ class Args:
     halt_criterion: str = 'kl'            # 'kl' (policy-KL halting) | 'latent_residual' (original FPRM-paper rule: latent max-token residual)
     halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts <= this
                                           # (0 = only at a fixed point, < 0 = never: the iso_* arms pass -1)
-    halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh;
-                                          # fprm_rim: relative change of the SEP latent between steps)
-    perceiver_step_grid_conv: bool = False  # fprm_perceiver: apply a residual depthwise 3x3 conv to the cells at every thinking step
-                                            # (pass i reads the cells convolved i times; tokenizer=cell)
-    perceiver_num_initial_latents: int = 1  # fprm_perceiver: number of learned initial latents (bidirectional among themselves, all in pass 1)
-    perceiver_cell_encoder_iters: int = 0   # fprm_perceiver: looped board encoder iterations (0 = off; latent layer l reads the last
-                                            # iteration's layer-l output)
-    input_grid_conv: bool = False         # fprm_cot / fprm_perceiver: residual depthwise 3x3 conv over the cell embeddings (tokenizer=cell)
-    input_grid_conv_depth: int = 1        # fprm_cot / fprm_perceiver with --input_grid_conv: 1 = one linear depthwise conv; D > 1 = D ConvNeXt blocks
+    halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh)
     halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
     halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
     halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
     halt_threshold_fixed: bool = False    # fprm_mem_halt: h = 1/2 at KL = halt_kl throughout (beta = alpha log halt_kl; alpha sets sharpness)
     halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), the expectation under the acting policy
     stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
-    stable_softmax: bool = False          # fprm_mem_halt: collapse-free log-softmax for the policy and the steps halting head
+    stable_softmax: bool = False          # fprm_mem / fprm_mem_halt: collapse-free log-softmax for the action policy
+                                           # (and, fprm_mem_halt only, the steps halting head)
     halt_signal: str = 'kl'               # fprm_mem_halt: halting signal 'kl' | 'latent' (latent residual) | 'none' (learned head only)
     halt_mode: str = 'binary'             # fprm_mem_halt: 'binary' (halt yes/no per pass) | 'steps' (predict 0..4 more passes per decision)
     readout_token: str = 'thought'        # fprm_mem_halt: readout from the newest thought | 'sep' (a carried SEP token after the cells) | 'sep_mem' (SEP only, its K/V is the memory)
     halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent': initialization only (h = 1/2 at residual = halt_res)
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
-    cot_thought_norm: bool = False        # fprm_cot / fprm_perceiver / fprm_mem: RMS-normalize each thought / latent before feeding it back
+    cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
 
 
 @flax.struct.dataclass
@@ -360,45 +346,6 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
         )
-    elif args.architecture == 'fprm_cot':
-        assert args.halt_criterion == 'kl', "fprm_cot supports only halt_criterion='kl'"
-        actor_critic_network = FPRMCoTThinkerActorValue(
-            m=env.m,
-            n=env.n,
-            config=fprm_config,
-            max_think_iters=args.max_think_iters,
-            min_think_iters=args.min_think_iters,
-            halt_kl=args.halt_kl,
-            output_dim_1=action_size,
-            obs_channels=obs_channels,
-            action_head=action_head,
-            tokenizer=args.tokenizer,
-            tokenizer_conv_features=args.tokenizer_conv_features,
-            thought_norm=args.cot_thought_norm,
-            input_grid_conv=args.input_grid_conv,
-            input_grid_conv_depth=args.input_grid_conv_depth,
-        )
-    elif args.architecture == 'fprm_perceiver':
-        assert args.halt_criterion == 'kl', "fprm_perceiver supports only halt_criterion='kl'"
-        actor_critic_network = FPRMPerceiverActorValue(
-            m=env.m,
-            n=env.n,
-            config=fprm_config,
-            max_think_iters=args.max_think_iters,
-            min_think_iters=args.min_think_iters,
-            halt_kl=args.halt_kl,
-            output_dim_1=action_size,
-            obs_channels=obs_channels,
-            action_head=action_head,
-            tokenizer=args.tokenizer,
-            tokenizer_conv_features=args.tokenizer_conv_features,
-            thought_norm=args.cot_thought_norm,
-            input_grid_conv=args.input_grid_conv,
-            input_grid_conv_depth=args.input_grid_conv_depth,
-            step_grid_conv=args.perceiver_step_grid_conv,
-            num_initial_latents=args.perceiver_num_initial_latents,
-            cell_encoder_iters=args.perceiver_cell_encoder_iters,
-        )
     elif args.architecture == 'fprm_mem':
         assert args.halt_criterion == 'kl', "fprm_mem supports only halt_criterion='kl'"
         actor_critic_network = FPRMMemActorValue(
@@ -415,6 +362,7 @@ def main(args: Args):
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
             value_at_max_iters=args.value_at_max_iters,
+            stable_softmax=args.stable_softmax,
         )
     elif args.architecture == 'fprm_mem_halt':
         assert args.halt_criterion == 'kl', "fprm_mem_halt supports only halt_criterion='kl'"
@@ -442,21 +390,6 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
-        )
-    elif args.architecture == 'fprm_rim':
-        assert args.tokenizer == 'cell', "fprm_rim needs tokenizer='cell'"
-        actor_critic_network = FPRMRiMActorValue(
-            m=env.m,
-            n=env.n,
-            config=fprm_config,
-            max_think_iters=args.max_think_iters,
-            min_think_iters=args.min_think_iters,
-            halt_criterion='latent' if args.halt_criterion == 'latent_residual' else 'kl',
-            halt_residual_thresh=args.halt_residual_thresh,
-            halt_kl=args.halt_kl,
-            output_dim_1=action_size,
-            obs_channels=obs_channels,
-            action_head=action_head,
         )
     elif args.architecture in ('single_block', 'multi_block'):
         actor_critic_network = TransformerActorValue(
