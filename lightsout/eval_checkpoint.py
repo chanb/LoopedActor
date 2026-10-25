@@ -42,7 +42,7 @@ def build_module(args, m, n):
         return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
                                  thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_mem_halt':
-        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=args.min_think_iters, halt_kl=args.halt_kl,
+        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=args.min_think_iters,
                                      halt_max_skip=args.halt_max_skip, halt_kl_reverse=args.halt_kl_reverse,
                                      thought_norm=args.thought_norm, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)

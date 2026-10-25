@@ -32,7 +32,7 @@ which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergenc
 `halt_head` picks the head, each a one-hidden-layer GELU MLP (width `halt_head_width`) with K + 1 outputs and a
 zero-initialized output layer, so k is uniform at init:
   'none':     p_n = softmax(MLP(rms_norm(h_n)))                      no signal, no lookahead (ACT / PonderNet style)
-  'distance': p_n = softmax(MLP((log S_{n+1} - log threshold) / 5))  threshold = halt_kl ('kl') or halt_res ('latent')
+  'distance': p_n = softmax(MLP(log S_{n+1}))
   'raw':      p_n = softmax(MLP([z_n, z_{n+1}]))                     z = probability vectors or rms_norm(h)
 'distance' and 'raw' look one pass ahead: pass n+1 is computed, and if the head halts, pass n acts (c = n means "pass
 n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
@@ -185,7 +185,6 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
 
 _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the gradients NaN-free)
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
-_SIG_SCALE = 5.0  # halt_head='distance' input: (log S - log threshold) / this, ~[-3, 2] over S in [1e-10, 10]
 
 
 def step_path_log_prob(lp, mask, c):
@@ -277,14 +276,12 @@ class FPRMMemHaltActorValue(nn.Module):
     max_think_iters: int = 8
     min_think_iters: int = 2
     halting: bool = True           # False: no halting head, always act with pass max_think_iters (iso_mem)
-    halt_kl: float = 1e-3          # halt_head='distance', 'kl': the KL at the center of the MLP's input range
     halt_max_skip: int = 1         # K: each decision picks k in 0..K more passes (1: halt yes/no at every pass)
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the head's h / pi inputs
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     stable_kl: bool = False        # KL_i without the fp32 rounding floor (see the module docstring)
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
     halt_signal: str = 'kl'        # 'kl' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
-    halt_res: float = 0.1          # halt_head='distance', 'latent': the L2 distance at the center of the MLP's input range
     halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' (see the module docstring)
     halt_head_width: int = 32      # hidden width of the halting MLP
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
@@ -300,7 +297,7 @@ class FPRMMemHaltActorValue(nn.Module):
     def setup(self):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
-        assert not self.halting or (self.halt_kl > 0 and self.halt_res > 0 and self.halt_max_skip >= 1)
+        assert not self.halting or self.halt_max_skip >= 1
         assert self.halt_signal in ('kl', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         assert self.halt_head in ('none', 'distance', 'raw'), self.halt_head
@@ -332,10 +329,6 @@ class FPRMMemHaltActorValue(nn.Module):
         """The halting head's logits of k [..., K + 1] from its input x [..., in]."""
         p_in, p_out = self.variables['params']['halt_hidden'], self.variables['params']['halt_out']
         return jax.nn.gelu(x @ p_in['kernel'] + p_in['bias']) @ p_out['kernel'] + p_out['bias']
-
-    @property
-    def halt_threshold(self):  # halt_head='distance': the signal at the center of the MLP's input range
-        return {'kl': self.halt_kl, 'latent': self.halt_res}[self.halt_signal]
 
     def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None):
         if normalizer_params is not None:
@@ -398,7 +391,7 @@ class FPRMMemHaltActorValue(nn.Module):
             if self.halt_head == 'none':
                 x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
             elif self.halt_head == 'distance':
-                x = (jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None] - math.log(self.halt_threshold)) / _SIG_SCALE
+                x = jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None]
             elif self.halt_signal == 'kl':
                 x = sg(jnp.concatenate([jax.nn.softmax(logits_prev, -1), jax.nn.softmax(logits, -1)], -1))
             else:

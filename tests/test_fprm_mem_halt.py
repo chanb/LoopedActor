@@ -82,7 +82,7 @@ def test_k1_is_sigmoid_halting():
     T, min_iters = 4, 2
     net = _net(min_think_iters=min_iters)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
+    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'], scale=0.05)  # h strictly inside (0, 1) in fp32
     h = _intermediates(net, params, x)['halt_prob']
     log_pc = []
     for c in range(min_iters, T + 1):
@@ -143,15 +143,14 @@ def test_lookahead_halts_with_previous_pass(signal):
 @pytest.mark.parametrize('K', [1, 4])
 @pytest.mark.parametrize('signal', ['kl', 'latent'])
 def test_distance_head_reads_the_next_signal(K, signal):
-    # 'distance': the decision at pass n is softmax(MLP((log S_{n+1} - log threshold) / 5)), a GELU MLP of the scalar.
+    # 'distance': the decision at pass n is softmax(MLP(log S_{n+1})), a GELU MLP of the scalar.
     net = _net(min_think_iters=1, halt_signal=signal, halt_max_skip=K)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
     inter = _intermediates(net, params, x)
     if signal == 'kl':
         assert jnp.allclose(inter['halt_signal_t'], inter['policy_kl_t'])
-    thr = 1e-3 if signal == 'kl' else 0.1
-    u = (jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)[..., None] - math.log(thr)) / 5
+    u = jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)[..., None]
     hid, out = params['halt_hidden'], params['halt_out']
     g = jax.nn.gelu(u @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
     assert jnp.allclose(inter['halt_step_probs'][:-1], jax.nn.softmax(g, axis=-1), atol=1e-5)
