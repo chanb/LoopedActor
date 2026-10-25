@@ -1,7 +1,7 @@
 """Alternative observation tokenizers, for ablating the per-cell tokenization.
 
 Every model (models/fprm_thinker.py, models/transformer_baseline.py,
-models/fprm_mem.py) takes a `tokenizer` option:
+models/fprm_mem_halt.py) takes a `tokenizer` option:
 
   'cell' (default): one token per grid cell from its channels + geometry
       (`fprm_thinker.tokenize` + the model's own `cell_projection`; unchanged,

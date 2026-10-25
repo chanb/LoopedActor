@@ -38,7 +38,6 @@ from utils.evaluation import Evaluator
 from envs.utils import make_env
 from models.fprm import FPRMConfig
 from models.fprm_thinker import FPRMThinkerActorValue
-from models.fprm_mem import FPRMMemActorValue
 from models.fprm_mem_halt import FPRMMemHaltActorValue
 from models.transformer_baseline import TransformerActorValue
 
@@ -97,8 +96,6 @@ class Args:
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
-    value_at_max_iters: bool = False      # fprm_mem: the value is read out from the max_think_iters-th pass's latent (halting
-                                          # fixes only the policy readout; the latent keeps evolving), not from the halt pass
     value_expectile: float = 0.5          # value loss |tau - 1(u < 0)| u^2 with u = target - V: 0.5 = MSE (mean return),
                                           # > 0.5 = an upper expectile of the return (optimistic V, as Stoix --expectile)
     clipping_epsilon: float = 0.3
@@ -113,9 +110,10 @@ class Args:
 
     # model
     # 'fprm'         — looped FPRM with policy-KL adaptive halting
-    # 'fprm_mem'       — fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other; readout from the newest thought)
-    # 'fprm_mem_halt'  — fprm_mem with stochastic halting: c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i) (learned alpha, beta);
-    #                    the PPO ratio uses the joint log p(c|s) + log pi_c(a|s); halt_kl only initializes beta
+    # 'fprm_mem'       — fprm's looped board plus a SEP token and a memory of thought tokens; always runs max_think_iters passes
+    #                    and acts with the last (models/fprm_mem_halt.py with halting=False)
+    # 'fprm_mem_halt'  — the same trunk with learned stochastic halting: chains of decisions k ~ p_n(k) over 0..halt_max_skip
+    #                    more passes; the PPO ratio uses the joint log p(path|s) + log pi_c(a|s)
     # 'single_block' — FPRM core applied once (same params as fprm, no looping)
     # 'multi_block'  — num_blocks FPRM cores without weight tying (~num_blocks x params)
     architecture: str = 'fprm'
@@ -126,8 +124,6 @@ class Args:
     tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
-    num_experts: int = 1                  # > 1: mixture-of-experts block MLP (fprm_mem / fprm_mem_halt; see FPRMConfig)
-    moe_top_k: int = 0                    # MoE routing: 0 = soft (all experts), k = top-k
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
                                           # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
@@ -147,18 +143,17 @@ class Args:
     halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts <= this
                                           # (0 = only at a fixed point, < 0 = never: the iso_* arms pass -1)
     halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh)
-    halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the KL slope alpha (alpha = this + softplus(.), 1 at init)
-    halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar
-    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the beta head
-    halt_threshold_fixed: bool = False    # fprm_mem_halt: h = 1/2 at KL = halt_kl throughout (beta = alpha log halt_kl; alpha sets sharpness)
+    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the halting head
     halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), the expectation under the acting policy
     stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
     stable_softmax: bool = False          # fprm_mem / fprm_mem_halt: collapse-free log-softmax for the action policy
-                                           # (and, fprm_mem_halt only, the steps halting head)
+                                           # (and, fprm_mem_halt only, the halting head)
     halt_signal: str = 'kl'               # fprm_mem_halt: halting signal 'kl' | 'latent' (latent residual) | 'none' (learned head only)
-    halt_mode: str = 'binary'             # fprm_mem_halt: 'binary' (halt yes/no per pass) | 'steps' (predict 0..4 more passes per decision)
-    readout_token: str = 'thought'        # fprm_mem_halt: readout from the newest thought | 'sep' (a carried SEP token after the cells) | 'sep_mem' (SEP only, its K/V is the memory)
-    halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent': initialization only (h = 1/2 at residual = halt_res)
+    halt_max_skip: int = 1                # fprm_mem_halt: each halting decision picks 0..this more passes (0 = halt; 1 = yes/no at every pass)
+    readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
+    halt_res: float = 0.1                 # fprm_mem_halt, halt_signal='latent', halt_signal_head='mlp': residual at the center of the MLP's input
+    halt_signal_head: str = 'linear'      # fprm_mem_halt, kl / latent: 'linear' in log S | 'mlp' (+ an MLP of log S) | 'raw' (an MLP of both policies / both passes' cell latents)
+    halt_signal_width: int = 32           # fprm_mem_halt: hidden width of the 'mlp' / 'raw' signal heads
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
 
@@ -235,7 +230,7 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
                 'value': value,
                 'compute_time': compute_time,
             }
-            if 'halt_path' in inter['intermediates']:  # halt_mode='steps': the loss replays the decision passes too
+            if 'halt_path' in inter['intermediates']:  # fprm_mem_halt: the loss replays the decision passes too
                 extras['halt_path'] = inter['intermediates']['halt_path'][0]
             return actions, extras
 
@@ -264,7 +259,6 @@ def make_optimizer(args):
 def main(args: Args):
 
     assert 0.0 < args.value_expectile < 1.0, args.value_expectile
-    assert not args.value_at_max_iters or args.architecture == 'fprm_mem', '--value_at_max_iters is implemented for fprm_mem only'
     args.num_training_step = args.num_timesteps // (args.num_envs * args.rollout_length)
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
     args.num_training_steps_per_real_reset = args.num_training_step // max(1, args.num_reset_steps)
@@ -325,8 +319,6 @@ def main(args: Args):
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
-        num_experts=args.num_experts,
-        moe_top_k=args.moe_top_k,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
     )
@@ -346,44 +338,26 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
         )
-    elif args.architecture == 'fprm_mem':
-        assert args.halt_criterion == 'kl', "fprm_mem supports only halt_criterion='kl'"
-        actor_critic_network = FPRMMemActorValue(
-            m=env.m,
-            n=env.n,
-            config=fprm_config,
-            max_think_iters=args.max_think_iters,
-            min_think_iters=args.min_think_iters,
-            halt_kl=args.halt_kl,
-            output_dim_1=action_size,
-            obs_channels=obs_channels,
-            action_head=action_head,
-            tokenizer=args.tokenizer,
-            tokenizer_conv_features=args.tokenizer_conv_features,
-            thought_norm=args.cot_thought_norm,
-            value_at_max_iters=args.value_at_max_iters,
-            stable_softmax=args.stable_softmax,
-        )
-    elif args.architecture == 'fprm_mem_halt':
-        assert args.halt_criterion == 'kl', "fprm_mem_halt supports only halt_criterion='kl'"
+    elif args.architecture in ('fprm_mem', 'fprm_mem_halt'):
+        assert args.halt_criterion == 'kl', "fprm_mem / fprm_mem_halt support only halt_criterion='kl'"
         actor_critic_network = FPRMMemHaltActorValue(
+            halting=args.architecture == 'fprm_mem_halt',
             m=env.m,
             n=env.n,
             config=fprm_config,
             max_think_iters=args.max_think_iters,
             min_think_iters=args.min_think_iters,
             halt_kl=args.halt_kl,
-            halt_alpha_min=args.halt_alpha_min,
-            halt_beta_head=args.halt_beta_head,
             halt_head_grad=args.halt_head_grad,
             halt_kl_reverse=args.halt_kl_reverse,
             stable_kl=args.stable_kl,
             stable_softmax=args.stable_softmax,
-            halt_threshold_fixed=args.halt_threshold_fixed,
             halt_signal=args.halt_signal,
             halt_res=args.halt_res,
+            halt_signal_head=args.halt_signal_head,
+            halt_signal_width=args.halt_signal_width,
             readout_token=args.readout_token,
-            halt_mode=args.halt_mode,
+            halt_max_skip=args.halt_max_skip,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -586,15 +560,12 @@ def main(args: Args):
             halt_log_prob = inter['intermediates']['halt_log_prob'][0]
             halt_entropy = jnp.mean(inter['intermediates']['halt_entropy'][0])
             halt_metrics = {'halt_entropy': halt_entropy}
-            if 'halt_alpha' in inter['intermediates']:  # halt_mode='binary'
-                halt_metrics['halt_alpha'] = inter['intermediates']['halt_alpha'][0]
-                halt_metrics['halt_beta'] = jnp.mean(inter['intermediates']['halt_beta_t'][0])
-            else:  # halt_mode='steps': mean p(k) over passes and states, and the number of decisions per state
-                p_k = jnp.mean(inter['intermediates']['halt_step_probs'][0], axis=(0, 1))
-                halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
-                path = data.extras['policy_extras']['halt_path']
-                halt_metrics['halt_decisions'] = jnp.mean(jnp.sum((path[..., None] >> jnp.arange(32)) & 1, axis=-1).astype(jnp.float32))
-            # Per-pass means, each in its own wandb section: h_i (forced 0 before min_think_iters, 1 at the cap),
+            # mean p(k) over passes and states, and the number of decisions per state
+            p_k = jnp.mean(inter['intermediates']['halt_step_probs'][0], axis=(0, 1))
+            halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
+            path = data.extras['policy_extras']['halt_path']
+            halt_metrics['halt_decisions'] = jnp.mean(jnp.sum((path[..., None] >> jnp.arange(32)) & 1, axis=-1).astype(jnp.float32))
+            # Per-pass means, each in its own wandb section: p_i(k = 0) (the halting probability at a decision at pass i),
             # log10 of the policy KL_i between passes i and i-1 (KL spans decades, so the mean of the log) and the
             # latent residual (below).
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)

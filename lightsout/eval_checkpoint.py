@@ -27,7 +27,6 @@ from envs.lightsout_env import LightsOutEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem import FPRMMemActorValue  # noqa: E402
 from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
@@ -40,11 +39,11 @@ def build_module(args, m, n):
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                      halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_mem':
-        return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+        return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
                                  thought_norm=args.thought_norm, **kw)
     if args.arch == 'fprm_mem_halt':
         return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=args.min_think_iters, halt_kl=args.halt_kl,
-                                     halt_alpha_min=args.halt_alpha_min, halt_beta_head=args.halt_beta_head, halt_kl_reverse=args.halt_kl_reverse, halt_threshold_fixed=args.halt_threshold_fixed,
+                                     halt_max_skip=args.halt_max_skip, halt_kl_reverse=args.halt_kl_reverse,
                                      thought_norm=args.thought_norm, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
@@ -53,12 +52,12 @@ def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed, halt_mode=
     @jax.jit
     def act(obs, goal, key):
         x = jnp.concatenate([obs, goal], axis=-1)
-        # fprm_mem_halt: c = argmax p(c|s) (mode), c ~ p(c|s) (sample) or a fixed c for every state (fixed).
+        # fprm_mem_halt: the most likely halting path (mode), a sampled one (sample) or a fixed c for every state (fixed).
         kw = {}
         if halt_mode == 'sample':
             kw = {'halt_key': key}
         elif halt_mode == 'fixed':
-            kw = {'halt_steps': jnp.full((obs.shape[0],), halt_fixed, jnp.int32)}
+            kw = {'halt_steps': jnp.full((obs.shape[0],), halt_fixed, jnp.int32), 'halt_path': jnp.zeros((obs.shape[0],), jnp.int32)}
         (pi, _), inter = mod.apply(policy_vars, x, norm, mutable=['intermediates'], **kw)
         I = inter['intermediates']
         conv = I['fp_converged'][0] if 'fp_converged' in I else jnp.zeros(obs.shape[0], bool)
@@ -103,13 +102,11 @@ def main():
     ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
     ap.add_argument('--halt_kl', type=float, default=1e-3,
                     help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
-    ap.add_argument('--halt_alpha_min', type=float, default=0.0, help='fprm_mem_halt: the checkpoint\'s --halt_alpha_min')
-    ap.add_argument('--halt_beta_head', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_beta_head')
-    ap.add_argument('--halt_threshold_fixed', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_threshold_fixed')
+    ap.add_argument('--halt_max_skip', type=int, default=1, help='fprm_mem_halt: the checkpoint\'s --halt_max_skip')
     ap.add_argument('--halt_kl_reverse', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_kl_reverse')
     ap.add_argument('--min_think_iters', type=int, default=1, help='fprm_mem_halt: the checkpoint\'s --min_think_iters')
     ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
-                    help='fprm_mem_halt: think time c = argmax p(c|s) (the training eval), c ~ p(c|s), or --halt_fixed for every state')
+                    help='fprm_mem_halt: think time c of the most likely halting path (the training eval), of a sampled path, or --halt_fixed for every state')
     ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
     ap.add_argument('--thought_norm', action='store_true', help='fprm_mem / fprm_mem_halt: the checkpoint was trained with --cot_thought_norm')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')

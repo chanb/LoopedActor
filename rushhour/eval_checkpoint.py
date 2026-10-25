@@ -24,7 +24,7 @@ from envs.rushhour_env import RushHourEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem import FPRMMemActorValue  # noqa: E402
+from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
@@ -56,7 +56,7 @@ def main():
         mod = FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                     halt_kl=args.halt_kl, **kw)
     elif args.arch == 'fprm_mem':
-        mod = FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+        mod = FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
                                 thought_norm=args.thought_norm, **kw)
     else:
         mod = TransformerActorValue(num_blocks=args.num_blocks if args.arch == 'multi_block' else 1,

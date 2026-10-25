@@ -26,7 +26,7 @@ from envs.utils import State  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
 from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem import FPRMMemActorValue  # noqa: E402
+from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
@@ -39,7 +39,7 @@ def build_module(args):
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
                                      halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_mem':
-        return FPRMMemActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_kl=args.halt_kl,
+        return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
                                  thought_norm=args.thought_norm, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 

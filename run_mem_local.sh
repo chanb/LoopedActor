@@ -1,14 +1,14 @@
 #!/bin/bash
 set -uo pipefail
 
-# Runs the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem at caps MEM_ITERS,
-# default 2 3 4, on all four environments, 10 seeds) on local GPUs without slurm. Runs are queued longest first (by the
+# Runs the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem_halt at caps MEM_HALT_ITERS,
+# default none, on all four environments, 10 seeds) on local GPUs without slurm. Runs are queued longest first (by the
 # estimated run time in slurm/mem_study.sh) and started on the next free slot; each GPU has RUNS_PER_GPU slots.
 #
-#   ./run_mem_local.sh                                    # all 120 runs on GPUs 0-7, one run per GPU
+#   ./run_mem_local.sh                                    # every run on GPUs 0-7, one run per GPU
 #   GPUS="3 5 7" RUNS_PER_GPU=2 ./run_mem_local.sh
 #   ENVS="lightsout slidingpuzzle" SEEDS="1 2 3" ./run_mem_local.sh
-#   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" ./run_mem_local.sh
+#   ISO_ITERS="1 2 4 8" MEM_HALT_ITERS="4 8" ./run_mem_local.sh
 #   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout ./run_mem_local.sh
 #   DRY_RUN=1 ./run_mem_local.sh                          # print the queue only
 #   nohup ./run_mem_local.sh > mem_local.log 2>&1 &       # keep running after logout

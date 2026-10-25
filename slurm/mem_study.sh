@@ -1,14 +1,10 @@
 # The fprm_mem study, sourced by slurm/submit_mem.sh and run_mem_local.sh: iso_mem at every cap in ISO_ITERS (fixed
-# compute) and mem at every cap in MEM_ITERS (policy-KL halting) on all four environments. Every run: bfloat16 + GELU
+# compute) and mem_halt at every cap in MEM_HALT_ITERS (learned halting) on all four environments. Every run: bfloat16 + GELU
 # MLP, DISCOUNT_ACT=0.99, DISCOUNT_COMPUTE=0.999 (unless set, see DISCOUNT_COMPUTES), each env's default board / episode settings.
 #   ISO_ITERS   iso_mem caps (default "1 2 3 4")
-#   MEM_ITERS   mem caps (default "2 3 4"; a cap of 1 is iso_mem T=1, since halting acts from pass 2; an empty list
-#               (MEM_ITERS=) runs no mem configs, likewise ISO_ITERS=)
-#   MEM_HALT_ITERS  mem_halt caps (fprm_mem with stochastic learned halting; default empty = none; e.g.
-#               MEM_HALT_ITERS="4" ISO_ITERS= MEM_ITERS= runs only mem_halt). Same cost as mem at the same cap
-#               (every pass runs); HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / HALT_THRESHOLD_FIXED are read by train.sh
-#   HALT_ALPHA_MINS  alpha floors swept over the mem_halt configs, crossed with the rest (e.g. "0 0.1 0.25 0.5"; config
-#               and slurm job names get _amin<a>; other arms are not multiplied). Use instead of HALT_ALPHA_MIN, not with it
+#   MEM_HALT_ITERS  mem_halt caps (iso_mem with stochastic learned halting; default empty = none; e.g.
+#               MEM_HALT_ITERS="4" ISO_ITERS= runs only mem_halt; ISO_ITERS= runs no iso_mem). Same cost as iso_mem at the same cap
+#               (every pass runs); HALT_ENTROPY_COST / HALT_MAX_SKIP / HALT_HEAD_GRAD / HALT_KL_REVERSE are read by train.sh
 #   VALUE_EXPECTILES  value-loss expectiles, crossed with every config above (default "0.5" = MSE; e.g. "0.5 0.7 0.9"
 #               multiplies the study by 3; train.sh adds _ve<tau> to the run name for tau != 0.5)
 #   TARGET_KL, NUM_EPOCHS  passed to every run when set (train.sh adds _tkl<k> / _ep<n> to the run name; slurm job names
@@ -19,50 +15,38 @@
 #               (default "${DISCOUNT_COMPUTE:-0.999}", so DISCOUNT_COMPUTE=g still sets a single value; e.g.
 #               DISCOUNT_COMPUTES="0.9 0.99 0.999" multiplies the study by 3; train.sh adds _gc<g> to the run name when
 #               != 1.0; slurm job names get _gc<g> when g != 0.999)
-#   VALUE_AT_MAX_ITERS=1  value from the MAX_THINK_ITERS-th pass's latent (train.sh adds _vT to the run name; slurm job
-#               names get _vT; mem / iso_mem only)
 #   MIN_RANDOM_MOVES  slidingpuzzle: training scrambles of a uniform length in [k, NUM_RANDOM_MOVES] (train.sh adds
 #               _rmin<k> to the run name; slurm job names get _rmin<k>; other envs ignore it)
 #   RANDOM_MOVES_ZIPF  with MIN_RANDOM_MOVES: length k drawn with p(k) ∝ k^-s (default 0 = uniform; _rzipf<s>)
-#   HALT_KL     mem configs' policy-KL halting threshold (default 1e-3; train.sh adds _hkl<k> to mem run names when
-#               != 1e-3; slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
+#   HALT_KL     mem_halt configs' --halt_kl (only used by HALT_SIGNAL_HEAD=mlp; train.sh adds _hkl<k> when != 1e-3;
+#               slurm job names get _hkl<k> when set; iso_mem never halts, so it is unaffected)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
 MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
 MEM_STUDY_TAG="${MEM_STUDY_TAG:-}"   # appended to slurm job names (preserves a caller-set prefix/salt, if any)
-[[ -n "${HALT_ALPHA_MINS:-}" && -n "${HALT_ALPHA_MIN:-}" ]] && { echo "set HALT_ALPHA_MINS or HALT_ALPHA_MIN, not both" >&2; return 1; }
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }
 [[ -n "${HALT_KL:-}" ]] && { MEM_STUDY_COMMON+=" HALT_KL=${HALT_KL}"; MEM_STUDY_TAG+="_hkl${HALT_KL}"; }
 [[ -n "${HALT_ENTROPY_COST:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ENTROPY_COST=${HALT_ENTROPY_COST}"; MEM_STUDY_TAG+="_hent${HALT_ENTROPY_COST}"; }
-[[ -n "${HALT_ALPHA_MIN:-}" ]] && { MEM_STUDY_COMMON+=" HALT_ALPHA_MIN=${HALT_ALPHA_MIN}"; MEM_STUDY_TAG+="_amin${HALT_ALPHA_MIN}"; }
-[[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_BETA_HEAD=1"; MEM_STUDY_TAG+="_bh"; }
+[[ -n "${HALT_MAX_SKIP:-}" ]] && { MEM_STUDY_COMMON+=" HALT_MAX_SKIP=${HALT_MAX_SKIP}"; MEM_STUDY_TAG+="_hk${HALT_MAX_SKIP}"; }
 [[ "${HALT_HEAD_GRAD:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_HEAD_GRAD=1"; MEM_STUDY_TAG+="_hgrad"; }
 [[ "${HALT_KL_REVERSE:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_KL_REVERSE=1"; MEM_STUDY_TAG+="_rkl"; }
-[[ "${HALT_THRESHOLD_FIXED:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" HALT_THRESHOLD_FIXED=1"; MEM_STUDY_TAG+="_kthr"; }
 [[ -n "${TARGET_KL:-}" ]] && { MEM_STUDY_COMMON+=" TARGET_KL=${TARGET_KL}"; MEM_STUDY_TAG+="_tkl${TARGET_KL}"; }
 [[ -n "${NUM_EPOCHS:-}" ]] && { MEM_STUDY_COMMON+=" NUM_EPOCHS=${NUM_EPOCHS}"; MEM_STUDY_TAG+="_ep${NUM_EPOCHS}"; }
 if [[ -n "${NUM_TIMESTEPS:-}" ]]; then
   MEM_STUDY_COMMON+=" NUM_TIMESTEPS=${NUM_TIMESTEPS}"
   (( NUM_TIMESTEPS % 1000000 == 0 )) && MEM_STUDY_TAG+="_ts$(( NUM_TIMESTEPS / 1000000 ))M" || MEM_STUDY_TAG+="_ts${NUM_TIMESTEPS}"
 fi
-[[ "${VALUE_AT_MAX_ITERS:-0}" == 1 ]] && { MEM_STUDY_COMMON+=" VALUE_AT_MAX_ITERS=1"; MEM_STUDY_TAG+="_vT"; }
 # "<config name>|<env vars> <arm>"
 MEM_STUDY_CONFIGS=()
 for _gc in ${DISCOUNT_COMPUTES:-${DISCOUNT_COMPUTE:-0.999}}; do
 for _ve in ${VALUE_EXPECTILES:-0.5}; do
   _sfx=""; [[ "$_ve" != 0.5 ]] && _sfx+="_ve${_ve}"; [[ "$_gc" != 0.999 ]] && _sfx+="_gc${_gc}"
   for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_mem"); done
-  for _t in ${MEM_ITERS-2 3 4}; do MEM_STUDY_CONFIGS+=("mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem"); done
-  for _t in ${MEM_HALT_ITERS-}; do
-    for _am in ${HALT_ALPHA_MINS:--}; do   # "-": no sweep (HALT_ALPHA_MIN, if set, is in MEM_STUDY_COMMON)
-      _amv=""; _amn=""; [[ "$_am" != - ]] && { _amv=" HALT_ALPHA_MIN=${_am}"; _amn="_amin${_am}"; }
-      MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}${_amn}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc}${_amv} mem_halt")
-    done
-  done
+  for _t in ${MEM_HALT_ITERS-}; do MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem_halt"); done
 done
 done
-unset _t _ve _gc _sfx _am _amv _amn
+unset _t _ve _gc _sfx
 
 # Measured cost of one run alone (bf16, GELU, each env's train.sh settings: 1024 envs x 64 steps, 64 minibatches x 4
 # epochs, 100M steps; RTX A4500 - the L40S should be at least as fast):
@@ -71,7 +55,7 @@ unset _t _ve _gc _sfx _am _amv _amn
 #   slidingpuzzle      46.3k    0.6         12.6k     2.2     0.32 / 0.32 GiB             2.6 GiB
 #   rushhour          >14.6k   <1.9         >3.5k    <7.9     1.06 / 1.13 GiB             3.7 GiB   (shared GPU: speeds are lower bounds)
 #   sokoban             7.6k    3.7          1.8k    15.6     2.71 / 2.98 GiB             6.1 GiB
-# mem and iso_mem at the same cap cost the same (halting freezes examples but does not skip compute); the cost of a cap
+# mem_halt and iso_mem at the same cap cost the same (halting does not skip compute); the cost of a cap
 # T is interpolated linearly through the T=1 and T=4 measurements (each think iteration is one more core call).
 # lightsout is refit to the L40S runs of looped_actor_gamma_ablation (5x4, T = 1..16, GPU-hours per run with 2-3 runs
 # per GPU): ~1.25-1.5x the old "0.25 1.0" at every T, which timed out the T=16 jobs; "0.3 1.35" stays within SAFETY.

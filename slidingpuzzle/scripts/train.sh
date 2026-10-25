@@ -1,7 +1,7 @@
 #!/bin/bash
 # Train one arm of the sliding puzzle study.
 #   slidingpuzzle/scripts/train.sh <arm> <seed> [out_dir] [device]
-#   arm: looped | iso_flops | iso_param | iso_loop | mem | iso_mem | mem_halt
+#   arm: looped | iso_flops | iso_param | iso_loop | iso_mem | mem_halt
 # Optional environment variables:
 #   GRID=N              board size N x N (default 3 = 8-puzzle)
 #   EPISODE_LENGTH=N    steps per training episode (default 40; also used by the eval/train_* episodes)
@@ -16,34 +16,31 @@
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 0.999; 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
-#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / mem / iso_mem / mem_halt (default 16)
+#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / iso_mem / mem_halt (default 16)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
-#   THOUGHT_NORM=1      mem arm (and iso_mem) / mem_halt: RMS-normalize each thought before feeding it back (default 0)
-#   HALT_KL=k           looped / mem: halt once the policy KL between passes < k (default 1e-3);
-#                       mem_halt: initialization only (h_i = 1/2 at KL_i = k)
+#   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
+#   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3);
+#                       mem_halt with HALT_SIGNAL_HEAD=mlp: the KL at the center of the MLP's input
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_ALPHA_MIN=a    mem_halt: floor on the KL slope alpha, in [0, 1) (default 0 = no floor)
-#   HALT_BETA_HEAD=0|1  mem_halt: state-dependent beta (Dense on the newest thought) instead of a scalar (default 0)
-#   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the beta head (default 0)
-#   HALT_THRESHOLD_FIXED=0|1  mem_halt: h = 1/2 at KL = HALT_KL throughout training; alpha only sets sharpness (default 0;
-#                       pair with HALT_ALPHA_MIN > 0, as alpha -> 0 makes every h = 1/2)
+#   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
-#   STABLE_SOFTMAX=0|1  mem / iso_mem / mem_halt: collapse-free log-softmax for the action policy (mem_halt also: the
-#                       steps head) (default 0, run names get _ssm)
-#                       (mem_halt with HALT_SIGNAL=kl|latent halts with lookahead: on the signal of pass c+1, acting with
-#                       pi_c; run names get _look, or _hsteps_look in steps mode. HALT_SIGNAL=none does not look ahead)
-#   HALT_SIGNAL=kl|latent|none  mem_halt: halting signal - policy KL, latent residual (h = 1/2 at HALT_RES at init), or
-#                       none (h = sigmoid(beta) only; pair with HALT_BETA_HEAD=1) (default kl)
-#   HALT_RES=r          mem_halt, HALT_SIGNAL=latent: initialization only (default 0.1)
-#   HALT_MODE=binary|steps  mem_halt: halt yes/no at every pass, or at each decision predict 0..4 more passes (0 = halt;
-#                       decide again after k passes; scored by the sampled decision path) (default binary)
-#   READOUT=thought|sep|sep_mem  mem_halt: read actions / value / halting from the newest thought, or from a carried SEP token
-#                (sep_mem: no thought tokens; queries are [cells, SEP] and SEP's K/V is the memory)
-#                       after the cells (thoughts then only feed the memory) (default thought)
-#   NUM_EXPERTS=E       mem / mem_halt: E > 1 = mixture-of-experts block MLP (default 1). The experts split the default
-#                       MLP width (512 at d=128): E experts of 512/E each, unless EXPANSION / MLP_ROUND_TO are given
-#   MOE_TOP_K=k         NUM_EXPERTS > 1: 0 = soft routing over all experts, k = top-k (default 0)
+#   STABLE_SOFTMAX=0|1  iso_mem / mem_halt: collapse-free log-softmax for the action policy (mem_halt also: the
+#                       halting head) (default 0, run names get _ssm)
+#   HALT_MAX_SKIP=K     mem_halt: each halting decision picks k in 0..K more passes from softmax(Dense([readout, log S]))
+#                       (0 = halt; decide again after k passes; scored by the sampled decision path). K = 1 is a yes/no
+#                       halt at every pass (default 1; run names get _hk<K>)
+#   HALT_SIGNAL=kl|latent|none  mem_halt: halting signal S - policy KL, latent residual, or none (the readout only)
+#                       (default kl). kl / latent look ahead: decide on the signal of pass c+1, act with pi_c (_look)
+#   HALT_RES=r          mem_halt, HALT_SIGNAL=latent, HALT_SIGNAL_HEAD=mlp: the residual at the center of the MLP's input
+#                       (default 0.1)
+#   HALT_SIGNAL_HEAD=linear|mlp|raw  mem_halt, HALT_SIGNAL=kl|latent: the signal enters halting linearly in log S, plus
+#                       an MLP of log S (_shmlp), or only through an MLP of both policies / both passes' cell latents
+#                       (_shraw) (default linear)
+#   HALT_SIGNAL_WIDTH=W  mem_halt: hidden width of the mlp / raw signal heads (default 32; run names get W if not 32)
+#   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
+#                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
+#                       run names get _rthought / _rsep)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       KL(pi_1 || uniform))
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
@@ -51,9 +48,7 @@
 #                         conv = 3x3 conv, one token per output channel
 #   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
-#   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4; with
-#                       NUM_EXPERTS, the width of each expert: EXPANSION=1.5 MLP_ROUND_TO=128 gives 128)
-#                       (NUM_EXPERTS sets both when neither is given)
+#   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
 #                       64 -> 384, 1 -> 341)
 #   COMPUTE_DTYPE=float32|float16|bfloat16  block computation dtype (default float32). bfloat16: ~1.6-1.75x faster, fp32 range;
@@ -66,8 +61,6 @@
 #                       are not computed, so this also saves time; training/kl_stop_frac = fraction skipped)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
 #   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
-#   VALUE_AT_MAX_ITERS=0|1  mem / iso_mem: read the value out from the MAX_THINK_ITERS-th pass's latent instead of the
-#                       halt pass's (halting then fixes only the policy readout) (default 0)
 #   VALUE_EXPECTILE=tau  value loss expectile in (0, 1) (default 0.5 = MSE; e.g. 0.9 = optimistic upper-expectile value,
 #                       as Stoix --expectile)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
@@ -84,11 +77,11 @@
 #   iso_flops : 16 untied cores stacked (16x the parameters)
 #   iso_param : one core applied once
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
-#   mem       : fprm's looped board plus a memory of thought tokens (cells and thoughts attend to each other, readout
-#               from the newest thought), cap 16 passes, policy-KL halting (1e-3)
-#   iso_mem   : the same, always runs the full 16 passes (no halting)
-#   mem_halt  : mem with stochastic learned halting, c ~ p(c|s) from h_i = sigmoid(beta - alpha log KL_i); the PPO
-#               ratio uses log p(c|s) + log pi_c(a|s); value from the last pass (models/fprm_mem_halt.py)
+#   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
+#               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
+#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(Dense([readout, log KL])) pick how many more
+#               passes to run; the PPO ratio uses log p(path|s) + log pi_c(a|s); value from the last pass
+#               (models/fprm_mem_halt.py)
 # Usage:
 # MAX_THINK_ITERS=4 slidingpuzzle/scripts/train.sh looped 1 exp/slidingpuzzle 0 &
 # GRID=4 NUM_RANDOM_MOVES=200 EVAL_NUM_RANDOM_MOVES=400 EPISODE_LENGTH=80 slidingpuzzle/scripts/train.sh looped 1 exp/slidingpuzzle 1 &
@@ -99,10 +92,9 @@ GRID="${GRID:-3}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVAL_EPISODE_LENGTH="
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; MIN_RANDOM_MOVES="${MIN_RANDOM_MOVES:-0}"; RANDOM_MOVES_ZIPF="${RANDOM_MOVES_ZIPF:-0}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.999}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
-MLP_WIDTH_SET="${EXPANSION+1}${MLP_ROUND_TO+1}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; VALUE_AT_MAX_ITERS="${VALUE_AT_MAX_ITERS:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
+MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_BETA_HEAD="${HALT_BETA_HEAD:-0}"; HALT_ALPHA_MIN="${HALT_ALPHA_MIN:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_THRESHOLD_FIXED="${HALT_THRESHOLD_FIXED:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_RES="${HALT_RES:-0.1}"; READOUT="${READOUT:-thought}"; HALT_MODE="${HALT_MODE:-binary}"; NUM_EXPERTS="${NUM_EXPERTS:-1}"; MOE_TOP_K="${MOE_TOP_K:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_RES="${HALT_RES:-0.1}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_SIGNAL_HEAD="${HALT_SIGNAL_HEAD:-linear}"; HALT_SIGNAL_WIDTH="${HALT_SIGNAL_WIDTH:-32}"; READOUT="${READOUT:-thought}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -113,33 +105,26 @@ case "$ARM" in
   iso_param) ARM_FLAGS=(--architecture=single_block) ;;
   iso_loop)  ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
-  mem)       ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
 esac
-[[ "$ARM" =~ ^(looped|mem|mem_halt)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
+[[ "$ARM" =~ ^(looped|mem_halt)$ && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
 [[ "$MIN_THINK_ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "MIN_THINK_ITERS must be an integer >= 1, got $MIN_THINK_ITERS"; exit 1; }
 [[ "$MIN_THINK_ITERS" != 2 ]] && { ARM_FLAGS+=(--min_think_iters="$MIN_THINK_ITERS"); RUN+="_minit${MIN_THINK_ITERS}"; }
 if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a + 0 == a && a >= 0 && a < 1) }' || { echo "HALT_ALPHA_MIN must be in [0, 1), got $HALT_ALPHA_MIN"; exit 1; }
-  awk -v a="$HALT_ALPHA_MIN" 'BEGIN { exit !(a > 0) }' && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_amin${HALT_ALPHA_MIN}"; }
-  case "$HALT_BETA_HEAD" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_beta_head); RUN+="_bh" ;;
-    *) echo "HALT_BETA_HEAD must be 0 or 1, got $HALT_BETA_HEAD"; exit 1 ;;
-  esac
   case "$HALT_HEAD_GRAD" in
     0) ;;
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  [[ "$HALT_MODE" == binary && "$HALT_SIGNAL" != none ]] && RUN+="_look"  # steps mode: _hsteps_look below
+  [[ "$HALT_MAX_SKIP" =~ ^[1-9][0-9]*$ ]] || { echo "HALT_MAX_SKIP must be an integer >= 1, got $HALT_MAX_SKIP"; exit 1; }
+  ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP"); RUN+="_hk${HALT_MAX_SKIP}"
+  [[ "$HALT_SIGNAL" != none ]] && RUN+="_look"
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
@@ -150,43 +135,34 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--stable_kl); RUN+="_skl" ;;
     *) echo "STABLE_KL must be 0 or 1, got $STABLE_KL"; exit 1 ;;
   esac
-  case "$HALT_THRESHOLD_FIXED" in
-    0) ;;
-    1) ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_kthr" ;;
-    *) echo "HALT_THRESHOLD_FIXED must be 0 or 1, got $HALT_THRESHOLD_FIXED"; exit 1 ;;
-  esac
   case "$HALT_SIGNAL" in
     kl) ;;
     latent) ARM_FLAGS+=(--halt_signal=latent --halt_res="$HALT_RES"); RUN+="_hlat"; [[ "$HALT_RES" != 0.1 ]] && RUN+="${HALT_RES}" ;;
     none) ARM_FLAGS+=(--halt_signal=none); RUN+="_hnone" ;;
     *) echo "HALT_SIGNAL must be kl, latent or none, got $HALT_SIGNAL"; exit 1 ;;
   esac
-  # Lookahead only with a convergence signal (kl / latent). Steps mode gained it and HALT_SIGNAL=none lost it on
-  # 2026-10-24 with the same flags, so those runs get their own wandb group (GROUP_SALT) and run names.
-  case "$HALT_MODE" in
-    binary) [[ "$HALT_SIGNAL" == none ]] && GROUP_SALT=" lookahead-v2" ;;
-    steps) ARM_FLAGS+=(--halt_mode=steps); RUN+="_hsteps"
-           [[ "$HALT_SIGNAL" != none ]] && RUN+="_look"; GROUP_SALT=" lookahead-v2" ;;
-    *) echo "HALT_MODE must be binary or steps, got $HALT_MODE"; exit 1 ;;
+  case "$HALT_SIGNAL_HEAD" in
+    linear) ;;
+    mlp|raw) ARM_FLAGS+=(--halt_signal_head="$HALT_SIGNAL_HEAD" --halt_signal_width="$HALT_SIGNAL_WIDTH"); RUN+="_sh${HALT_SIGNAL_HEAD}"
+             [[ "$HALT_SIGNAL_WIDTH" != 32 ]] && RUN+="${HALT_SIGNAL_WIDTH}" ;;
+    *) echo "HALT_SIGNAL_HEAD must be linear, mlp or raw, got $HALT_SIGNAL_HEAD"; exit 1 ;;
   esac
-  case "$READOUT" in
-    thought) ;;
-    sep) ARM_FLAGS+=(--readout_token=sep); RUN+="_sep" ;;
-    sep_mem) ARM_FLAGS+=(--readout_token=sep_mem); RUN+="_sepmem" ;;
-    *) echo "READOUT must be thought, sep or sep_mem, got $READOUT"; exit 1 ;;
-  esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_ALPHA_MIN / HALT_BETA_HEAD / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / HALT_THRESHOLD_FIXED (shared study settings)
-if [[ "$ARM" =~ ^(iso_)?mem$ || "$ARM" == mem_halt ]]; then
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / HALT_MAX_SKIP (shared study settings)
+if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then
   case "$STABLE_SOFTMAX" in
     0) ;;
     1) ARM_FLAGS+=(--stable_softmax); RUN+="_ssm" ;;
     *) echo "STABLE_SOFTMAX must be 0 or 1, got $STABLE_SOFTMAX"; exit 1 ;;
   esac
-fi  # other arms ignore STABLE_SOFTMAX
+  case "$READOUT" in  # SEP is in every pass since 25 Oct; READOUT only picks the readout token
+    thought|sep) ARM_FLAGS+=(--readout_token="$READOUT"); RUN+="_r${READOUT}" ;;
+    *) echo "READOUT must be thought or sep, got $READOUT"; exit 1 ;;
+  esac
+fi  # other arms ignore STABLE_SOFTMAX / READOUT
 case "$THOUGHT_NORM" in
   0) ;;
-  1) [[ "$ARM" =~ ^(iso_)?mem$ || "$ARM" == mem_halt ]] \
-       || { echo "THOUGHT_NORM=1 needs arm mem or mem_halt (or iso_mem)"; exit 1; }
+  1) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] \
+       || { echo "THOUGHT_NORM=1 needs arm iso_mem or mem_halt"; exit 1; }
      ARM_FLAGS+=(--cot_thought_norm); RUN+="_tn" ;;
   *) echo "THOUGHT_NORM must be 0 or 1, got $THOUGHT_NORM"; exit 1 ;;
 esac
@@ -216,16 +192,6 @@ case "$MLP_TYPE" in
   gelu) ARM_FLAGS+=(--mlp_type=gelu); RUN+="_gelu" ;;
   *) echo "MLP_TYPE must be swiglu or gelu, got $MLP_TYPE"; exit 1 ;;
 esac
-[[ "$NUM_EXPERTS" =~ ^[1-9][0-9]*$ && "$MOE_TOP_K" =~ ^[0-9]+$ ]] || { echo "NUM_EXPERTS / MOE_TOP_K must be integers"; exit 1; }
-if [[ "$NUM_EXPERTS" != 1 ]]; then
-  [[ "$ARM" =~ ^(iso_)?mem(_halt)?$ ]] || { echo "NUM_EXPERTS > 1 needs arm mem, iso_mem or mem_halt"; exit 1; }
-  ARM_FLAGS+=(--num_experts="$NUM_EXPERTS" --moe_top_k="$MOE_TOP_K"); RUN+="_moe${NUM_EXPERTS}k${MOE_TOP_K}"
-  if [[ -z "$MLP_WIDTH_SET" ]]; then  # experts of 512 / E: hidden = EXPANSION * 128 (* 2/3 swiglu) = MLP_ROUND_TO
-    (( 512 % NUM_EXPERTS == 0 )) || { echo "NUM_EXPERTS must divide 512, got $NUM_EXPERTS"; exit 1; }
-    MLP_ROUND_TO=$(( 512 / NUM_EXPERTS ))
-    EXPANSION=$(awk -v w="$MLP_ROUND_TO" -v t="$MLP_TYPE" 'BEGIN { print w / 128 * (t == "swiglu" ? 1.5 : 1) }')
-  fi
-fi
 [[ "$MLP_ROUND_TO" =~ ^[1-9][0-9]*$ ]] || { echo "MLP_ROUND_TO must be a positive integer, got $MLP_ROUND_TO"; exit 1; }
 awk -v x="$EXPANSION" 'BEGIN { exit !(x + 0 == x && x > 0) }' || { echo "EXPANSION must be > 0, got $EXPANSION"; exit 1; }
 [[ "$EXPANSION" != 4 ]] && { ARM_FLAGS+=(--fprm_expansion="$EXPANSION"); RUN+="_x${EXPANSION}"; }
@@ -255,12 +221,6 @@ NUM_TIMESTEPS="${NUM_TIMESTEPS:-100000000}"
 if [[ "$NUM_TIMESTEPS" != 100000000 ]]; then
   (( NUM_TIMESTEPS % 1000000 == 0 )) && RUN+="_ts$(( NUM_TIMESTEPS / 1000000 ))M" || RUN+="_ts${NUM_TIMESTEPS}"
 fi
-case "$VALUE_AT_MAX_ITERS" in
-  0) ;;
-  1) [[ "$ARM" =~ ^(iso_)?mem$ ]] || { echo "VALUE_AT_MAX_ITERS=1 needs arm mem or iso_mem"; exit 1; }
-     ARM_FLAGS+=(--value_at_max_iters); RUN+="_vT" ;;
-  *) echo "VALUE_AT_MAX_ITERS must be 0 or 1, got $VALUE_AT_MAX_ITERS"; exit 1 ;;
-esac
 ARM_FLAGS+=(--discount_act="$DISCOUNT_ACT" --discount_compute="$DISCOUNT_COMPUTE")
 [[ "$DISCOUNT_ACT" != 0.99 ]] && RUN+="_ga${DISCOUNT_ACT}"
 [[ "$DISCOUNT_COMPUTE" != 1.0 ]] && RUN+="_gc${DISCOUNT_COMPUTE}"  # suffix kept vs 1.0 so new runs never reuse the old 1.0 run dirs
@@ -273,7 +233,7 @@ HPARAM_FLAGS=(--env_id="slidingpuzzle-${GRID}x${GRID}" --slidingpuzzle_episode_l
   --num_envs=1024 --rollout_length=64 --num_minibatches_per_rollout=64 --num_epochs_per_rollout="$NUM_EPOCHS"
   --num_timesteps="$NUM_TIMESTEPS" --num_eval_steps=100 --num_reset_steps=100 --num_eval_envs=256
   "${ARM_FLAGS[@]}")
-GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}${GROUP_SALT:-}")"
+GROUP="${ARM}_$(uuidgen --sha1 --namespace @oid --name "${HPARAM_FLAGS[*]}")"
 export WANDB_MODE=${WANDB_MODE:-disabled}
 cd "$(dirname "$0")/../.."
 mkdir -p "$OUT/${RUN}"

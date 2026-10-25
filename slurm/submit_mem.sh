@@ -1,17 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# Submits the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem at caps MEM_ITERS,
-# default 2 3 4) on all four environments, 10 seeds each.
+# Submits the fprm_mem study (slurm/mem_study.sh: iso_mem at caps ISO_ITERS, default 1 2 3 4, and mem_halt at caps MEM_HALT_ITERS,
+# default none) on all four environments, 10 seeds each.
 # The runs of an env (every config and seed) are packed onto shared L40S GPUs (48GB, run with CUDA MPS); see bin_pack() below.
 #
 #   slurm/submit_mem.sh                    # submit everything
 #   DRY_RUN=1 slurm/submit_mem.sh          # print the sbatch commands only
 #   ENVS="lightsout slidingpuzzle" slurm/submit_mem.sh
 #   SEEDS="1 2 3" slurm/submit_mem.sh
-#   ISO_ITERS="1 2 4 8" MEM_ITERS="4 8" slurm/submit_mem.sh
+#   ISO_ITERS="1 2 4 8" MEM_HALT_ITERS="4 8" slurm/submit_mem.sh
 #   VALUE_EXPECTILES="0.5 0.7 0.9" ENVS=lightsout slurm/submit_mem.sh
-#   TARGET_KL=0.03 ENVS=lightsout ISO_ITERS=4 MEM_ITERS= slurm/submit_mem.sh
+#   TARGET_KL=0.03 ENVS=lightsout ISO_ITERS=4 slurm/submit_mem.sh
 #   MAX_RUNS_PER_GPU=3 MAX_JOB_HOURS=48 slurm/submit_mem.sh   # longer jobs, 3 runs at a time, the next starting as one ends
 # Optional: REPO_DIR (repo on the cluster), OUT_ROOT (experiment output root, <OUT_ROOT>/<env>/<run>/train.log),
 # LOG_DIR (slurm logs), WANDB_MODE (default offline; `wandb sync` afterwards), WANDB_PROJECT (default looped_actor).
