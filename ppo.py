@@ -157,6 +157,9 @@ class Args:
     halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(path) inside PPO's ratio; 'next' = the softmax over k
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss)
     halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) in J_n
+    halt_prior_coef: float = 0.0          # fprm_mem_halt: weight of KL(p_n || q) at every decision pass, decayed linearly
+                                          # to 0 over training; q favours continuing (0 = off)
+    halt_prior_halt: float = 0.1          # q(k = 0); q(k) = (1 - q(0)) / K for every k >= 1
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
     init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
                                            # checkpoint's core/actor_head/value_head) instead of a fresh random init;
@@ -541,7 +544,7 @@ def main(args: Args):
         ) * truncation_mask
         return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
-    def compute_ppo_loss(params, normalizer_params, data, rng):
+    def compute_ppo_loss(params, normalizer_params, data, rng, progress):
         data, value_targets, advantages = data
 
         next_halt = stochastic_halt and args.halt_objective == 'next'
@@ -629,6 +632,17 @@ def main(args: Args):
                                  'halt_best_k': jnp.sum(jnp.where(valid, best_k, 0)) / n_valid,
                                  'halt_continue_better_frac': jnp.sum(valid & (best_k > 0)) / n_valid})
             halt_log_prob = 0.0
+        if stochastic_halt and args.halt_prior_coef > 0:
+            # Prior on the halting head favouring "continue": KL(p_n || q) at every pass that can decide
+            # (min_think_iters .. T - 1), q(0) = halt_prior_halt and q(k) = (1 - q(0)) / K for k >= 1, weighted by
+            # halt_prior_coef * (1 - progress), so it fades out by the end of training.
+            lp = inter['intermediates']['halt_step_log_probs'][0][args.min_think_iters - 1:-1]  # [decision passes, B, K + 1]
+            K = lp.shape[-1] - 1
+            log_q = jnp.log(jnp.array([args.halt_prior_halt] + [(1 - args.halt_prior_halt) / K] * K))
+            prior_kl = jnp.mean(jnp.sum(jnp.exp(lp) * (lp - log_q), axis=-1))
+            prior_coef = args.halt_prior_coef * jnp.maximum(1.0 - progress, 0.0)
+            halt_loss = halt_loss + prior_coef * prior_kl
+            halt_metrics.update({'halt_prior_kl': prior_kl, 'halt_prior_coef': prior_coef})
         if 'policy_kl_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
             # Per-pass means, each in its own wandb section: log10 of the policy KL_i between passes i and i-1 (KL spans
             # decades, so the mean of the log) and the latent residual.
@@ -661,6 +675,9 @@ def main(args: Args):
 
     use_loss_scale = args.compute_dtype == 'float16' and args.dynamic_loss_scale
 
+    def progress(training_state):  # fraction of training done, in [0, 1]
+        return (training_state.env_steps / args.num_timesteps).astype(jnp.float32)
+
     @jax.jit
     def learn_step(training_state, data, key_sgd):
 
@@ -673,7 +690,7 @@ def main(args: Args):
                     return loss * scale, aux
 
                 (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss
+                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
                 )
                 grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
                 finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
@@ -681,7 +698,7 @@ def main(args: Args):
                 grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
             else:
                 (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss
+                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
                 )
             grad_norm = optax.global_norm(grads)  # pre-clip
             metrics['grad_norm'] = grad_norm

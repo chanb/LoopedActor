@@ -25,6 +25,10 @@
 #                       over k at the sampled c with J_(c+k) - J_c, J_n the clipped importance-weighted return of acting
 #                       with pass n (_hobjnext)
 #   HALT_RHO_MAX=r      mem_halt, HALT_OBJECTIVE=next: clip of the ratio in J_n (default 2; _rho<r> if not 2)
+#   HALT_PRIOR_COEF=b   mem_halt: weight of KL(p_n || q) with q a prior favouring continuing, decayed linearly to 0
+#                       over training (default 0 = off; _hprior<b>)
+#   HALT_PRIOR_HALT=q0  mem_halt, HALT_PRIOR_COEF > 0: the prior's q(k = 0); k >= 1 share the rest (default 0.1;
+#                       _q<q0> if not 0.1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
@@ -124,6 +128,10 @@ if [[ "$ARM" == mem_halt ]]; then
       [[ "${HALT_RHO_MAX:-2}" != 2 ]] && { ARM_FLAGS+=(--halt_rho_max="$HALT_RHO_MAX"); RUN+="_rho${HALT_RHO_MAX}"; } ;;
     *) echo "HALT_OBJECTIVE must be pg or next, got $HALT_OBJECTIVE"; exit 1 ;;
   esac
+  if awk -v b="${HALT_PRIOR_COEF:-0}" 'BEGIN { exit !(b > 0) }'; then
+    ARM_FLAGS+=(--halt_prior_coef="$HALT_PRIOR_COEF"); RUN+="_hprior${HALT_PRIOR_COEF}"
+    [[ "${HALT_PRIOR_HALT:-0.1}" != 0.1 ]] && { ARM_FLAGS+=(--halt_prior_halt="$HALT_PRIOR_HALT"); RUN+="_q${HALT_PRIOR_HALT}"; }
+  fi
   case "$HALT_HEAD_GRAD" in
     0) ;;
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
