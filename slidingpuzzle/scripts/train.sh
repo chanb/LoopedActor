@@ -21,6 +21,10 @@
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
 #   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
+#   HALT_OBJECTIVE=pg|next  mem_halt: train the halting head through PPO's ratio (pg, default) or by comparing the halt at
+#                       the sampled c with one more pass, J_c - J_(c+1), J_n the clipped importance-weighted return of
+#                       acting with pass n (_hobjnext)
+#   HALT_RHO_MAX=r      mem_halt, HALT_OBJECTIVE=next: clip of the ratio in J_n (default 2; _rho<r> if not 2)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
@@ -114,6 +118,12 @@ esac
 if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
+  case "${HALT_OBJECTIVE:-pg}" in
+    pg) ;;
+    next) ARM_FLAGS+=(--halt_objective=next); RUN+="_hobjnext"
+      [[ "${HALT_RHO_MAX:-2}" != 2 ]] && { ARM_FLAGS+=(--halt_rho_max="$HALT_RHO_MAX"); RUN+="_rho${HALT_RHO_MAX}"; } ;;
+    *) echo "HALT_OBJECTIVE must be pg or next, got $HALT_OBJECTIVE"; exit 1 ;;
+  esac
   case "$HALT_HEAD_GRAD" in
     0) ;;
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;

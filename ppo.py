@@ -154,6 +154,9 @@ class Args:
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw')
     halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(path) inside PPO's ratio; 'next' = the halt at the
+                                          # sampled c against one more pass, J_c - J_(c+1) (see the loss)
+    halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) in J_n
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
     init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
                                            # checkpoint's core/actor_head/value_head) instead of a fresh random init;
@@ -541,7 +544,9 @@ def main(args: Args):
     def compute_ppo_loss(params, normalizer_params, data, rng):
         data, value_targets, advantages = data
 
-        behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
+        next_halt = stochastic_halt and args.halt_objective == 'next'
+        # The rollout's log mu(c, a | s), or log mu(a | s) alone when the halting head has its own objective.
+        behaviour_action_log_probs = data.extras['policy_extras']['action_log_prob' if next_halt else 'log_prob']
 
         def ppo_terms(policy_dist, baseline, halt_log_prob=0.0):
             # Policy function loss (stochastic halting: joint log p(c|s) + log pi_c(a|s))
@@ -601,6 +606,27 @@ def main(args: Args):
             halt_metrics['latent_res_at_c'] = jnp.mean(res_c)
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
+        halt_loss = 0.0
+        if next_halt:
+            # The halting head compares the halt at the rollout's think time c with one more pass: J_n = discount_compute^(n - c)
+            # * min(pi_n(a|s) / mu(a|s), rho_max) * G estimates the return of acting with pass n (mu the behaviour policy,
+            # G the return target, which carries discount_compute^(c - 1)), and D = J_c - J_(c+1) pushes log p_c(k = 0) up
+            # when halting is better, down otherwise. A think time at the cap (c = T) has no halt decision and no c + 1.
+            # PPO's ratio then covers pi_c(a|s) alone.
+            lp_a = jnp.take_along_axis(inter['intermediates']['policy_log_probs_t'][0], data.action[None, :, None].astype(jnp.int32), axis=-1)[..., 0]
+            rho = jnp.minimum(jnp.exp(lp_a - data.extras['policy_extras']['action_log_prob']), args.halt_rho_max)  # [T, B]
+            T_max = rho.shape[0]
+            c = data.extras['policy_extras']['compute_time'].astype(jnp.int32)
+            at = lambda x, n: jnp.take_along_axis(x, (jnp.clip(n, 1, T_max) - 1)[None], axis=0)[0]
+            D = jax.lax.stop_gradient((at(rho, c) - args.discount_compute * at(rho, c + 1)) * value_targets)
+            valid = c < T_max
+            lp_halt = at(inter['intermediates']['halt_step_log_probs'][0][..., 0], c)
+            n_valid = jnp.maximum(jnp.sum(valid), 1)
+            halt_loss = -jnp.sum(jnp.where(valid, D * lp_halt, 0.0)) / n_valid
+            halt_metrics.update({'halt_loss': halt_loss, 'halt_rho_clip_frac': jnp.mean(rho >= args.halt_rho_max),
+                                 'halt_next_adv': jnp.sum(jnp.where(valid, D, 0.0)) / n_valid,
+                                 'halt_next_better_frac': jnp.sum(valid & (D < 0)) / n_valid})
+            halt_log_prob = 0.0
         if 'policy_kl_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
             # Per-pass means, each in its own wandb section: log10 of the policy KL_i between passes i and i-1 (KL spans
             # decades, so the mean of the log) and the latent residual.
@@ -615,7 +641,7 @@ def main(args: Args):
 
         think_iters = inter['intermediates']['fp_iterations'][0]
 
-        total_loss = policy_loss + v_loss + entropy_loss
+        total_loss = policy_loss + v_loss + entropy_loss + halt_loss
 
         return total_loss, {
             **halt_metrics,

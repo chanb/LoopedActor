@@ -71,8 +71,8 @@ halting gradient.
 Sown intermediates: 'logits'/'value' (at the chosen c), 'fp_iterations' (= c), 'fp_residual' (S_{c+1}, the signal that
 decided the halt; KL_T without halting), 'fp_converged' / 'fp_stop_reason', 'halt_signal_t' (S_i by pass, [T, B],
 unshifted), with halting also 'halt_log_prob'
-(log p(path | s)), 'halt_entropy', 'halt_path', 'halt_prob' (p_n(0), [T, B]) and 'halt_step_probs' (p_n(k),
-[T, B, K + 1]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
+(log p(path | s)), 'halt_entropy', 'halt_path', 'halt_prob' (p_n(0), [T, B]), 'halt_step_probs' (p_n(k),
+[T, B, K + 1]), 'halt_step_log_probs' (log p_n(k), [T, B, K + 1]) and 'policy_log_probs_t' (log pi_n by pass, [T, B, A]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
 against uniform) and 'latent_residual_t' (the max-token residual of the cell latents between consecutive passes, as
 fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
 """
@@ -450,6 +450,8 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_signal_t', sig_t)
         if self.halting:
             c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1])
+            self.sow('intermediates', 'policy_log_probs_t',
+                     (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t))
         else:
             c, sig_c = jnp.full((B,), T, jnp.int32), sig_t[-1]
         idx = c - 1
@@ -493,4 +495,5 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_log_prob', halt_log_prob.reshape(batch_shape))
         self.sow('intermediates', 'halt_entropy', halt_entropy.reshape(batch_shape))
         self.sow('intermediates', 'halt_prob', h_t)
+        self.sow('intermediates', 'halt_step_log_probs', lp_t)
         return c, sig_c
