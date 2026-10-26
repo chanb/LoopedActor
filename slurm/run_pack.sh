@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=aip-schuurma
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 # --time, --mem, --cpus-per-task and --output are set per job by submit_mem.sh.
 
 # Runs a pack of train.sh commands on one GPU (CUDA MPS), one per line: $CONCURRENCY at a time (0 or unset = all at
