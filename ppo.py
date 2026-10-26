@@ -155,6 +155,15 @@ class Args:
     halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
+    init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
+                                           # checkpoint's core/actor_head/value_head) instead of a fresh random init;
+                                           # groups the checkpoint lacks (e.g. fprm_mem_halt's halt_hidden/halt_out
+                                           # on an iso_mem checkpoint) stay freshly initialized. Also loads its
+                                           # normalizer_params. Expects the (params, normalizer_params) tuple format
+                                           # save_params()/load_params() use.
+    freeze_except_halt: bool = False      # fprm_mem_halt: zero the optimizer update for every param group except
+                                           # halt_hidden/halt_out - trains only the halting head, typically paired
+                                           # with init_checkpoint pointed at a halting=False checkpoint
 
 
 @flax.struct.dataclass
@@ -237,7 +246,9 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     return make_policy
 
 
-def make_optimizer(args):
+def make_optimizer(args, init_params=None):
+    """init_params is only needed (and required) when args.freeze_except_halt - its pytree structure builds the
+    freeze mask: True (trained) for halt_hidden/halt_out, False (frozen, zero update) for every other param group."""
     if args.anneal_lr:
         total_grad_steps = (
             args.num_training_step
@@ -252,6 +263,14 @@ def make_optimizer(args):
     tx = optax.adam(learning_rate=learning_rate)
     if args.max_grad_norm > 0.0:
         tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx)
+    if args.freeze_except_halt:
+        assert init_params is not None, "freeze_except_halt needs init_params to build the freeze mask"
+        # optax.masked() passes ungated gradients through unchanged for mask=False leaves - not a freeze. Use
+        # multi_transform instead: 'frozen' groups get optax.set_to_zero(), an actual zero update.
+        train_groups = {'halt_hidden', 'halt_out'}
+        labels = {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in train_groups else 'frozen', v)
+                              for k, v in init_params['params'].items()}}
+        tx = optax.multi_transform({'train': tx, 'frozen': optax.set_to_zero()}, labels)
     return tx
 
 
@@ -377,11 +396,22 @@ def main(args: Args):
     else:
         raise ValueError(f"Unknown architecture: {args.architecture}")
 
+    init_params = actor_critic_network.init(key_policy, x=jnp.zeros((1, obs_size + goal_size)))
+    init_normalizer = running_statistics.init_state((obs_size + goal_size,))
+    if args.init_checkpoint:
+        ckpt_params, ckpt_normalizer = load_params(args.init_checkpoint)
+        # Overwrite every param group the checkpoint has; a group it lacks (e.g. fprm_mem_halt's halt_hidden/
+        # halt_out on a halting=False checkpoint) stays at its fresh init above.
+        merged = dict(init_params['params'])
+        merged.update(ckpt_params['params'])
+        init_params = {'params': merged}
+        init_normalizer = ckpt_normalizer
+
     training_state = PPOTrainingState.create(
         apply_fn=None,
-        params=actor_critic_network.init(key_policy, x=jnp.zeros((1, obs_size + goal_size))),
-        tx=make_optimizer(args),
-        normalizer_params=running_statistics.init_state((obs_size + goal_size,)),
+        params=init_params,
+        tx=make_optimizer(args, init_params),
+        normalizer_params=init_normalizer,
         env_steps=np.zeros((), dtype=np.float64),
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
