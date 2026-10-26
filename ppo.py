@@ -562,21 +562,22 @@ def main(args: Args):
             halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
             path = data.extras['policy_extras']['halt_path']
             halt_metrics['halt_decisions'] = jnp.mean(jnp.sum((path[..., None] >> jnp.arange(32)) & 1, axis=-1).astype(jnp.float32))
-            # Per-pass means, each in its own wandb section: p_i(k = 0) (the halting probability at a decision at pass i),
-            # log10 of the policy KL_i between passes i and i-1 (KL spans decades, so the mean of the log) and the
-            # latent residual (below).
+            # Per-pass mean p_i(k = 0), the halting probability at a decision at pass i, in its own wandb section.
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob/pass_{i + 1:02d}': mean_h[i] for i in range(mean_h.shape[0])})
-            log_kl = jnp.mean(jnp.log10(jnp.maximum(inter['intermediates']['policy_kl_t'][0], 0.0) + 1e-10), axis=-1)
-            halt_metrics.update({f'halt_log10_kl/pass_{i + 1:02d}': log_kl[i] for i in range(log_kl.shape[0])})
-            # Latent residual between consecutive passes: at the sampled (halted) c, and its mean at every pass.
-            res_t = inter['intermediates']['latent_residual_t'][0]  # [T, B]
+            # Latent residual between consecutive passes at the sampled (halted) c.
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)
-            halt_metrics['latent_res_at_c'] = jnp.mean(jnp.take_along_axis(res_t, c_idx[None], axis=0))
-            mean_res = jnp.mean(res_t, axis=-1)
-            halt_metrics.update({f'latent_res/pass_{i + 1:02d}': mean_res[i] for i in range(mean_res.shape[0])})
+            res_c = jnp.take_along_axis(inter['intermediates']['latent_residual_t'][0], c_idx[None], axis=0)
+            halt_metrics['latent_res_at_c'] = jnp.mean(res_c)
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
+        if 'policy_kl_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
+            # Per-pass means, each in its own wandb section: log10 of the policy KL_i between passes i and i-1 (KL spans
+            # decades, so the mean of the log) and the latent residual.
+            log_kl = jnp.mean(jnp.log10(jnp.maximum(inter['intermediates']['policy_kl_t'][0], 0.0) + 1e-10), axis=-1)
+            halt_metrics.update({f'halt_log10_kl/pass_{i + 1:02d}': log_kl[i] for i in range(log_kl.shape[0])})
+            mean_res = jnp.mean(inter['intermediates']['latent_residual_t'][0], axis=-1)
+            halt_metrics.update({f'latent_res/pass_{i + 1:02d}': mean_res[i] for i in range(mean_res.shape[0])})
         policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
             distrax.Categorical(logits=logits), values, halt_log_prob
         )
