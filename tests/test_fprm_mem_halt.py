@@ -270,13 +270,13 @@ def test_every_head_starts_uniform(K, signal, head):
 
 @pytest.mark.parametrize('K', [1, 4])
 def test_raw_kl_head_reads_both_policies(K):
-    # The decision at pass 1 is softmax(g([pi_1, pi_2])); pi_n = the policy of an n-pass net.
+    # The decision at pass 1 is softmax(g([log pi_1, log pi_2])); pi_n = the policy of an n-pass net.
     kw, x, _, params = _signal_head_case(K, 'kl', 'raw')
-    pi = [jax.nn.softmax(_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=n, **kw), params, x,
+    log_pi = [jax.nn.log_softmax(_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=n, **kw), params, x,
                                         halt_steps=jnp.full((3,), n), halt_path=jnp.zeros((3,), int))['logits'], -1)
           for n in (1, 2)]  # replaying c = n just selects pi_n
     hid, out = params['halt_hidden'], params['halt_out']
-    g = jax.nn.gelu(jnp.concatenate(pi, -1) @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
+    g = jax.nn.gelu(jnp.concatenate(log_pi, -1) @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
     assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'][0], jax.nn.softmax(g, -1), atol=1e-4)
 
 

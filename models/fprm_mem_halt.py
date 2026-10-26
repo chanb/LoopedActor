@@ -33,7 +33,7 @@ which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergenc
 zero-initialized output layer, so k is uniform at init:
   'none':     p_n = softmax(MLP(rms_norm(h_n)))                      no signal, no lookahead (ACT / PonderNet style)
   'distance': p_n = softmax(MLP(log S_{n+1}))
-  'raw':      p_n = softmax(MLP([z_n, z_{n+1}]))                     z = probability vectors or rms_norm(h)
+  'raw':      p_n = softmax(MLP([z_n, z_{n+1}]))                     z = log pi (log-softmax) or rms_norm(h)
 'distance' and 'raw' look one pass ahead: pass n+1 is computed, and if the head halts, pass n acts (c = n means "pass
 n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
 stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
@@ -393,7 +393,8 @@ class FPRMMemHaltActorValue(nn.Module):
             elif self.halt_head == 'distance':
                 x = jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None]
             elif self.halt_signal == 'kl':
-                x = sg(jnp.concatenate([jax.nn.softmax(logits_prev, -1), jax.nn.softmax(logits, -1)], -1))
+                log_softmax = stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax
+                x = sg(jnp.concatenate([log_softmax(logits_prev), log_softmax(logits)], -1))
             else:
                 x = sg(jnp.concatenate([rms_norm(h_prev, eps=cfg.rms_norm_eps), rms_norm(h, eps=cfg.rms_norm_eps)], -1))
             return jnp.where(finite[:, None], self._halt_mlp(x.astype(jnp.float32)), 0.0)
