@@ -21,9 +21,9 @@
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
 #   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_OBJECTIVE=pg|next  mem_halt: train the halting head through PPO's ratio (pg, default) or by comparing the halt at
-#                       the sampled c with one more pass, J_c - J_(c+1), J_n the clipped importance-weighted return of
-#                       acting with pass n (_hobjnext)
+#   HALT_OBJECTIVE=pg|next  mem_halt: train the halting head through PPO's ratio (pg, default) or by scoring its softmax
+#                       over k at the sampled c with J_(c+k) - J_c, J_n the clipped importance-weighted return of acting
+#                       with pass n (_hobjnext)
 #   HALT_RHO_MAX=r      mem_halt, HALT_OBJECTIVE=next: clip of the ratio in J_n (default 2; _rho<r> if not 2)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
