@@ -33,7 +33,7 @@
 #                       (_hhdist) or on [z_n, z_(n+1)] (_hhraw) (default distance). distance / raw look ahead: decide
 #                       on pass c+1, act with pi_c (_look)
 #   HALT_SIGNAL=kl|latent  mem_halt, HALT_HEAD=distance|raw: z = the policies, S = KL; or z = the readout latents h,
-#                       S = ||h_(n+1) - h_n|| (_hlat) (default kl)
+#                       S = ||rms_norm(h_(n+1)) - rms_norm(h_n)|| (_hlat) (default kl)
 #   HALT_HEAD_WIDTH=W   mem_halt: hidden width of the halting MLP (default 32; run names get W if not 32)
 #   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;

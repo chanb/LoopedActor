@@ -28,7 +28,7 @@ every pass (h_n = p_n(0)); K = 4 can skip up to 4 passes at once.
 What a decision at pass n reads. Let h_n be the latent at the readout head (the readout token's output at pass n, from
 which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergence test compares and its distance S:
   'kl':     z_n = pi_n,  S_{n+1} = KL(pi_{n+1} || pi_n)
-  'latent': z_n = h_n,   S_{n+1} = ||h_{n+1} - h_n||   (L2)
+  'latent': z_n = h_n,   S_{n+1} = ||rms_norm(h_{n+1}) - rms_norm(h_n)||   (L2 of what the readout heads read)
 `halt_head` picks the head, each a one-hidden-layer GELU MLP (width `halt_head_width`) with K + 1 outputs and a
 zero-initialized output layer, so k is uniform at init:
   'none':     p_n = softmax(MLP(rms_norm(h_n)))                      no signal, no lookahead (ACT / PonderNet style)
@@ -430,7 +430,8 @@ class FPRMMemHaltActorValue(nn.Module):
             kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: against uniform (logits_init = 0), unused
             h_prev, h_new = (z[:, P], z_cells[:, P]) if sep else (token, out)  # latents at the readout head
             if self.halt_signal == 'latent':  # L2; pass 1: against the initial latent, unused
-                sig = jnp.linalg.norm(jax.lax.stop_gradient(h_new - h_prev).astype(jnp.float32), axis=-1)
+                dh = rms_norm(h_new, eps=cfg.rms_norm_eps) - rms_norm(h_prev, eps=cfg.rms_norm_eps)
+                sig = jnp.linalg.norm(jax.lax.stop_gradient(dh).astype(jnp.float32), axis=-1)
             else:
                 sig = kl
             logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite) if self.halting

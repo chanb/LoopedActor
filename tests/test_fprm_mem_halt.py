@@ -157,13 +157,15 @@ def test_distance_head_reads_the_next_signal(K, signal):
 
 
 def test_latent_signal_is_l2_of_readout_latents():
-    # S_i = ||h_i - h_{i-1}|| with h the readout token's latent: finite and positive (the passes differ); the signal changes
-    # only S, not the passes (the same KLs).
+    # S_i = ||rms_norm(h_i) - rms_norm(h_{i-1})|| with h the readout token's latent: finite and positive (the passes differ);
+    # the signal changes only S, not the passes (the same KLs).
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     net = _net(halt_signal='latent')
     params = net.init(jax.random.PRNGKey(0), x)['params']
     sig = _intermediates(net, params, x)['halt_signal_t']
     assert bool(jnp.all(jnp.isfinite(sig))) and bool(jnp.all(sig > 0))
+    # pass 1 compares against the zero initial thought (rms_norm(0) = 0), so S_1 = ||rms_norm(h_1)|| = sqrt(d_model)
+    assert jnp.allclose(sig[0], CFG.d_model ** 0.5, rtol=1e-3)
     # kl and latent see the same passes; only S differs
     kl_net = _net(halt_signal='kl')
     assert jnp.allclose(_intermediates(kl_net, params, x)['policy_kl_t'], _intermediates(net, params, x)['policy_kl_t'])
