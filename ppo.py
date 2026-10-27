@@ -151,6 +151,8 @@ class Args:
     halt_signal: str = 'kl'               # fprm_mem_halt: what the distance / raw heads compare: 'kl' (the policies) | 'latent' (the readout latents, L2)
     halt_max_skip: int = 1                # fprm_mem_halt: each halting decision picks 0..this more passes (0 = halt; 1 = yes/no at every pass)
     readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
+    value_token: str = ''                 # fprm_mem / fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': where the value is read from
+    halt_token: str = ''                  # fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': the halting head's h_n (halt_head=none or halt_signal=latent)
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw')
     halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
@@ -383,6 +385,8 @@ def main(args: Args):
             halt_head=args.halt_head,
             halt_head_width=args.halt_head_width,
             readout_token=args.readout_token,
+            value_token=args.value_token,
+            halt_token=args.halt_token,
             halt_max_skip=args.halt_max_skip,
             output_dim_1=action_size,
             obs_channels=obs_channels,

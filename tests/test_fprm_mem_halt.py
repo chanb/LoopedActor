@@ -198,6 +198,23 @@ def test_sep_token_in_every_pass():
         assert float(jnp.abs(jax.grad(value_sum)(params['sep'])).sum()) > 0
 
 
+@pytest.mark.parametrize('signal,head', [('kl', 'none'), ('latent', 'distance'), ('latent', 'raw')])
+def test_value_and_halt_tokens(signal, head):
+    # value_token / halt_token move one readout to the other token: the action stays with readout_token's, the value
+    # and the halting head match readout_token='sep'.
+    kw = dict(action_head='readout', output_dim_1=4, min_think_iters=1, halt_signal=signal, halt_head=head)
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = _random_head(_net(**kw).init(jax.random.PRNGKey(0), x)['params'])
+    out = {r: _intermediates(_net(readout_token=r, **kw), params, x) for r in ('thought', 'sep')}
+    split = _intermediates(_net(readout_token='thought', value_token='sep', halt_token='sep', **kw), params, x)
+    assert jnp.allclose(split['policy_log_probs_t'], out['thought']['policy_log_probs_t'], atol=1e-6)
+    assert jnp.allclose(split['value'], out['sep']['value'], atol=1e-6)
+    assert jnp.allclose(split['halt_step_probs'], out['sep']['halt_step_probs'], atol=1e-6)
+    assert not jnp.allclose(split['halt_step_probs'], out['thought']['halt_step_probs'], atol=1e-4)
+    with pytest.raises(AssertionError):  # the KL heads never read h_n
+        _net(halt_token='sep', **{**kw, 'halt_signal': 'kl', 'halt_head': 'distance'}).init(jax.random.PRNGKey(0), x)
+
+
 @pytest.mark.parametrize('min_iters', [1, 2])
 def test_step_path_probabilities_sum_to_one(min_iters):
     T = 7

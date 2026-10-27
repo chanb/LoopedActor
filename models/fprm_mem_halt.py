@@ -42,7 +42,10 @@ Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose lat
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
 memory keeps. `readout_token` picks where every readout (logits, value, the halting head's input) comes from: the
 thought's output ('thought') or SEP's latent ('sep'; the thoughts then only feed the memory and the next thought, so
-they need not be decodable as a policy themselves).
+they need not be decodable as a policy themselves). `value_token` / `halt_token` ('' = readout_token) move the value
+or the halting head's h_n to the other token, e.g. readout_token='thought', value_token='sep', halt_token='sep': the
+thought acts, SEP evaluates and decides the halt. halt_token only matters where the head reads h_n (halt_head='none'
+or halt_signal='latent'), so it must equal readout_token otherwise.
 
 The PPO ratio scores the sampled path, log p(path) = sum of the log-probabilities of its decisions (all k that reach
 the cap count as one outcome), so the rollout stores the decision passes (`halt_path`, a bitmask) along with c. For
@@ -290,6 +293,8 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' (see the module docstring)
     halt_head_width: int = 32      # hidden width of the halting MLP
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
+    value_token: str = ''          # '' (= readout_token) | 'thought' | 'sep': where the value is read from
+    halt_token: str = ''           # '' (= readout_token) | 'thought' | 'sep': where the halting head's h_n is read from
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -305,6 +310,11 @@ class FPRMMemHaltActorValue(nn.Module):
         assert not self.halting or self.halt_max_skip >= 1
         assert self.halt_signal in ('kl', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
+        assert self.value_token in ('', 'thought', 'sep'), self.value_token
+        assert self.halt_token in ('', 'thought', 'sep'), self.halt_token
+        assert (self.halt_token or self.readout_token) == self.readout_token or (
+            self.halting and (self.halt_head == 'none' or self.halt_signal == 'latent')), \
+            'halt_token only matters for halt_head=none or halt_signal=latent'
         assert self.halt_head in ('none', 'distance', 'raw'), self.halt_head
         if self.halting:
             self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
@@ -368,17 +378,19 @@ class FPRMMemHaltActorValue(nn.Module):
         core_p, actor_p, value_p = params['core'], params['actor_head'], params['value_head']
 
         sep = self.readout_token == 'sep'
+        value_sep = (self.value_token or self.readout_token) == 'sep'
+        halt_sep = (self.halt_token or self.readout_token) == 'sep'
         sep_in = jnp.broadcast_to(self.sep, (B, 1, H))
 
-        def readout(z_cells, out):
-            last_latent = rms_norm(out, eps=cfg.rms_norm_eps)
+        def readout(z_cells, act_latent, value_latent):
             if per_cell:
                 cell_latents = rms_norm(z_cells, eps=cfg.rms_norm_eps)
                 logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
             else:
-                logits = last_latent @ actor_p['kernel'] + actor_p['bias']
+                logits = rms_norm(act_latent, eps=cfg.rms_norm_eps) @ actor_p['kernel'] + actor_p['bias']
             assert logits.shape[-1] == self.output_dim_1, (logits.shape, self.output_dim_1)
-            value = jnp.squeeze(last_latent @ value_p['kernel'] + value_p['bias'], axis=-1)
+            value_latent = rms_norm(value_latent, eps=cfg.rms_norm_eps)
+            value = jnp.squeeze(value_latent @ value_p['kernel'] + value_p['bias'], axis=-1)
             return logits, value
 
         bot = jnp.broadcast_to(self.bot, (B, H))
@@ -417,7 +429,7 @@ class FPRMMemHaltActorValue(nn.Module):
             mem_v = jnp.where(write[None, None, :, None, None], jnp.stack([v for _, v in thought_kv])[:, :, None], mem_v)
 
             z_cells, out = h[:, :-1], h[:, -1]  # z_cells: cells + SEP
-            logits, value = readout(z_cells[:, :P], z_cells[:, P] if sep else out)
+            logits, value = readout(z_cells[:, :P], z_cells[:, P] if sep else out, z_cells[:, P] if value_sep else out)
             finite = (jnp.all(jnp.isfinite(logits), axis=-1) & jnp.isfinite(value)
                       & jnp.all(jnp.isfinite(out), axis=-1) & jnp.all(jnp.isfinite(z_cells), axis=(-2, -1)))
             z_cells = jnp.where(finite[:, None, None], z_cells, z)
@@ -433,7 +445,7 @@ class FPRMMemHaltActorValue(nn.Module):
                 lp_q, lp_p = jax.nn.log_softmax(z_q, axis=-1), jax.nn.log_softmax(z_p, axis=-1)
                 kl = jnp.sum(jnp.exp(lp_q) * (lp_q - lp_p), axis=-1)
             kl = jax.lax.stop_gradient(kl).astype(jnp.float32)  # pass 1: against uniform (logits_init = 0), unused
-            h_prev, h_new = (z[:, P], z_cells[:, P]) if sep else (token, out)  # latents at the readout head
+            h_prev, h_new = (z[:, P], z_cells[:, P]) if halt_sep else (token, out)  # latents at the halting head
             if self.halt_signal == 'latent':  # L2; pass 1: against the initial latent, unused
                 dh = rms_norm(h_new, eps=cfg.rms_norm_eps) - rms_norm(h_prev, eps=cfg.rms_norm_eps)
                 sig = jnp.linalg.norm(jax.lax.stop_gradient(dh).astype(jnp.float32), axis=-1)
