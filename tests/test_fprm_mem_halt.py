@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fprm import FPRMConfig  # noqa: E402
 from models.fprm_mem_halt import (  # noqa: E402
-    FPRMMemHaltActorValue, best_step_path, step_path_entropy, step_path_log_prob,
+    FPRMMemHaltActorValue, best_step_path, sample_step_path, step_decision_log_probs, step_path_entropy, step_path_log_prob,
 )
 
 CFG = FPRMConfig(d_model=16, num_heads=2)
@@ -308,3 +308,13 @@ def test_no_halting_acts_with_the_last_pass():
     forced = _intermediates(_net(), {**params, **head}, x, halt_steps=jnp.full((3,), 4),
                             halt_path=jnp.full((3,), _k1_path(4, 2, 4)))
     assert jnp.allclose(iso['logits'], forced['logits'], atol=1e-6) and jnp.allclose(iso['value'], forced['value'], atol=1e-6)
+
+
+def test_step_decision_log_probs_sum_to_path():
+    T, B, K = 8, 5, 4
+    lp = jax.nn.log_softmax(jax.random.normal(jax.random.PRNGKey(3), (T, B, K + 1)), axis=-1)
+    mask, c = sample_step_path(lp, 1, jax.random.PRNGKey(4))
+    d = step_decision_log_probs(lp, mask, c)
+    dec = ((mask[None] >> jnp.arange(T)[:, None]) & 1) == 1
+    assert jnp.allclose(jnp.sum(d, axis=0), step_path_log_prob(lp, mask, c), atol=1e-6)
+    assert jnp.all(jnp.where(dec, True, d == 0.0)) and jnp.all(jnp.where(dec, d < 0.0, True))

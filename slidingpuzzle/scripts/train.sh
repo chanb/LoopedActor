@@ -24,6 +24,8 @@
 #   HALT_OBJECTIVE=pg|next  mem_halt: train the halting head through PPO's ratio (pg, default) or by scoring its softmax
 #                       over k at the sampled c with J_(c+k) - J_c, J_n the clipped importance-weighted return of acting
 #                       with pass n (_hobjnext)
+#   HALT_CLIP=joint|path|each  mem_halt, HALT_OBJECTIVE=pg: one PPO clip over the joint ratio p(path) pi_c(a|s) (joint,
+#                       default), or pi_c(a|s) clipped apart from p(path) as a whole (_hclippath) or from each decision (_hclipeach)
 #   HALT_RHO_MAX=r      mem_halt, HALT_OBJECTIVE=next: clip of the ratio in J_n (default 2; _rho<r> if not 2)
 #   HALT_PRIOR_COEF=b   mem_halt: weight of KL(p_n || q) with q a prior favouring continuing, decayed linearly to 0
 #                       over training (default 0 = off; _hprior<b>)
@@ -123,7 +125,11 @@ if [[ "$ARM" == mem_halt ]]; then
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
   case "${HALT_OBJECTIVE:-pg}" in
-    pg) ;;
+    pg) case "${HALT_CLIP:-joint}" in
+          joint) ;;
+          path|each) ARM_FLAGS+=(--halt_clip="$HALT_CLIP"); RUN+="_hclip${HALT_CLIP}" ;;
+          *) echo "HALT_CLIP must be joint, path or each, got $HALT_CLIP"; exit 1 ;;
+        esac ;;
     next) ARM_FLAGS+=(--halt_objective=next); RUN+="_hobjnext"
       [[ "${HALT_RHO_MAX:-2}" != 2 ]] && { ARM_FLAGS+=(--halt_rho_max="$HALT_RHO_MAX"); RUN+="_rho${HALT_RHO_MAX}"; } ;;
     *) echo "HALT_OBJECTIVE must be pg or next, got $HALT_OBJECTIVE"; exit 1 ;;

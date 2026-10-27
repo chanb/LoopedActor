@@ -156,6 +156,8 @@ class Args:
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(path) inside PPO's ratio; 'next' = the softmax over k
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss)
+    halt_clip: str = 'joint'              # halt_objective='pg': PPO clip of one ratio over log p(path) + log pi_c(a|s) ('joint'),
+                                          # or of pi_c(a|s) apart from p(path) as a whole ('path') or from each decision ('each')
     halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) in J_n
     halt_prior_coef: float = 0.0          # fprm_mem_halt: weight of KL(p_n || q) at every decision pass, decayed linearly
                                           # to 0 over training; q favours continuing (0 = off)
@@ -246,6 +248,7 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
             }
             if 'halt_path' in inter['intermediates']:  # fprm_mem_halt: the loss replays the decision passes too
                 extras['halt_path'] = inter['intermediates']['halt_path'][0]
+                extras['halt_decision_log_probs'] = inter['intermediates']['halt_decision_log_probs'][0]
             return actions, extras
 
         return policy
@@ -364,6 +367,7 @@ def main(args: Args):
         )
     elif args.architecture in ('fprm_mem', 'fprm_mem_halt'):
         assert args.halt_criterion == 'kl', "fprm_mem / fprm_mem_halt support only halt_criterion='kl'"
+        assert args.halt_clip in ('joint', 'path', 'each'), f"halt_clip must be joint, path or each, got {args.halt_clip}"
         actor_critic_network = FPRMMemHaltActorValue(
             halting=args.architecture == 'fprm_mem_halt',
             m=env.m,
@@ -551,14 +555,28 @@ def main(args: Args):
         # The rollout's log mu(c, a | s), or log mu(a | s) alone when the halting head has its own objective.
         behaviour_action_log_probs = data.extras['policy_extras']['action_log_prob' if next_halt else 'log_prob']
 
-        def ppo_terms(policy_dist, baseline, halt_log_prob=0.0):
+        halt_clip = args.halt_clip if stochastic_halt and not next_halt else 'joint'
+
+        def surrogate(log_rho):  # PPO's clipped surrogate of one ratio
+            rho = jnp.exp(log_rho)
+            return jnp.minimum(rho * advantages, jnp.clip(rho, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
+
+        def ppo_terms(policy_dist, baseline, halt_log_prob=0.0, halt_decision_log_probs=None):
             # Policy function loss (stochastic halting: joint log p(c|s) + log pi_c(a|s))
             target_pi_log_probs = policy_dist.log_prob(data.action)
             target_action_log_probs = target_pi_log_probs + halt_log_prob
-            rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
-            surrogate_loss1 = rho_s * advantages
-            surrogate_loss2 = (jnp.clip(rho_s, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
-            policy_loss = -jnp.mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
+            if halt_clip == 'joint':
+                policy_loss = -jnp.mean(surrogate(target_action_log_probs - behaviour_action_log_probs))
+            else:  # the action's surrogate, plus the halting path's ('path') or each decision's ('each')
+                mu_pi = data.extras['policy_extras']['action_log_prob']
+                policy_loss = -jnp.mean(surrogate(target_pi_log_probs - mu_pi))
+                if halt_clip == 'path':
+                    policy_loss -= jnp.mean(surrogate(halt_log_prob - (behaviour_action_log_probs - mu_pi)))
+                else:
+                    mu_dec = data.extras['policy_extras']['halt_decision_log_probs']  # [B, T]
+                    dec = (data.extras['policy_extras']['halt_path'][:, None] >> jnp.arange(mu_dec.shape[-1])) & 1
+                    s_dec = jax.vmap(surrogate, in_axes=1, out_axes=1)(halt_decision_log_probs - mu_dec)
+                    policy_loss -= jnp.mean(jnp.sum(jnp.where(dec == 1, s_dec, 0.0), axis=-1))
 
             # Value function loss: expectile regression (tau = 0.5 gives the MSE 0.25 * mean(v_error^2)).
             v_error = value_targets - baseline
@@ -651,7 +669,8 @@ def main(args: Args):
             mean_res = jnp.mean(inter['intermediates']['latent_residual_t'][0], axis=-1)
             halt_metrics.update({f'latent_res/pass_{i + 1:02d}': mean_res[i] for i in range(mean_res.shape[0])})
         policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
-            distrax.Categorical(logits=logits), values, halt_log_prob
+            distrax.Categorical(logits=logits), values, halt_log_prob,
+            inter['intermediates']['halt_decision_log_probs'][0] if halt_clip == 'each' else None,
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
 
