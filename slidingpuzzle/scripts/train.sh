@@ -46,6 +46,14 @@
 #                       on pass c+1, act with pi_c (_look)
 #   HALT_SIGNAL=kl|latent  mem_halt, HALT_HEAD=distance|raw: z = the policies, S = KL; or z = the readout latents h,
 #                       S = ||rms_norm(h_(n+1)) - rms_norm(h_n)|| (_hlat) (default kl)
+#   HALT_HEAD=convtest  mem_halt: learned convergence test, logit_halt_n = theta0 + theta1 f_n (+ o_n), f_n = log of the
+#                       estimated distance to the fixed point from S_(n+1), S_n (_hhconv; needs HALT_SIGNAL=latent,
+#                       HALT_MAX_SKIP=1, MIN_THINK_ITERS=1). Its settings (run-name suffix only when not the default):
+#     HALT_OFFSET=none|uniform  o_n = -log(T - n), c ~ Uniform{1..T} at init (_hoffuniform; default none)
+#     HALT_REPLAY=1|0     the loss replays the rollout's features (default 1; 0: _hnoreplay)
+#     HALT_PRECOND=1|0    SGD on Sigma^-1 g, Sigma the decisions' Fisher (default 1; 0: Adam, _hnoprecond)
+#     HALT_LR=lr          learning rate of theta0 / theta1 (default 1e-2; _hlr<lr>)
+#     HALT_DAMPING=d      damping added to Sigma (default 1e-3; _hdamp<d>)
 #   HALT_HEAD_WIDTH=W   mem_halt: hidden width of the halting MLP (default 32; run names get W if not 32)
 #   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
@@ -106,7 +114,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -157,7 +165,13 @@ if [[ "$ARM" == mem_halt ]]; then
     none|distance|raw) ARM_FLAGS+=(--halt_head="$HALT_HEAD" --halt_head_width="$HALT_HEAD_WIDTH"); RUN+="_hh${HALT_HEAD/distance/dist}"
                        [[ "$HALT_HEAD_WIDTH" != 32 ]] && RUN+="${HALT_HEAD_WIDTH}"
                        [[ "$HALT_HEAD" != none ]] && RUN+="_look" ;;
-    *) echo "HALT_HEAD must be none, distance or raw, got $HALT_HEAD"; exit 1 ;;
+    convtest) ARM_FLAGS+=(--halt_head=convtest); RUN+="_hhconv"
+      [[ "$HALT_OFFSET" != none ]] && { ARM_FLAGS+=(--halt_offset="$HALT_OFFSET"); RUN+="_hoff${HALT_OFFSET}"; }
+      [[ "$HALT_REPLAY" == 0 ]] && { ARM_FLAGS+=(--no-halt_replay_features); RUN+="_hnoreplay"; }
+      [[ "$HALT_PRECOND" == 0 ]] && { ARM_FLAGS+=(--no-halt_precondition); RUN+="_hnoprecond"; }
+      [[ "$HALT_LR" != 1e-2 ]] && { ARM_FLAGS+=(--halt_lr="$HALT_LR"); RUN+="_hlr${HALT_LR}"; }
+      [[ "$HALT_DAMPING" != 1e-3 ]] && { ARM_FLAGS+=(--halt_damping="$HALT_DAMPING"); RUN+="_hdamp${HALT_DAMPING}"; } ;;
+    *) echo "HALT_HEAD must be none, distance, raw or convtest, got $HALT_HEAD"; exit 1 ;;
   esac
   case "$HALT_KL_REVERSE" in
     0) ;;

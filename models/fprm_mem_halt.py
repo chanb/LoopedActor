@@ -190,6 +190,23 @@ _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the g
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
+def convtest_features(s_next, s_prev, H):
+    """halt_head='convtest' features (a, L, f) from the readout-latent distances S_(n+1), S_n: f = a + logit(L) is
+    the log of the estimated distance to the fixed point (contraction rate L, normalized step a)."""
+    a = jnp.clip(jnp.log((s_next + 1e-12) / math.sqrt(H)), math.log(1e-4), math.log(2))
+    L = jnp.clip((s_next + 1e-12) / (s_prev + 1e-12), 1e-3, 0.999)
+    return a, L, a + jnp.log(L / (1 - L))
+
+
+def convtest_fisher(f, p, mask, damping):
+    """Fisher of the convtest head's (theta0, theta1): mean over states of sum over decision passes of
+    p (1 - p) phi phi^T, phi = [1, f], plus damping * I. f, p, mask: [passes, B]."""
+    w = jnp.where(mask, p * (1 - p), 0.0)
+    m = lambda v: jnp.mean(jnp.sum(w * v, axis=0))
+    s1, sf, sff = m(1.0), m(f), m(f * f)
+    return jnp.stack([jnp.stack([s1, sf]), jnp.stack([sf, sff])]) + damping * jnp.eye(2)
+
+
 def step_path_log_prob(lp, mask, c):
     """log p(path) from per-pass log-probabilities lp [T, B, K + 1] of k, the decision
     passes mask [B] (bit n-1 = a decision at pass n) and the think time c [B]."""
@@ -290,7 +307,8 @@ class FPRMMemHaltActorValue(nn.Module):
     stable_kl: bool = False        # KL_i without the fp32 rounding floor (see the module docstring)
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
     halt_signal: str = 'kl'        # 'kl' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
-    halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' (see the module docstring)
+    halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' | 'convtest' (see the module docstring)
+    halt_offset: str = 'none'      # convtest: 'none' | 'uniform' (o_n = -log(T - n): c ~ Uniform{1..T} at init)
     halt_head_width: int = 32      # hidden width of the halting MLP
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     value_token: str = ''          # '' (= readout_token) | 'thought' | 'sep': where the value is read from
@@ -315,8 +333,15 @@ class FPRMMemHaltActorValue(nn.Module):
         assert (self.halt_token or self.readout_token) == self.readout_token or (
             self.halting and (self.halt_head == 'none' or self.halt_signal == 'latent')), \
             'halt_token only matters for halt_head=none or halt_signal=latent'
-        assert self.halt_head in ('none', 'distance', 'raw'), self.halt_head
-        if self.halting:
+        assert self.halt_head in ('none', 'distance', 'raw', 'convtest'), self.halt_head
+        assert self.halt_offset in ('none', 'uniform'), self.halt_offset
+        if self.halt_head == 'convtest':
+            assert self.halting and self.halt_signal == 'latent' and self.halt_max_skip == 1 and self.min_think_iters == 1, \
+                'convtest needs halting, halt_signal=latent, halt_max_skip=1 and min_think_iters=1'
+            theta0 = 0.0 if self.halt_offset == 'uniform' else -math.log(max(self.max_think_iters - 1, 1))
+            self.theta0 = self.param('theta0', lambda _: jnp.float32(theta0))
+            self.theta1 = self.param('theta1', lambda _: jnp.float32(0.0))
+        elif self.halting:
             self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
                 self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
             self.halt_out = nn.Dense(self.halt_max_skip + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
@@ -345,7 +370,7 @@ class FPRMMemHaltActorValue(nn.Module):
         p_in, p_out = self.variables['params']['halt_hidden'], self.variables['params']['halt_out']
         return jax.nn.gelu(x @ p_in['kernel'] + p_in['bias']) @ p_out['kernel'] + p_out['bias']
 
-    def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None):
+    def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None, halt_features=None):
         if normalizer_params is not None:
             x = (x - normalizer_params.mean) / (normalizer_params.std)
 
@@ -371,7 +396,7 @@ class FPRMMemHaltActorValue(nn.Module):
             self.core(seq, seq, jnp.ones(seq.shape[:2], bool), grid_shape, prefix_len=0, suffix_len=1)
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
-            if self.halting:
+            if self.halting and self.halt_head != 'convtest':
                 n_in = {'none': H, 'distance': 1, 'raw': 2 * (self.output_dim_1 if self.halt_signal == 'kl' else H)}[self.halt_head]
                 self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
         params = self.variables['params']
@@ -451,8 +476,9 @@ class FPRMMemHaltActorValue(nn.Module):
                 sig = jnp.linalg.norm(jax.lax.stop_gradient(dh).astype(jnp.float32), axis=-1)
             else:
                 sig = kl
-            logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite) if self.halting
-                        else jnp.zeros((B, 1), jnp.float32))
+            logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite)
+                        if self.halting and self.halt_head != 'convtest'
+                        else jnp.zeros((B, 2 if self.halting else 1), jnp.float32))  # convtest: in _halt
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
             return carry, (logits, value, logits_k, kl, sig, nonfinite, latent_res)
@@ -466,7 +492,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'policy_kl_t', kl_t)
         self.sow('intermediates', 'halt_signal_t', sig_t)
         if self.halting:
-            c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1])
+            c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1], halt_features)
             self.sow('intermediates', 'policy_log_probs_t',
                      (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t))
         else:
@@ -490,11 +516,22 @@ class FPRMMemHaltActorValue(nn.Module):
 
         return (stable_softmax.Categorical if self.stable_softmax else distrax.Categorical)(logits=logits), value
 
-    def _halt(self, head_t, sig_t, halt_key, halt_steps, halt_path, B, T, batch_shape):
+    def _halt(self, head_t, sig_t, halt_key, halt_steps, halt_path, B, T, batch_shape, halt_features=None):
         """Halting: the think time c [B] and the signal that decided it; sows the halting intermediates."""
+        sig_prev_t = sig_t  # unshifted: row n - 1 holds S_n
         if self.halt_head != 'none':  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
             head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
             sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
+        if self.halt_head == 'convtest':  # logit_halt_n = theta0 + theta1 f_n + o_n, logit_continue_n = 0
+            if halt_features is None:
+                f = convtest_features(sig_t, sig_prev_t, self.config.d_model)[2]
+            else:  # the rollout's features [B, T] (replay: the path probability then moves with the head only)
+                f = jnp.asarray(halt_features, jnp.float32).reshape(B, T).T
+            n = jnp.arange(1, T + 1)[:, None]
+            o = -jnp.log(jnp.maximum(T - n, 1)) if self.halt_offset == 'uniform' else 0.0
+            logit = self.theta0 + self.theta1 * f + o
+            head_t = jnp.stack([logit, jnp.zeros_like(logit)], axis=-1)
+            self.sow('intermediates', 'halt_feature_t', f)
         lp_t = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(head_t)  # [T, B, K + 1]
         min_iters = 1 if T == 1 else self.min_think_iters
         if halt_steps is not None:
