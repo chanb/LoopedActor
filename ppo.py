@@ -171,6 +171,8 @@ class Args:
                                            # on an iso_mem checkpoint) stay freshly initialized. Also loads its
                                            # normalizer_params. Expects the (params, normalizer_params) tuple format
                                            # save_params()/load_params() use.
+    halt_adam_b1: float = 0.9             # fprm_mem_halt: Adam beta_1 / beta_2 of the halting head (halt_hidden/halt_out) only;
+    halt_adam_b2: float = 0.999           # the rest keeps optax's 0.9 / 0.999 (arXiv 2601.21739 suggests 0.99 / 0.99)
     freeze_except_halt: bool = False      # fprm_mem_halt: zero the optimizer update for every param group except
                                            # halt_hidden/halt_out - trains only the halting head, typically paired
                                            # with init_checkpoint pointed at a halting=False checkpoint
@@ -258,8 +260,8 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
 
 
 def make_optimizer(args, init_params=None):
-    """init_params is only needed (and required) when args.freeze_except_halt - its pytree structure builds the
-    freeze mask: True (trained) for halt_hidden/halt_out, False (frozen, zero update) for every other param group."""
+    """init_params is only needed (and required) when args.freeze_except_halt or the halting head's Adam betas are not
+    the defaults - its pytree structure labels halt_hidden/halt_out apart from every other param group."""
     if args.anneal_lr:
         total_grad_steps = (
             args.num_training_step
@@ -271,18 +273,23 @@ def make_optimizer(args, init_params=None):
         )
     else:
         learning_rate = args.learning_rate
-    tx = optax.adam(learning_rate=learning_rate)
-    if args.max_grad_norm > 0.0:
-        tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx)
+    clip = lambda tx: optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx) if args.max_grad_norm > 0.0 else tx
+    halt_tx = optax.adam(learning_rate=learning_rate, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
+    halt_betas = (args.halt_adam_b1, args.halt_adam_b2) != (0.9, 0.999)
+
+    def labels(other):  # 'train' for the halting head's param groups, `other` for the rest
+        return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in ('halt_hidden', 'halt_out') else other, v)
+                           for k, v in init_params['params'].items()}}
+
     if args.freeze_except_halt:
         assert init_params is not None, "freeze_except_halt needs init_params to build the freeze mask"
         # optax.masked() passes ungated gradients through unchanged for mask=False leaves - not a freeze. Use
         # multi_transform instead: 'frozen' groups get optax.set_to_zero(), an actual zero update.
-        train_groups = {'halt_hidden', 'halt_out'}
-        labels = {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in train_groups else 'frozen', v)
-                              for k, v in init_params['params'].items()}}
-        tx = optax.multi_transform({'train': tx, 'frozen': optax.set_to_zero()}, labels)
-    return tx
+        return optax.multi_transform({'train': clip(halt_tx), 'frozen': optax.set_to_zero()}, labels('frozen'))
+    if halt_betas:  # the halting head gets its own Adam moments; clipping stays global over all params
+        assert init_params is not None, "halt_adam_b1 / halt_adam_b2 need init_params to label the halting head"
+        return clip(optax.multi_transform({'train': halt_tx, 'rest': optax.adam(learning_rate=learning_rate)}, labels('rest')))
+    return clip(optax.adam(learning_rate=learning_rate))
 
 
 def main(args: Args):

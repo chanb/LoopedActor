@@ -31,6 +31,8 @@
 #                       over training (default 0 = off; _hprior<b>)
 #   HALT_PRIOR_HALT=q0  mem_halt, HALT_PRIOR_COEF > 0: the prior's q(k = 0); k >= 1 share the rest (default 0.1;
 #                       _q<q0> if not 0.1)
+#   HALT_ADAM_B1=b1 HALT_ADAM_B2=b2  mem_halt: Adam betas of the halting head only (default 0.9 / 0.999 as the rest;
+#                       arXiv 2601.21739 suggests 0.99 / 0.99; run names get _hadam<b1>_<b2> if not the default)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
@@ -104,7 +106,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -140,6 +142,9 @@ if [[ "$ARM" == mem_halt ]]; then
   if awk -v b="${HALT_PRIOR_COEF:-0}" 'BEGIN { exit !(b > 0) }'; then
     ARM_FLAGS+=(--halt_prior_coef="$HALT_PRIOR_COEF"); RUN+="_hprior${HALT_PRIOR_COEF}"
     [[ "${HALT_PRIOR_HALT:-0.1}" != 0.1 ]] && { ARM_FLAGS+=(--halt_prior_halt="$HALT_PRIOR_HALT"); RUN+="_q${HALT_PRIOR_HALT}"; }
+  fi
+  if [[ "$HALT_ADAM_B1" != 0.9 || "$HALT_ADAM_B2" != 0.999 ]]; then
+    ARM_FLAGS+=(--halt_adam_b1="$HALT_ADAM_B1" --halt_adam_b2="$HALT_ADAM_B2"); RUN+="_hadam${HALT_ADAM_B1}_${HALT_ADAM_B2}"
   fi
   case "$HALT_HEAD_GRAD" in
     0) ;;
