@@ -9,7 +9,7 @@ Instances are generated procedurally (no level bank), as jumanji's RandomWalkGen
 from the solved board, the blank makes `num_random_moves` uniformly random valid moves (immediate
 reversals allowed, so the scramble can be shallower than its length and occasionally solved).
 Training resets (`reset`) use `num_random_moves` (or, with `min_random_moves` > 0, a length drawn per reset
-from [min_random_moves, num_random_moves] with p(k) ∝ k^-random_moves_zipf; 0 = uniform), evaluation resets (`eval_reset`) always use the fixed
+from [min_random_moves, num_random_moves] with p(k) ∝ k^-random_moves_zipf; 0 = uniform, < 0 favours long scrambles), evaluation resets (`eval_reset`) always use the fixed
 `eval_num_random_moves` (default: the same, as in Stoix; raise it to evaluate on deeper scrambles).
 
 Observation: per-cell one-hot of the tile id (channel k = tile k, channel 0 = blank), cell-major flat
@@ -46,7 +46,7 @@ def default_config() -> config_dict.ConfigDict:
         eval_episode_length=40,    # eval_reset (eval/test_*) episodes; set by make_env (envs/utils.py)
         num_random_moves=10,       # training scramble length
         min_random_moves=0,        # > 0: each training reset draws its length from [this, num_random_moves] (0 = fixed)
-        random_moves_zipf=0.0,     # min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform; > 0 favours short scrambles)
+        random_moves_zipf=0.0,     # min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform; > 0 favours short, < 0 long scrambles)
         eval_num_random_moves=10,  # evaluation scramble length
         step_penalty=0.0,          # 0 = sparse reward (jumanji SparseRewardFn)
         solve_reward=1.0,

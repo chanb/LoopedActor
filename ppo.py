@@ -79,7 +79,7 @@ class Args:
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_min_random_moves: int = 0       # slidingpuzzle-*: > 0 draws each training scramble length uniformly from
                                                   # [this, num_random_moves] (eval_reset stays fixed; 0 = fixed length)
-    slidingpuzzle_random_moves_zipf: float = 0.0  # slidingpuzzle-*, min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform)
+    slidingpuzzle_random_moves_zipf: float = 0.0  # slidingpuzzle-*, min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform, < 0 favours long)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 
     # algorithm
@@ -154,8 +154,9 @@ class Args:
     value_token: str = ''                 # fprm_mem / fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': where the value is read from
     halt_token: str = ''                  # fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': the halting head's h_n (halt_head=none or halt_signal=latent)
     value_pass: str = 'last'              # fprm_mem_halt: 'last' (value from pass T) | 'halt' (from the acting pass c)
-    act_iters: int = 0                    # fprm_mem: act with this pass c <= max_think_iters (0 = max_think_iters); with
-                                          # value_pass=last the value still reads pass T (a fixed-c actor with the T-pass critic)
+    act_iters: Optional[int] = None       # fprm_mem: act with this pass c <= max_think_iters (None = max_think_iters); with
+                                          # value_pass=last the value still reads pass T (a fixed-c actor with the T-pass critic).
+                                          # Logged as c for fprm_mem and None for every other architecture (wandb group-by)
     value_deep_supervision: bool = False  # fprm_mem / fprm_mem_halt: regress the value of every pass up to the value's
                                           # readout pass (T, or c with value_pass=halt) on the same target: V(s) at every depth
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw');
@@ -337,6 +338,11 @@ def main(args: Args):
     print(f"Total number of gradient steps per training step = {args.num_minibatches_per_rollout * args.num_epochs_per_rollout}")
     print(f"Total number of env steps per training step = {args.num_envs * args.rollout_length}")
 
+    if args.architecture == 'fprm_mem':
+        args.act_iters = args.act_iters or args.max_think_iters
+    else:
+        assert args.act_iters is None, 'act_iters is only for fprm_mem'
+
     args.exp_name = f"{args.wandb_name_tag + '__' if args.wandb_name_tag != '' else ''}{args.env_id}__{args.architecture}__{args.seed}__{os.path.basename(__file__)[: -len('.py')]}__{int(time.time())}"
 
     if args.track:
@@ -429,7 +435,7 @@ def main(args: Args):
             value_token=args.value_token,
             halt_token=args.halt_token,
             value_pass=args.value_pass,
-            act_iters=args.act_iters,
+            act_iters=args.act_iters or 0,
             halt_max_skip=args.halt_max_skip,
             output_dim_1=action_size,
             obs_channels=obs_channels,
