@@ -11,7 +11,7 @@
 #                       (eval/test_* scrambles stay fixed at EVAL_NUM_RANDOM_MOVES; eval/train_* episodes use the mix;
 #                       default 0 = fixed length)
 #   RANDOM_MOVES_ZIPF=s  MIN_RANDOM_MOVES > 0: draw the length with p(k) ∝ k^-s instead of uniformly (default 0 = uniform;
-#                       s = 1 puts ~half of [1, 200] on k <= 10)
+#                       s = 1 puts ~half of [1, 200] on k <= 10; s < 0 favours long scrambles, s = -1: p(k) ∝ k)
 #   EVAL_NUM_RANDOM_MOVES=K  evaluation scramble length (default 200)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 0.999; 1.0 = standard return;
@@ -230,9 +230,9 @@ esac
 [[ "$MIN_RANDOM_MOVES" =~ ^[0-9]+$ ]] && (( MIN_RANDOM_MOVES <= NUM_RANDOM_MOVES )) \
   || { echo "MIN_RANDOM_MOVES must be an integer in [0, NUM_RANDOM_MOVES=$NUM_RANDOM_MOVES], got $MIN_RANDOM_MOVES"; exit 1; }
 (( MIN_RANDOM_MOVES > 0 )) && { ARM_FLAGS+=(--slidingpuzzle_min_random_moves="$MIN_RANDOM_MOVES"); RUN+="_rmin${MIN_RANDOM_MOVES}"; }
-awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s + 0 == s && s >= 0) }' || { echo "RANDOM_MOVES_ZIPF must be >= 0, got $RANDOM_MOVES_ZIPF"; exit 1; }
-if awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s > 0) }'; then
-  (( MIN_RANDOM_MOVES > 0 )) || { echo "RANDOM_MOVES_ZIPF > 0 needs MIN_RANDOM_MOVES > 0"; exit 1; }
+awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s + 0 == s) }' || { echo "RANDOM_MOVES_ZIPF must be a number, got $RANDOM_MOVES_ZIPF"; exit 1; }
+if awk -v s="$RANDOM_MOVES_ZIPF" 'BEGIN { exit !(s != 0) }'; then
+  (( MIN_RANDOM_MOVES > 0 )) || { echo "RANDOM_MOVES_ZIPF != 0 needs MIN_RANDOM_MOVES > 0"; exit 1; }
   ARM_FLAGS+=(--slidingpuzzle_random_moves_zipf="$RANDOM_MOVES_ZIPF"); RUN+="_rzipf${RANDOM_MOVES_ZIPF}"
 fi
 [[ "$EVAL_NUM_RANDOM_MOVES" != 200 ]] && RUN+="_erm${EVAL_NUM_RANDOM_MOVES}"

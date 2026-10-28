@@ -57,7 +57,6 @@ def make_env(args):
         config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
         config.min_random_moves = getattr(args, 'slidingpuzzle_min_random_moves', 0)
         config.random_moves_zipf = getattr(args, 'slidingpuzzle_random_moves_zipf', 0.0)
-        assert config.random_moves_zipf >= 0, config.random_moves_zipf
         assert config.min_random_moves <= config.num_random_moves, (config.min_random_moves, config.num_random_moves)
         eval_moves = getattr(args, 'slidingpuzzle_eval_num_random_moves', 0)
         config.eval_num_random_moves = eval_moves if eval_moves > 0 else config.num_random_moves

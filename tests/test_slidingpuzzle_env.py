@@ -60,3 +60,15 @@ def test_zipf_scramble_lengths():
     d_uniform, d_zipf = _manhattan(uniform, _boards(uniform, 'reset')), _manhattan(zipf, _boards(zipf, 'reset'))
     assert (d_zipf <= 4).mean() > 2 * (d_uniform <= 4).mean() and d_zipf.mean() < 0.8 * d_uniform.mean()
     assert np.array_equal(_manhattan(zipf, _boards(zipf, 'eval_reset')), _manhattan(uniform, _boards(uniform, 'eval_reset')))
+
+
+def test_negative_zipf_favours_long_scrambles():
+    # random_moves_zipf = -s < 0: p(k) ∝ k^s puts more mass on long scrambles than uniform, and make_env accepts it.
+    from types import SimpleNamespace
+    from envs.utils import make_env
+    _, cfg = make_env(SimpleNamespace(env_id='slidingpuzzle-4x4', slidingpuzzle_random_moves_zipf=-1.0))
+    assert cfg.random_moves_zipf == -1.0
+    uniform = _env(num_random_moves=200, min_random_moves=1, eval_num_random_moves=200)
+    ramp = _env(num_random_moves=200, min_random_moves=1, eval_num_random_moves=200, random_moves_zipf=-1.0)
+    d_uniform, d_ramp = _manhattan(uniform, _boards(uniform, 'reset')), _manhattan(ramp, _boards(ramp, 'reset'))
+    assert (d_ramp <= 4).mean() < 0.5 * (d_uniform <= 4).mean() and d_ramp.mean() > 1.1 * d_uniform.mean()
