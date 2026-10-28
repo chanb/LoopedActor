@@ -153,6 +153,11 @@ class Args:
     readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
     value_token: str = ''                 # fprm_mem / fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': where the value is read from
     halt_token: str = ''                  # fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': the halting head's h_n (halt_head=none or halt_signal=latent)
+    value_pass: str = 'last'              # fprm_mem_halt: 'last' (value from pass T) | 'halt' (from the acting pass c)
+    act_iters: int = 0                    # fprm_mem: act with this pass c <= max_think_iters (0 = max_think_iters); with
+                                          # value_pass=last the value still reads pass T (a fixed-c actor with the T-pass critic)
+    value_deep_supervision: bool = False  # fprm_mem / fprm_mem_halt: regress the value of every pass up to the value's
+                                          # readout pass (T, or c with value_pass=halt) on the same target: V(s) at every depth
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw');
                                           # 'convtest': learned convergence test theta0 + theta1 f_n (models/fprm_mem_halt.py)
     halt_offset: str = 'none'             # convtest: 'uniform' adds o_n = -log(T - n) to the halt logit (c ~ Uniform at init)
@@ -203,6 +208,16 @@ class Transition(NamedTuple):
     discount: jnp.ndarray
     next_observation: jnp.ndarray
     extras: jnp.ndarray = ()
+
+
+def value_loss(values, targets, expectile, mask=None):
+    """Expectile regression (tau = 0.5 gives the MSE 0.25 * mean(v_error^2)). values [T, B] with mask [T, B]: each
+    state's loss is the mean over its masked passes."""
+    v_error = targets - values
+    loss = jnp.abs(expectile - (v_error < 0).astype(v_error.dtype)) * v_error * v_error * 0.5
+    if mask is None:
+        return jnp.mean(loss)
+    return jnp.mean(jnp.sum(jnp.where(mask, loss, 0.0), axis=0) / jnp.sum(mask, axis=0))
 
 
 def count_parameters(params):
@@ -413,6 +428,8 @@ def main(args: Args):
             readout_token=args.readout_token,
             value_token=args.value_token,
             halt_token=args.halt_token,
+            value_pass=args.value_pass,
+            act_iters=args.act_iters,
             halt_max_skip=args.halt_max_skip,
             output_dim_1=action_size,
             obs_channels=obs_channels,
@@ -608,10 +625,7 @@ def main(args: Args):
                     s_dec = jax.vmap(surrogate, in_axes=1, out_axes=1)(halt_decision_log_probs - mu_dec)
                     policy_loss -= jnp.mean(jnp.sum(jnp.where(dec == 1, s_dec, 0.0), axis=-1))
 
-            # Value function loss: expectile regression (tau = 0.5 gives the MSE 0.25 * mean(v_error^2)).
-            v_error = value_targets - baseline
-            v_weight = jnp.abs(args.value_expectile - (v_error < 0).astype(v_error.dtype))
-            v_loss = jnp.mean(v_weight * v_error * v_error) * 0.5
+            v_loss = value_loss(baseline, value_targets, args.value_expectile)
 
             # Entropy loss
             entropy = jnp.mean(policy_dist.entropy())
@@ -715,6 +729,14 @@ def main(args: Args):
             inter['intermediates']['halt_decision_log_probs'][0] if halt_clip == 'each' else None,
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
+        if 'value_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
+            value_t = inter['intermediates']['value_t'][0]  # [T, B]
+            if args.value_deep_supervision:  # passes 1..n_max all regress on the same target
+                n_max = inter['intermediates']['fp_iterations'][0] if args.value_pass == 'halt' else value_t.shape[0]
+                v_loss = value_loss(value_t, value_targets, args.value_expectile, jnp.arange(1, value_t.shape[0] + 1)[:, None] <= n_max)
+            # Per-pass value loss over every state (supervised or not), each in its own wandb section.
+            v_loss_t = jax.lax.stop_gradient(jax.vmap(lambda v: value_loss(v, value_targets, args.value_expectile))(value_t))
+            halt_metrics.update({f'v_loss/pass_{i + 1:02d}': v_loss_t[i] for i in range(v_loss_t.shape[0])})
 
         think_iters = inter['intermediates']['fp_iterations'][0]
 

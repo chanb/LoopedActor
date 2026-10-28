@@ -335,3 +335,32 @@ def test_step_decision_log_probs_sum_to_path():
     dec = ((mask[None] >> jnp.arange(T)[:, None]) & 1) == 1
     assert jnp.allclose(jnp.sum(d, axis=0), step_path_log_prob(lp, mask, c), atol=1e-6)
     assert jnp.all(jnp.where(dec, True, d == 0.0)) and jnp.all(jnp.where(dec, d < 0.0, True))
+
+
+def test_value_pass_halt_reads_the_value_at_c():
+    # value_pass='halt': the value comes from the acting pass c (the default 'last' reads pass T for every c).
+    net = _net(min_think_iters=1)
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    c = jnp.array([1, 2, 4])
+    kw = dict(halt_steps=c, halt_path=jnp.array([_k1_path(int(n), 1, 4) for n in c]))
+    by_c = [_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=int(n), min_think_iters=1), params, x)
+            ['value'] for n in c]  # pass n = the last pass of a T = n model
+    last = _intermediates(net, params, x, **kw)['value']
+    inter = _intermediates(_net(min_think_iters=1, value_pass='halt'), params, x, **kw)
+    halt = inter['value']
+    assert jnp.allclose(halt, inter['value_t'][c - 1, jnp.arange(3)], atol=1e-6)  # value_t [T, B]: every pass's value
+    assert jnp.allclose(halt, jnp.array([v[i] for i, v in enumerate(by_c)]), atol=1e-5)
+    assert jnp.allclose(last[2], halt[2], atol=1e-6) and not jnp.allclose(last[:2], halt[:2], atol=1e-3)
+
+
+def test_act_iters_acts_at_c_and_values_at_T():
+    # halting=False, act_iters=c < T: the fixed-c actor of a T = c model with the critic of the T model.
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = _net(halting=False).init(jax.random.PRNGKey(0), x)['params']
+    fixed_c = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=2, halting=False), params, x)
+    full_T = _intermediates(_net(halting=False), params, x)
+    mixed = _intermediates(_net(halting=False, act_iters=2), params, x)
+    assert bool(jnp.all(mixed['fp_iterations'] == 2))
+    assert jnp.allclose(mixed['logits'], fixed_c['logits'], atol=1e-5)
+    assert jnp.allclose(mixed['value'], full_T['value'], atol=1e-6)

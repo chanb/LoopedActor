@@ -301,6 +301,7 @@ class FPRMMemHaltActorValue(nn.Module):
     max_think_iters: int = 8
     min_think_iters: int = 2
     halting: bool = True           # False: no halting head, always act with pass max_think_iters (iso_mem)
+    act_iters: int = 0             # halting=False: act with this pass instead (0 = max_think_iters); the value keeps value_pass
     halt_max_skip: int = 1         # K: each decision picks k in 0..K more passes (1: halt yes/no at every pass)
     halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the head's h / pi inputs
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
@@ -313,6 +314,7 @@ class FPRMMemHaltActorValue(nn.Module):
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     value_token: str = ''          # '' (= readout_token) | 'thought' | 'sep': where the value is read from
     halt_token: str = ''           # '' (= readout_token) | 'thought' | 'sep': where the halting head's h_n is read from
+    value_pass: str = 'last'       # 'last': the value from pass T | 'halt': from the acting pass c (V then depends on c)
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
@@ -330,6 +332,8 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         assert self.value_token in ('', 'thought', 'sep'), self.value_token
         assert self.halt_token in ('', 'thought', 'sep'), self.halt_token
+        assert self.value_pass in ('last', 'halt'), self.value_pass
+        assert 0 <= self.act_iters <= self.max_think_iters and (self.act_iters == 0 or not self.halting), self.act_iters
         assert (self.halt_token or self.readout_token) == self.readout_token or (
             self.halting and (self.halt_head == 'none' or self.halt_signal == 'latent')), \
             'halt_token only matters for halt_head=none or halt_signal=latent'
@@ -496,15 +500,18 @@ class FPRMMemHaltActorValue(nn.Module):
             self.sow('intermediates', 'policy_log_probs_t',
                      (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t))
         else:
-            c, sig_c = jnp.full((B,), T, jnp.int32), sig_t[-1]
+            c = jnp.full((B,), self.act_iters or T, jnp.int32)
+            sig_c = sig_t[c[0] - 1]
         idx = c - 1
         logits = jnp.take_along_axis(logits_t, idx[None, :, None], axis=0)[0]
         nonfinite = jnp.take_along_axis(nonfinite_t.T, idx[:, None], axis=-1)[:, 0]
 
         logits = logits.reshape(input_shape[:-1] + (-1,))
-        value = value_t[-1].reshape(input_shape[:-1])
+        value = value_t[-1] if self.value_pass == 'last' else jnp.take_along_axis(value_t.T, idx[:, None], axis=-1)[:, 0]
+        value = value.reshape(input_shape[:-1])
         self.sow('intermediates', 'logits', logits)
         self.sow('intermediates', 'value', value)
+        self.sow('intermediates', 'value_t', value_t)  # [T, B]: every pass's value
         self.sow('intermediates', 'latent_residual_t', latent_res_t)
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
