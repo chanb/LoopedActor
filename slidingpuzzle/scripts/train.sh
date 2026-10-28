@@ -59,6 +59,7 @@
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
 #                       run names get _rthought / _rsep)
 #   VALUE_TOKEN=thought|sep  iso_mem / mem_halt: read the value from this token instead of READOUT's (_v<tok>; default: READOUT)
+#   ACT_ITERS=c         iso_mem: act with pass c <= MAX_THINK_ITERS; the value still reads pass MAX_THINK_ITERS (_a<c>; default 0 = MAX_THINK_ITERS)
 #   HALT_TOKEN=thought|sep   mem_halt: the halting head's h_n from this token instead of READOUT's (_ht<tok>; default: READOUT);
 #                       only with HALT_HEAD=none or HALT_SIGNAL=latent (the KL heads never read h_n)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
@@ -114,7 +115,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -126,7 +127,8 @@ case "$ARM" in
   iso_loop)  ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}"
+             [[ "$ACT_ITERS" != 0 ]] && { ARM_FLAGS+=(--act_iters="$ACT_ITERS"); RUN+="_a${ACT_ITERS}"; } ;;
   mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl)
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
