@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models.fprm import FPRMConfig  # noqa: E402
+from models.fprm import FPRMConfig, rms_norm  # noqa: E402
 from models.fprm_mem_halt import (  # noqa: E402
     FPRMMemHaltActorValue, best_step_path, sample_step_path, step_decision_log_probs, step_path_entropy, step_path_log_prob,
 )
@@ -364,3 +364,16 @@ def test_act_iters_acts_at_c_and_values_at_T():
     assert bool(jnp.all(mixed['fp_iterations'] == 2))
     assert jnp.allclose(mixed['logits'], fixed_c['logits'], atol=1e-5)
     assert jnp.allclose(mixed['value'], full_T['value'], atol=1e-6)
+
+
+@pytest.mark.parametrize('readout', ['thought', 'sep'])
+def test_readout_latent_sown(readout):
+    # readout_latent_t [T, B, H]: the latent pi_n is decoded from; its rms_norm differences are the latent halt signal
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    net = _net(halt_signal='latent', readout_token=readout)
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    inter = _intermediates(net, params, x)
+    h = inter['readout_latent_t']
+    assert h.shape == (4, 3, CFG.d_model)
+    rn = lambda v: rms_norm(v, CFG.rms_norm_eps)
+    assert jnp.allclose(jnp.linalg.norm(rn(h[1:]) - rn(h[:-1]), axis=-1), inter['halt_signal_t'][1:], rtol=1e-3, atol=1e-3)

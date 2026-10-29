@@ -77,7 +77,7 @@ unshifted), with halting also 'halt_log_prob'
 (log p(path | s)), 'halt_decision_log_probs' (its terms by decision pass, [B, T], 0 off the path), 'halt_entropy', 'halt_path', 'halt_prob' (p_n(0), [T, B]), 'halt_step_probs' (p_n(k),
 [T, B, K + 1]), 'halt_step_log_probs' (log p_n(k), [T, B, K + 1]) and 'policy_log_probs_t' (log pi_n by pass, [T, B, A]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
 against uniform) and 'latent_residual_t' (the max-token residual of the cell latents between consecutive passes, as
-fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent).
+fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent) and 'readout_latent_t' (the latent pi_n is decoded from, by pass, [T, B, H]).
 """
 
 import math
@@ -485,12 +485,13 @@ class FPRMMemHaltActorValue(nn.Module):
                         else jnp.zeros((B, 2 if self.halting else 1), jnp.float32))  # convtest: in _halt
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
-            return carry, (logits, value, logits_k, kl, sig, nonfinite, latent_res)
+            return carry, (logits, value, logits_k, kl, sig, nonfinite, latent_res, z_cells[:, P] if sep else out)
 
         if self.remat:
             body = jax.checkpoint(body, prevent_cse=False)
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
-        _, (logits_t, value_t, head_t, kl_t, sig_t, nonfinite_t, latent_res_t) = jax.lax.scan(body, init, jnp.arange(T))
+        _, (logits_t, value_t, head_t, kl_t, sig_t, nonfinite_t, latent_res_t, readout_latent_t) = jax.lax.scan(
+            body, init, jnp.arange(T))
         # logits_t [T, B, A]; head_t [T, B, K + 1]; value_t, kl_t, sig_t, nonfinite_t [T, B]
 
         self.sow('intermediates', 'policy_kl_t', kl_t)
@@ -513,6 +514,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'value', value)
         self.sow('intermediates', 'value_t', value_t)  # [T, B]: every pass's value
         self.sow('intermediates', 'latent_residual_t', latent_res_t)
+        self.sow('intermediates', 'readout_latent_t', readout_latent_t)  # [T, B, H]: the latent pi_n is decoded from
 
         reason = jnp.where(c >= T, STOP_ITERATION_CAP, STOP_CONVERGED)
         reason = jnp.where(nonfinite, STOP_NONFINITE, reason)
