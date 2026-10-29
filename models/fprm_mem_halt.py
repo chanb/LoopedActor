@@ -37,6 +37,9 @@ zero-initialized output layer, so k is uniform at init:
 'distance' and 'raw' look one pass ahead: pass n+1 is computed, and if the head halts, pass n acts (c = n means "pass
 n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
 stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
+'convtest' (K = 1, also lookahead): logit p_n(0) = theta0 + theta1 f_n, f_n = convtest_features(S_{n+1}, S_n).
+With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
+rate (KL's ratio would be its square); decision 1's S_1 is against uniform ('kl') or the initial latent ('latent').
 
 Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose latent is carried between passes like the
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
@@ -190,10 +193,11 @@ _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the g
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
-def convtest_features(s_next, s_prev, H):
-    """halt_head='convtest' features (a, L, f) from the readout-latent distances S_(n+1), S_n: f = a + logit(L) is
-    the log of the estimated distance to the fixed point (contraction rate L, normalized step a)."""
-    a = jnp.clip(jnp.log((s_next + 1e-12) / math.sqrt(H)), math.log(1e-4), math.log(2))
+def convtest_features(s_next, s_prev, scale):
+    """halt_head='convtest' features (a, L, f) from the distances S_(n+1), S_n: f = a + logit(L) is the log of the
+    estimated distance to the fixed point (contraction rate L, step a normalized by `scale`: sqrt(H) for the rms-normed
+    latents, 1 for sqrt(2 KL))."""
+    a = jnp.clip(jnp.log((s_next + 1e-12) / scale), math.log(1e-4), math.log(2))
     L = jnp.clip((s_next + 1e-12) / (s_prev + 1e-12), 1e-3, 0.999)
     return a, L, a + jnp.log(L / (1 - L))
 
@@ -340,8 +344,8 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.halt_head in ('none', 'distance', 'raw', 'convtest'), self.halt_head
         assert self.halt_offset in ('none', 'uniform'), self.halt_offset
         if self.halt_head == 'convtest':
-            assert self.halting and self.halt_signal == 'latent' and self.halt_max_skip == 1 and self.min_think_iters == 1, \
-                'convtest needs halting, halt_signal=latent, halt_max_skip=1 and min_think_iters=1'
+            assert self.halting and self.halt_max_skip == 1 and self.min_think_iters == 1, \
+                'convtest needs halting, halt_max_skip=1 and min_think_iters=1'
             theta0 = 0.0 if self.halt_offset == 'uniform' else -math.log(max(self.max_think_iters - 1, 1))
             self.theta0 = self.param('theta0', lambda _: jnp.float32(theta0))
             self.theta1 = self.param('theta1', lambda _: jnp.float32(0.0))
@@ -533,7 +537,11 @@ class FPRMMemHaltActorValue(nn.Module):
             sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
         if self.halt_head == 'convtest':  # logit_halt_n = theta0 + theta1 f_n + o_n, logit_continue_n = 0
             if halt_features is None:
-                f = convtest_features(sig_t, sig_prev_t, self.config.d_model)[2]
+                if self.halt_signal == 'kl':  # sqrt(2 KL): a distance (local Fisher-Rao length), so S_(n+1) / S_n is L, not L^2
+                    to_dist = lambda s: jnp.sqrt(2 * jnp.maximum(s, 0.0))
+                    f = convtest_features(to_dist(sig_t), to_dist(sig_prev_t), 1.0)[2]
+                else:
+                    f = convtest_features(sig_t, sig_prev_t, math.sqrt(self.config.d_model))[2]
             else:  # the rollout's features [B, T] (replay: the path probability then moves with the head only)
                 f = jnp.asarray(halt_features, jnp.float32).reshape(B, T).T
             n = jnp.arange(1, T + 1)[:, None]

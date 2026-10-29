@@ -47,7 +47,7 @@ def test_features_formulas_and_clipping():
     from models.fprm_mem_halt import convtest_features
     s_prev = jnp.array([4.0, 2.0, 1.0, 1.0, 1e-9, 4.0, 40.0])
     s_next = jnp.array([2.0, 1.0, 1.5, 1e-9, 1e-9, 39.0, 41.0])  # ratios 0.5, 0.5, 1.5 (clip .999), tiny, 1, ~10, ~1
-    a, L, f = convtest_features(s_next, s_prev, H)
+    a, L, f = convtest_features(s_next, s_prev, math.sqrt(H))
     s_n, s_p = np.asarray(s_next, np.float64), np.asarray(s_prev, np.float64)
     a_want = np.clip(np.log((s_n + 1e-12) / math.sqrt(H)), np.log(1e-4), np.log(2))
     L_want = np.clip((s_n + 1e-12) / (s_p + 1e-12), 1e-3, 0.999)
@@ -65,9 +65,23 @@ def test_features_sown_after_the_shift():
     net = _net(**CONV)
     out = _apply(net, net.init(jax.random.PRNGKey(0), x)['params'], x)
     s = out['halt_signal_t']  # [T, B], row i = S_(i+1)
-    _, _, f = convtest_features(s[1:], s[:-1], H)
+    _, _, f = convtest_features(s[1:], s[:-1], math.sqrt(H))
     np.testing.assert_allclose(out['halt_feature_t'][:-1], f, rtol=1e-5, atol=1e-5)
     assert out['halt_feature_t'].shape == (T, 3)
+
+
+@pytest.mark.parametrize('stable_kl', [False, True])
+def test_features_kl(stable_kl):
+    # halt_signal='kl': the features read sqrt(2 KL), unnormalized; decision 1's S_1 is KL(pi_1 || uniform).
+    from models.fprm_mem_halt import convtest_features
+    x = _x()
+    net = _net(halt_head='convtest', halt_max_skip=1, min_think_iters=1, stable_kl=stable_kl)
+    out = _apply(net, net.init(jax.random.PRNGKey(0), x)['params'], x)
+    s = out['halt_signal_t']
+    np.testing.assert_allclose(s, out['policy_kl_t'], rtol=1e-6)
+    d = jnp.sqrt(2 * jnp.maximum(s, 0.0))
+    _, _, f = convtest_features(d[1:], d[:-1], 1.0)
+    np.testing.assert_allclose(out['halt_feature_t'][:-1], f, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize('offset', ['uniform', 'none'])

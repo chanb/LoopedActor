@@ -47,8 +47,9 @@
 #   HALT_SIGNAL=kl|latent  mem_halt, HALT_HEAD=distance|raw: z = the policies, S = KL; or z = the readout latents h,
 #                       S = ||rms_norm(h_(n+1)) - rms_norm(h_n)|| (_hlat) (default kl)
 #   HALT_HEAD=convtest  mem_halt: learned convergence test, logit_halt_n = theta0 + theta1 f_n (+ o_n), f_n = log of the
-#                       estimated distance to the fixed point from S_(n+1), S_n (_hhconv; needs HALT_SIGNAL=latent,
-#                       HALT_MAX_SKIP=1, MIN_THINK_ITERS=1). Its settings (run-name suffix only when not the default):
+#                       estimated distance to the fixed point from S_(n+1), S_n (_hhconv; needs HALT_MAX_SKIP=1,
+#                       MIN_THINK_ITERS=1; HALT_SIGNAL=kl reads sqrt(2 KL), S_1 against uniform; use STABLE_KL=1).
+#                       Its settings (run-name suffix only when not the default):
 #     HALT_OFFSET=none|uniform  o_n = -log(T - n), c ~ Uniform{1..T} at init (_hoffuniform; default none)
 #     HALT_REPLAY=1|0     the loss replays the rollout's features (default 1; 0: _hnoreplay)
 #     HALT_PRECOND=1|0    SGD on Sigma^-1 g, Sigma the decisions' Fisher (default 1; 0: Adam, _hnoprecond)
