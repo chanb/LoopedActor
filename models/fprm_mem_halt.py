@@ -77,7 +77,7 @@ halting gradient.
 Sown intermediates: 'logits'/'value' (at the chosen c), 'fp_iterations' (= c), 'fp_residual' (S_{c+1}, the signal that
 decided the halt; KL_T without halting), 'fp_converged' / 'fp_stop_reason', 'halt_signal_t' (S_i by pass, [T, B],
 unshifted), with halting also 'halt_log_prob'
-(log p(path | s)), 'halt_decision_log_probs' (its terms by decision pass, [B, T], 0 off the path), 'halt_entropy', 'halt_path', 'halt_prob' (p_n(0), [T, B]), 'halt_step_probs' (p_n(k),
+(log p(path | s)), 'halt_decision_log_probs' (its terms by decision pass, [B, T], 0 off the path), 'halt_entropy', 'halt_expected_c' (E[c | s]), 'halt_path', 'halt_prob' (p_n(0), [T, B]), 'halt_step_probs' (p_n(k),
 [T, B, K + 1]), 'halt_step_log_probs' (log p_n(k), [T, B, K + 1]) and 'policy_log_probs_t' (log pi_n by pass, [T, B, A]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
 against uniform) and 'latent_residual_t' (the max-token residual of the cell latents between consecutive passes, as
 fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent) and 'readout_latent_t' (the latent pi_n is decoded from, by pass, [T, B, H]).
@@ -294,6 +294,22 @@ def step_path_entropy(lp, min_iters):
             if nxt is not None:
                 reach[nxt] = reach.get(nxt, 0.0) + r * jnp.exp(lp_k)
     return ent
+
+
+def step_expected_c(lp, min_iters):
+    """E[c | s] of the path distribution, [B] (as step_path_entropy, with c in place of -log p)."""
+    T, B, _ = lp.shape
+    reach, ec = {min_iters: jnp.ones((B,))}, jnp.zeros((B,)) if min_iters < T else jnp.full((B,), float(T))
+    for n in range(min_iters, T):
+        if n not in reach:
+            continue
+        r = reach.pop(n)
+        for nxt, c, lp_k in _decisions(lp, n):
+            if nxt is None:
+                ec = ec + r * jnp.exp(lp_k) * c
+            else:
+                reach[nxt] = reach.get(nxt, 0.0) + r * jnp.exp(lp_k)
+    return ec
 
 
 class FPRMMemHaltActorValue(nn.Module):
@@ -567,6 +583,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_log_prob', halt_log_prob.reshape(batch_shape))
         self.sow('intermediates', 'halt_decision_log_probs', halt_decision_log_probs.T.reshape(batch_shape + (T,)))
         self.sow('intermediates', 'halt_entropy', halt_entropy.reshape(batch_shape))
+        self.sow('intermediates', 'halt_expected_c', step_expected_c(lp_t, min_iters).reshape(batch_shape))
         self.sow('intermediates', 'halt_prob', h_t)
         self.sow('intermediates', 'halt_step_log_probs', lp_t)
         return c, sig_c

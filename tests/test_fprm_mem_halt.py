@@ -10,7 +10,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fprm import FPRMConfig, rms_norm  # noqa: E402
 from models.fprm_mem_halt import (  # noqa: E402
-    FPRMMemHaltActorValue, best_step_path, sample_step_path, step_decision_log_probs, step_path_entropy, step_path_log_prob,
+    FPRMMemHaltActorValue, best_step_path, sample_step_path, step_decision_log_probs, step_expected_c, step_path_entropy,
+    step_path_log_prob,
 )
 
 CFG = FPRMConfig(d_model=16, num_heads=2)
@@ -107,6 +108,8 @@ def test_best_path_and_entropy_match_enumeration(K, min_iters):
     i = jnp.argmax(log_p, axis=0)
     assert jnp.array_equal(mask, jnp.array([paths[j][0] for j in i])) and jnp.array_equal(c, jnp.array([paths[j][1] for j in i]))
     assert jnp.allclose(step_path_entropy(lp, min_iters), -jnp.sum(jnp.exp(log_p) * log_p, axis=0), atol=1e-5)
+    cs = jnp.array([c for _, c in paths], jnp.float32)[:, None]
+    assert jnp.allclose(step_expected_c(lp, min_iters), jnp.sum(jnp.exp(log_p) * cs, axis=0), atol=1e-4)
 
 
 @pytest.mark.parametrize('head_grad', [False, True])

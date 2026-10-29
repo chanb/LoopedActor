@@ -671,6 +671,10 @@ def main(args: Args):
             halt_log_prob = inter['intermediates']['halt_log_prob'][0]
             halt_entropy = jnp.mean(inter['intermediates']['halt_entropy'][0])
             halt_metrics = {'halt_entropy': halt_entropy}
+            # Spread over states of E[c | s]: 0 iff every state gets the same expected think time (halt_entropy is within a state)
+            ec = inter['intermediates']['halt_expected_c'][0].reshape(-1)
+            q10, q50, q90 = jnp.percentile(ec, jnp.array([10.0, 50.0, 90.0]))
+            halt_metrics.update({'halt_ec_mean': jnp.mean(ec), 'halt_ec_std': jnp.std(ec), 'halt_ec_p10': q10, 'halt_ec_p50': q50, 'halt_ec_p90': q90})
             # mean p(k) over passes and states, and the number of decisions per state
             p_k = jnp.mean(inter['intermediates']['halt_step_probs'][0], axis=(0, 1))
             halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
