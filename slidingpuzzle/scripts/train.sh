@@ -56,6 +56,7 @@
 #     HALT_LR=lr          learning rate of theta0 / theta1 (default 1e-2; _hlr<lr>)
 #     HALT_DAMPING=d      damping added to Sigma (default 1e-3; _hdamp<d>)
 #     HALT_FISHER_EMA=b   precondition with an EMA of Sigma over updates, decay b (default 0 = per minibatch; _hfema<b>)
+#     HALT_TRUST=d        cap each preconditioned step's predicted KL of the decisions at d (default 0 = off; _htr<d>)
 #   HALT_HEAD_WIDTH=W   mem_halt: hidden width of the halting MLP (default 32; run names get W if not 32)
 #   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
@@ -117,7 +118,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; HALT_TRUST="${HALT_TRUST:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -175,7 +176,8 @@ if [[ "$ARM" == mem_halt ]]; then
       [[ "$HALT_PRECOND" == 0 ]] && { ARM_FLAGS+=(--no-halt_precondition); RUN+="_hnoprecond"; }
       [[ "$HALT_LR" != 1e-2 ]] && { ARM_FLAGS+=(--halt_lr="$HALT_LR"); RUN+="_hlr${HALT_LR}"; }
       [[ "$HALT_DAMPING" != 1e-3 ]] && { ARM_FLAGS+=(--halt_damping="$HALT_DAMPING"); RUN+="_hdamp${HALT_DAMPING}"; }
-      [[ "$HALT_FISHER_EMA" != 0 ]] && { ARM_FLAGS+=(--halt_fisher_ema="$HALT_FISHER_EMA"); RUN+="_hfema${HALT_FISHER_EMA}"; } ;;
+      [[ "$HALT_FISHER_EMA" != 0 ]] && { ARM_FLAGS+=(--halt_fisher_ema="$HALT_FISHER_EMA"); RUN+="_hfema${HALT_FISHER_EMA}"; }
+      [[ "$HALT_TRUST" != 0 ]] && { ARM_FLAGS+=(--halt_trust_region="$HALT_TRUST"); RUN+="_htr${HALT_TRUST}"; } ;;
     *) echo "HALT_HEAD must be none, distance, raw or convtest, got $HALT_HEAD"; exit 1 ;;
   esac
   case "$HALT_KL_REVERSE" in

@@ -169,6 +169,8 @@ class Args:
     halt_damping: float = 1e-3            # convtest: damping added to the Fisher Sigma
     halt_fisher_ema: float = 0.0          # convtest, halt_precondition: precondition with an EMA of Sigma over minibatch
                                           # updates (decay beta, bias-corrected); 0: each minibatch's own Sigma
+    halt_trust_region: float = 0.0        # convtest, halt_precondition: cap the step's predicted KL of the decisions,
+                                          # 1/2 dtheta^T Sigma dtheta, at delta: step min(halt_lr, sqrt(2 delta / g^T Sigma^-1 g)) Sigma^-1 g; 0: off
     halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(path) inside PPO's ratio; 'next' = the softmax over k
@@ -807,7 +809,15 @@ def main(args: Args):
                 metrics.update({'halt_fisher_00': fisher[0, 0], 'halt_fisher_01': fisher[0, 1], 'halt_fisher_11': fisher[1, 1]})
             if fisher is not None and args.halt_precondition:  # convtest: head gradient g -> Sigma^-1 g (SGD in the optimizer)
                 p = grads['params']
-                g = jnp.linalg.solve(fisher, jnp.stack([p['theta0'], p['theta1']]))
+                g_raw = jnp.stack([p['theta0'], p['theta1']])
+                g = jnp.linalg.solve(fisher, g_raw)
+                g_nat = jnp.dot(g_raw, g)  # g^T Sigma^-1 g: the predicted KL of an SGD step is halt_lr^2 g_nat / 2
+                metrics['halt_step_kl'] = 0.5 * args.halt_lr ** 2 * g_nat
+                if args.halt_trust_region > 0.0:  # shrink so the step's predicted KL is at most delta
+                    shrink = jnp.minimum(1.0, jnp.sqrt(2.0 * args.halt_trust_region / jnp.maximum(g_nat, 1e-30)) / args.halt_lr)
+                    g = g * shrink
+                    metrics['halt_trust_shrink'] = shrink
+                    metrics['halt_trust_active'] = (shrink < 1.0).astype(jnp.float32)
                 grads = {**grads, 'params': {**p, 'theta0': g[0], 'theta1': g[1]}}
             new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
             if use_loss_scale:
