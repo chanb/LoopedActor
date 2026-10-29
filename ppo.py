@@ -167,6 +167,8 @@ class Args:
                                           # off: Adam with halt_lr
     halt_lr: float = 1e-2                 # convtest: learning rate of (theta0, theta1)
     halt_damping: float = 1e-3            # convtest: damping added to the Fisher Sigma
+    halt_fisher_ema: float = 0.0          # convtest, halt_precondition: precondition with an EMA of Sigma over minibatch
+                                          # updates (decay beta, bias-corrected); 0: each minibatch's own Sigma
     halt_head_width: int = 32             # fprm_mem_halt: hidden width of the halting MLP
     halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(path) inside PPO's ratio; 'next' = the softmax over k
@@ -198,6 +200,7 @@ class PPOTrainingState(TrainState):
     env_steps: float
     loss_scale: Any  # () float32, dynamic fp16 loss scale (unused unless compute_dtype=float16 and dynamic_loss_scale)
     loss_scale_good_steps: Any  # () int32, consecutive finite-gradient steps since the last scale change
+    halt_fisher: Any  # (2, 2) float32, convtest: the EMA of the (damped) Fisher Sigma, before bias correction
 
 
 class Transition(NamedTuple):
@@ -478,6 +481,7 @@ def main(args: Args):
         env_steps=np.zeros((), dtype=np.float64),
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
+        halt_fisher=jnp.zeros((2, 2), jnp.float32),
     )
     stochastic_halt = args.architecture == 'fprm_mem_halt'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt)
@@ -794,11 +798,18 @@ def main(args: Args):
             if args.max_grad_norm > 0.0:
                 metrics['grad_clip_frac'] = (grad_norm > args.max_grad_norm).astype(jnp.float32)
             fisher = metrics.pop('halt_fisher', None)
+            fisher_ema = training_state.halt_fisher
+            if fisher is not None and args.halt_fisher_ema > 0.0:  # Sigma <- the bias-corrected EMA over minibatch updates
+                beta = args.halt_fisher_ema
+                fisher_ema = beta * fisher_ema + (1.0 - beta) * fisher
+                fisher = fisher_ema / (1.0 - beta ** (training_state.step + 1).astype(jnp.float32))
+            if fisher is not None:
+                metrics.update({'halt_fisher_00': fisher[0, 0], 'halt_fisher_01': fisher[0, 1], 'halt_fisher_11': fisher[1, 1]})
             if fisher is not None and args.halt_precondition:  # convtest: head gradient g -> Sigma^-1 g (SGD in the optimizer)
                 p = grads['params']
                 g = jnp.linalg.solve(fisher, jnp.stack([p['theta0'], p['theta1']]))
                 grads = {**grads, 'params': {**p, 'theta0': g[0], 'theta1': g[1]}}
-            new_training_state = training_state.apply_gradients(grads=grads)
+            new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
             if use_loss_scale:
                 # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
                 # consecutive finite steps.
