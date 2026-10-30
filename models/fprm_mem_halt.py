@@ -28,6 +28,7 @@ every pass (h_n = p_n(0)); K = 4 can skip up to 4 passes at once.
 What a decision at pass n reads. Let h_n be the latent at the readout head (the readout token's output at pass n, from
 which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergence test compares and its distance S:
   'kl':     z_n = pi_n,  S_{n+1} = KL(pi_{n+1} || pi_n)
+  'tv':     z_n = pi_n,  S_{n+1} = TV(pi_{n+1}, pi_n) = 1/2 sum_a |pi_{n+1}(a) - pi_n(a)|
   'latent': z_n = h_n,   S_{n+1} = ||rms_norm(h_{n+1}) - rms_norm(h_n)||   (L2 of what the readout heads read)
 `halt_head` picks the head, each a one-hidden-layer GELU MLP (width `halt_head_width`) with K + 1 outputs and a
 zero-initialized output layer, so k is uniform at init:
@@ -39,7 +40,8 @@ n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass
 stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
 'convtest' (K = 1, also lookahead): logit p_n(0) = theta0 + theta1 f_n, f_n = convtest_features(S_{n+1}, S_n).
 With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
-rate (KL's ratio would be its square); decision 1's S_1 is against uniform ('kl') or the initial latent ('latent').
+rate (KL's ratio would be its square); 'tv' is a distance as is. Decision 1's S_1 is against uniform ('kl', 'tv') or the
+initial latent ('latent').
 
 Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose latent is carried between passes like the
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
@@ -327,7 +329,7 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     stable_kl: bool = False        # KL_i without the fp32 rounding floor (see the module docstring)
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
-    halt_signal: str = 'kl'        # 'kl' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
+    halt_signal: str = 'kl'        # 'kl' | 'tv' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
     halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' | 'convtest' (see the module docstring)
     halt_offset: str = 'none'      # convtest: 'none' | 'uniform' (o_n = -log(T - n): c ~ Uniform{1..T} at init)
     halt_head_width: int = 32      # hidden width of the halting MLP
@@ -348,7 +350,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout'), self.action_head
         assert self.max_think_iters >= 1, self.max_think_iters
         assert not self.halting or self.halt_max_skip >= 1
-        assert self.halt_signal in ('kl', 'latent'), self.halt_signal
+        assert self.halt_signal in ('kl', 'tv', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         assert self.value_token in ('', 'thought', 'sep'), self.value_token
         assert self.halt_token in ('', 'thought', 'sep'), self.halt_token
@@ -421,7 +423,7 @@ class FPRMMemHaltActorValue(nn.Module):
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
             if self.halting and self.halt_head != 'convtest':
-                n_in = {'none': H, 'distance': 1, 'raw': 2 * (self.output_dim_1 if self.halt_signal == 'kl' else H)}[self.halt_head]
+                n_in = {'none': H, 'distance': 1, 'raw': 2 * (H if self.halt_signal == 'latent' else self.output_dim_1)}[self.halt_head]
                 self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
         params = self.variables['params']
         core_p, actor_p, value_p = params['core'], params['actor_head'], params['value_head']
@@ -458,7 +460,7 @@ class FPRMMemHaltActorValue(nn.Module):
                 x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
             elif self.halt_head == 'distance':
                 x = jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None]
-            elif self.halt_signal == 'kl':
+            elif self.halt_signal != 'latent':  # the policies
                 log_softmax = stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax
                 x = sg(jnp.concatenate([log_softmax(logits_prev), log_softmax(logits)], -1))
             else:
@@ -498,6 +500,10 @@ class FPRMMemHaltActorValue(nn.Module):
             if self.halt_signal == 'latent':  # L2; pass 1: against the initial latent, unused
                 dh = rms_norm(h_new, eps=cfg.rms_norm_eps) - rms_norm(h_prev, eps=cfg.rms_norm_eps)
                 sig = jnp.linalg.norm(jax.lax.stop_gradient(dh).astype(jnp.float32), axis=-1)
+            elif self.halt_signal == 'tv':  # pass 1: against uniform (logits_init = 0)
+                softmax = lambda v: jnp.exp((stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(v))
+                dp = softmax(logits.astype(jnp.float32)) - softmax(logits_prev.astype(jnp.float32))
+                sig = 0.5 * jnp.sum(jnp.abs(jax.lax.stop_gradient(dp)), axis=-1)
             else:
                 sig = kl
             logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite)
@@ -556,6 +562,8 @@ class FPRMMemHaltActorValue(nn.Module):
                 if self.halt_signal == 'kl':  # sqrt(2 KL): a distance (local Fisher-Rao length), so S_(n+1) / S_n is L, not L^2
                     to_dist = lambda s: jnp.sqrt(2 * jnp.maximum(s, 0.0))
                     f = convtest_features(to_dist(sig_t), to_dist(sig_prev_t), 1.0)[2]
+                elif self.halt_signal == 'tv':  # already a distance
+                    f = convtest_features(sig_t, sig_prev_t, 1.0)[2]
                 else:
                     f = convtest_features(sig_t, sig_prev_t, math.sqrt(self.config.d_model))[2]
             else:  # the rollout's features [B, T] (replay: the path probability then moves with the head only)

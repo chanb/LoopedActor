@@ -193,7 +193,8 @@ if [[ "$ARM" == mem_halt ]]; then
   case "$HALT_SIGNAL" in
     kl) ;;
     latent) ARM_FLAGS+=(--halt_signal=latent); RUN+="_hlat" ;;
-    *) echo "HALT_SIGNAL must be kl or latent (no signal: HALT_HEAD=none), got $HALT_SIGNAL"; exit 1 ;;
+    tv) ARM_FLAGS+=(--halt_signal=tv); RUN+="_htv" ;;
+    *) echo "HALT_SIGNAL must be kl, tv or latent (no signal: HALT_HEAD=none), got $HALT_SIGNAL"; exit 1 ;;
   esac
 fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / HALT_MAX_SKIP (shared study settings)
 if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then

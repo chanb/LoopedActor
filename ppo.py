@@ -148,7 +148,7 @@ class Args:
     stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
     stable_softmax: bool = False          # fprm_mem / fprm_mem_halt: collapse-free log-softmax for the action policy
                                            # (and, fprm_mem_halt only, the halting head)
-    halt_signal: str = 'kl'               # fprm_mem_halt: what the distance / raw / convtest heads compare: 'kl' (the policies) | 'latent' (the readout latents, L2)
+    halt_signal: str = 'kl'               # fprm_mem_halt: what the distance / raw / convtest heads compare: 'kl' (the policies) | 'tv' (the policies, total variation) | 'latent' (the readout latents, L2)
     halt_max_skip: int = 1                # fprm_mem_halt: each halting decision picks 0..this more passes (0 = halt; 1 = yes/no at every pass)
     readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
     value_token: str = ''                 # fprm_mem / fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': where the value is read from

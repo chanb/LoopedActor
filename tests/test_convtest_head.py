@@ -84,6 +84,20 @@ def test_features_kl(stable_kl):
     np.testing.assert_allclose(out['halt_feature_t'][:-1], f, rtol=1e-5, atol=1e-5)
 
 
+def test_features_tv():
+    # halt_signal='tv': S_n = TV(pi_n, pi_(n-1)) = 1/2 sum |pi_n - pi_(n-1)| (S_1 against uniform), read unnormalized.
+    from models.fprm_mem_halt import convtest_features
+    x = _x()
+    net = _net(halt_head='convtest', halt_signal='tv', halt_max_skip=1, min_think_iters=1)
+    out = _apply(net, net.init(jax.random.PRNGKey(0), x)['params'], x)
+    pi = jnp.exp(out['policy_log_probs_t'])  # [T, B, A]
+    prev = jnp.concatenate([jnp.full_like(pi[:1], 1.0 / pi.shape[-1]), pi[:-1]], axis=0)
+    s = out['halt_signal_t']
+    np.testing.assert_allclose(s, 0.5 * jnp.sum(jnp.abs(pi - prev), -1), rtol=1e-5, atol=1e-7)
+    _, _, f = convtest_features(s[1:], s[:-1], 1.0)
+    np.testing.assert_allclose(out['halt_feature_t'][:-1], f, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize('offset', ['uniform', 'none'])
 def test_init(offset):
     x = _x()

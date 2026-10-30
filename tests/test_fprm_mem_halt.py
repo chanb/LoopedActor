@@ -128,7 +128,7 @@ def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
     assert float(jnp.sum(jnp.abs(g['halt_hidden']['kernel']))) > 0
 
 
-@pytest.mark.parametrize('signal', ['kl', 'latent'])
+@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
 def test_lookahead_halts_with_previous_pass(signal):
     # Lookahead: c = 1 is decided on pass 2 and acts with pi_1 (= the output of a 1-pass net); fp_residual is the
     # signal of pass 2.
@@ -144,7 +144,7 @@ def test_lookahead_halts_with_previous_pass(signal):
 
 
 @pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'latent'])
+@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
 def test_distance_head_reads_the_next_signal(K, signal):
     # 'distance': the decision at pass n is softmax(MLP(log S_{n+1})), a GELU MLP of the scalar.
     net = _net(min_think_iters=1, halt_signal=signal, halt_max_skip=K)
@@ -283,7 +283,7 @@ def _signal_head_case(K, signal, head):
 
 
 @pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'latent'])
+@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
 @pytest.mark.parametrize('head', ['none', 'distance', 'raw'])
 def test_every_head_starts_uniform(K, signal, head):
     kw, x, params, _ = _signal_head_case(K, signal, head)
@@ -291,9 +291,10 @@ def test_every_head_starts_uniform(K, signal, head):
 
 
 @pytest.mark.parametrize('K', [1, 4])
-def test_raw_kl_head_reads_both_policies(K):
+@pytest.mark.parametrize('signal', ['kl', 'tv'])
+def test_raw_policy_head_reads_both_policies(K, signal):
     # The decision at pass 1 is softmax(g([log pi_1, log pi_2])); pi_n = the policy of an n-pass net.
-    kw, x, _, params = _signal_head_case(K, 'kl', 'raw')
+    kw, x, _, params = _signal_head_case(K, signal, 'raw')
     log_pi = [jax.nn.log_softmax(_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=n, **kw), params, x,
                                         halt_steps=jnp.full((3,), n), halt_path=jnp.zeros((3,), int))['logits'], -1)
           for n in (1, 2)]  # replaying c = n just selects pi_n
