@@ -39,6 +39,8 @@ zero-initialized output layer, so k is uniform at init:
 n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
 stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
 'convtest' (K = 1, also lookahead): logit p_n(0) = theta0 + theta1 f_n, f_n = convtest_features(S_{n+1}, S_n).
+`halt_convtest_split` unties the two terms of f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
+(theta2 = theta1 is the tied head; theta2 = 0 a test on the step size alone).
 With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
 rate (KL's ratio would be its square); 'tv' is a distance as is. Decision 1's S_1 is against uniform ('kl', 'tv') or the
 initial latent ('latent').
@@ -205,12 +207,11 @@ def convtest_features(s_next, s_prev, scale):
 
 
 def convtest_fisher(f, p, mask, damping):
-    """Fisher of the convtest head's (theta0, theta1): mean over states of sum over decision passes of
-    p (1 - p) phi phi^T, phi = [1, f], plus damping * I. f, p, mask: [passes, B]."""
+    """Fisher of the convtest head's (theta0, theta1[, theta2]): mean over states of sum over decision passes of
+    p (1 - p) phi phi^T, phi = [1, f], plus damping * I. f: [passes, B] or, split, [passes, B, 2]; p, mask: [passes, B]."""
     w = jnp.where(mask, p * (1 - p), 0.0)
-    m = lambda v: jnp.mean(jnp.sum(w * v, axis=0))
-    s1, sf, sff = m(1.0), m(f), m(f * f)
-    return jnp.stack([jnp.stack([s1, sf]), jnp.stack([sf, sff])]) + damping * jnp.eye(2)
+    phi = jnp.concatenate([jnp.ones(p.shape + (1,), f.dtype), f[..., None] if f.ndim == 2 else f], axis=-1)
+    return jnp.einsum('nb,nbi,nbj->ij', w, phi, phi) / p.shape[1] + damping * jnp.eye(phi.shape[-1])
 
 
 def step_path_log_prob(lp, mask, c):
@@ -331,6 +332,7 @@ class FPRMMemHaltActorValue(nn.Module):
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
     halt_signal: str = 'kl'        # 'kl' | 'tv' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
     halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' | 'convtest' (see the module docstring)
+    halt_convtest_split: bool = False  # convtest: theta0 + theta1 a_n + theta2 logit(L_n) (see the module docstring)
     halt_offset: str = 'none'      # convtest: 'none' | 'uniform' (o_n = -log(T - n): c ~ Uniform{1..T} at init)
     halt_head_width: int = 32      # hidden width of the halting MLP
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
@@ -367,6 +369,8 @@ class FPRMMemHaltActorValue(nn.Module):
             theta0 = 0.0 if self.halt_offset == 'uniform' else -math.log(max(self.max_think_iters - 1, 1))
             self.theta0 = self.param('theta0', lambda _: jnp.float32(theta0))
             self.theta1 = self.param('theta1', lambda _: jnp.float32(0.0))
+            if self.halt_convtest_split:
+                self.theta2 = self.param('theta2', lambda _: jnp.float32(0.0))
         elif self.halting:
             self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
                 self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
@@ -561,16 +565,21 @@ class FPRMMemHaltActorValue(nn.Module):
             if halt_features is None:
                 if self.halt_signal == 'kl':  # sqrt(2 KL): a distance (local Fisher-Rao length), so S_(n+1) / S_n is L, not L^2
                     to_dist = lambda s: jnp.sqrt(2 * jnp.maximum(s, 0.0))
-                    f = convtest_features(to_dist(sig_t), to_dist(sig_prev_t), 1.0)[2]
+                    a, L, f = convtest_features(to_dist(sig_t), to_dist(sig_prev_t), 1.0)
                 elif self.halt_signal == 'tv':  # already a distance
-                    f = convtest_features(sig_t, sig_prev_t, 1.0)[2]
+                    a, L, f = convtest_features(sig_t, sig_prev_t, 1.0)
                 else:
-                    f = convtest_features(sig_t, sig_prev_t, math.sqrt(self.config.d_model))[2]
-            else:  # the rollout's features [B, T] (replay: the path probability then moves with the head only)
-                f = jnp.asarray(halt_features, jnp.float32).reshape(B, T).T
+                    a, L, f = convtest_features(sig_t, sig_prev_t, math.sqrt(self.config.d_model))
+                if self.halt_convtest_split:  # [T, B, 2]
+                    f = jnp.stack([a, jnp.log(L / (1 - L))], axis=-1)
+            else:  # the rollout's features [B, T(, 2)] (replay: the path probability then moves with the head only)
+                f = jnp.asarray(halt_features, jnp.float32).reshape((B, T, 2) if self.halt_convtest_split else (B, T)).swapaxes(0, 1)
             n = jnp.arange(1, T + 1)[:, None]
             o = -jnp.log(jnp.maximum(T - n, 1)) if self.halt_offset == 'uniform' else 0.0
-            logit = self.theta0 + self.theta1 * f + o
+            if self.halt_convtest_split:
+                logit = self.theta0 + self.theta1 * f[..., 0] + self.theta2 * f[..., 1] + o
+            else:
+                logit = self.theta0 + self.theta1 * f + o
             head_t = jnp.stack([logit, jnp.zeros_like(logit)], axis=-1)
             self.sow('intermediates', 'halt_feature_t', f)
         lp_t = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(head_t)  # [T, B, K + 1]

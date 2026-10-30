@@ -144,34 +144,67 @@ def test_replay_features():
     assert not np.allclose(recomputed['halt_log_prob'], roll['halt_log_prob'], atol=1e-4)
 
 
-def test_fisher_preconditioner_logistic():
+@pytest.mark.parametrize('n_feat', [1, 2])
+def test_fisher_preconditioner_logistic(n_feat):
     # Logistic regression over decision passes: g = grad of the mean (over states) summed NLL, Sigma = the Fisher
-    # mean_b sum_n p (1 - p) phi phi^T + damping I; Sigma^-1 g must equal the analytic Fisher step.
+    # mean_b sum_n p (1 - p) phi phi^T + damping I; Sigma^-1 g must equal the analytic Fisher step. n_feat = 2: the
+    # split head's features (a, logit L), [passes, B, 2].
     from models.fprm_mem_halt import convtest_fisher
     B, n_pass, damping = 64, 5, 1e-3
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
-    f = jax.random.normal(k1, (n_pass, B)) * 2.0
+    f = jax.random.normal(k1, (n_pass, B, n_feat)) * 2.0
     mask = jax.random.bernoulli(k2, 0.7, (n_pass, B))
-    y = jax.random.bernoulli(k3, jax.nn.sigmoid(1.0 - 1.5 * f)).astype(jnp.float32)
-    theta = jnp.array([0.2, -0.4])
+    theta = jnp.array([0.2, -0.4, 0.3][:n_feat + 1])
+    z_fn = lambda th: th[0] + f @ th[1:]
+    y = jax.random.bernoulli(k3, jax.nn.sigmoid(z_fn(jnp.array([1.0, -1.5, 0.5][:n_feat + 1])))).astype(jnp.float32)
+    f_in = f[..., 0] if n_feat == 1 else f
 
     def nll(theta):
-        z = theta[0] + theta[1] * f
+        z = z_fn(theta)
         return jnp.mean(jnp.sum(jnp.where(mask, -(y * jax.nn.log_sigmoid(z) + (1 - y) * jax.nn.log_sigmoid(-z)), 0.0), 0))
 
     g = jax.grad(nll)(theta)
-    p = jax.nn.sigmoid(theta[0] + theta[1] * f)
-    step = jnp.linalg.solve(convtest_fisher(f, p, mask, damping), g)
+    p = jax.nn.sigmoid(z_fn(theta))
+    step = jnp.linalg.solve(convtest_fisher(f_in, p, mask, damping), g)
 
     f64, p64, m64 = (np.asarray(v, np.float64) for v in (f, p, mask))
-    F = np.zeros((2, 2))
+    F = np.zeros((n_feat + 1, n_feat + 1))
     for b in range(B):
         for n in range(n_pass):
             if m64[n, b]:
-                phi = np.array([1.0, f64[n, b]])
+                phi = np.concatenate([[1.0], f64[n, b]])
                 F += p64[n, b] * (1 - p64[n, b]) * np.outer(phi, phi)
-    F = F / B + damping * np.eye(2)
+    F = F / B + damping * np.eye(n_feat + 1)
     np.testing.assert_allclose(step, np.linalg.solve(F, np.asarray(g, np.float64)), rtol=1e-4)
+
+
+def test_split_head():
+    # halt_convtest_split: logit = theta0 + theta1 a_n + theta2 logit(L_n); theta2 = theta1 is the tied head, and the
+    # sown features [T, B, 2] = (a, logit L) replay like the tied head's f.
+    from models.fprm_mem_halt import convtest_features
+    x = _x(8)
+    net = _net(halt_convtest_split=True, **CONV)
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    assert float(params['theta2']) == 0.0
+    params = {**params, 'theta0': jnp.float32(-1.0), 'theta1': jnp.float32(-0.7), 'theta2': jnp.float32(-0.2)}
+    out = _apply(net, params, x)
+    s = out['halt_signal_t']
+    a, L, _ = convtest_features(s[1:], s[:-1], math.sqrt(H))
+    feats = out['halt_feature_t']
+    assert feats.shape == (T, 8, 2)
+    np.testing.assert_allclose(feats[:-1, :, 0], a, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(feats[:-1, :, 1], jnp.log(L / (1 - L)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(out['halt_step_log_probs'][:-1, :, 0],
+                               jax.nn.log_sigmoid(-1.0 - 0.7 * a - 0.2 * jnp.log(L / (1 - L))), rtol=1e-5, atol=1e-5)
+    tied = {**params, 'theta2': params['theta1']}
+    unsplit = {k: v for k, v in tied.items() if k != 'theta2'}
+    np.testing.assert_allclose(_apply(net, tied, x)['halt_step_log_probs'],
+                               _apply(_net(**CONV), unsplit, x)['halt_step_log_probs'], rtol=1e-5, atol=1e-5)
+    roll = _apply(net, params, x, halt_key=jax.random.PRNGKey(3))
+    noisy = jax.tree_util.tree_map(lambda p: p + 0.3 * jax.random.normal(jax.random.PRNGKey(4), p.shape), params['core'])
+    stored = _apply(net, {**params, 'core': noisy}, x, halt_features=roll['halt_feature_t'].swapaxes(0, 1),
+                    halt_steps=roll['fp_iterations'], halt_path=roll['halt_path'])
+    np.testing.assert_allclose(stored['halt_log_prob'], roll['halt_log_prob'], atol=1e-6)
 
 
 def golden_outputs(kw):

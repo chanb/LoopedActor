@@ -161,6 +161,7 @@ class Args:
                                           # readout pass (T, or c with value_pass=halt) on the same target: V(s) at every depth
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw');
                                           # 'convtest': learned convergence test theta0 + theta1 f_n (models/fprm_mem_halt.py)
+    halt_convtest_split: bool = False     # convtest: untie f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
     halt_offset: str = 'none'             # convtest: 'uniform' adds o_n = -log(T - n) to the halt logit (c ~ Uniform at init)
     halt_replay_features: bool = True     # convtest: the loss replays the rollout's features f instead of recomputing them
     halt_precondition: bool = True        # convtest: update (theta0, theta1) by SGD on Sigma^-1 g (Fisher of the decisions);
@@ -202,7 +203,7 @@ class PPOTrainingState(TrainState):
     env_steps: float
     loss_scale: Any  # () float32, dynamic fp16 loss scale (unused unless compute_dtype=float16 and dynamic_loss_scale)
     loss_scale_good_steps: Any  # () int32, consecutive finite-gradient steps since the last scale change
-    halt_fisher: Any  # (2, 2) float32, convtest: the EMA of the (damped) Fisher Sigma, before bias correction
+    halt_fisher: Any  # (2, 2) float32 ((3, 3) with halt_convtest_split), convtest: the EMA of the (damped) Fisher Sigma, before bias correction
 
 
 class Transition(NamedTuple):
@@ -282,14 +283,14 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
                 extras['halt_path'] = inter['intermediates']['halt_path'][0]
                 extras['halt_decision_log_probs'] = inter['intermediates']['halt_decision_log_probs'][0]
             if 'halt_feature_t' in inter['intermediates']:  # convtest: the features the decisions read, [B, T]
-                extras['halt_features'] = inter['intermediates']['halt_feature_t'][0].T
+                extras['halt_features'] = inter['intermediates']['halt_feature_t'][0].swapaxes(0, 1)
             return actions, extras
 
         return policy
     return make_policy
 
 
-HALT_PARAMS = ('halt_hidden', 'halt_out', 'theta0', 'theta1')  # the halting head's param groups
+HALT_PARAMS = ('halt_hidden', 'halt_out', 'theta0', 'theta1', 'theta2')  # the halting head's param groups
 
 
 def make_optimizer(args, init_params=None):
@@ -435,6 +436,7 @@ def main(args: Args):
             halt_signal=args.halt_signal,
             halt_head=args.halt_head,
             halt_offset=args.halt_offset,
+            halt_convtest_split=args.halt_convtest_split,
             halt_head_width=args.halt_head_width,
             readout_token=args.readout_token,
             value_token=args.value_token,
@@ -483,7 +485,7 @@ def main(args: Args):
         env_steps=np.zeros((), dtype=np.float64),
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
-        halt_fisher=jnp.zeros((2, 2), jnp.float32),
+        halt_fisher=jnp.zeros((3, 3) if args.halt_convtest_split else (2, 2), jnp.float32),
     )
     stochastic_halt = args.architecture == 'fprm_mem_halt'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt)
@@ -692,6 +694,8 @@ def main(args: Args):
                 safe = jnp.abs(theta1) > 1e-6
                 halt_metrics.update({'halt_theta0': theta0, 'halt_theta1': theta1, 'halt_kappa': -theta1,
                                      'halt_log_eps': jnp.where(safe, -theta0 / jnp.where(safe, theta1, 1.0), jnp.nan)})
+                if args.halt_convtest_split:
+                    halt_metrics['halt_theta2'] = params['params']['theta2']
                 # Fisher of the decisions on the sampled paths (passes n <= T - 1), for the preconditioned head update
                 f = inter['intermediates']['halt_feature_t'][0][:-1]  # [T - 1, B]
                 p = jnp.exp(inter['intermediates']['halt_step_log_probs'][0][:-1, :, 0])
@@ -810,10 +814,11 @@ def main(args: Args):
                 fisher_ema = beta * fisher_ema + (1.0 - beta) * fisher
                 fisher = fisher_ema / (1.0 - beta ** (training_state.step + 1).astype(jnp.float32))
             if fisher is not None:
-                metrics.update({'halt_fisher_00': fisher[0, 0], 'halt_fisher_01': fisher[0, 1], 'halt_fisher_11': fisher[1, 1]})
+                metrics.update({f'halt_fisher_{i}{j}': fisher[i, j] for i in range(len(fisher)) for j in range(i, len(fisher))})
             if fisher is not None and args.halt_precondition:  # convtest: head gradient g -> Sigma^-1 g (SGD in the optimizer)
                 p = grads['params']
-                g_raw = jnp.stack([p['theta0'], p['theta1']])
+                names = ('theta0', 'theta1', 'theta2')[:len(fisher)]
+                g_raw = jnp.stack([p[k] for k in names])
                 g = jnp.linalg.solve(fisher, g_raw)
                 g_nat = jnp.dot(g_raw, g)  # g^T Sigma^-1 g: the predicted KL of an SGD step is halt_lr^2 g_nat / 2
                 metrics['halt_step_kl'] = 0.5 * args.halt_lr ** 2 * g_nat
@@ -822,7 +827,7 @@ def main(args: Args):
                     g = g * shrink
                     metrics['halt_trust_shrink'] = shrink
                     metrics['halt_trust_active'] = (shrink < 1.0).astype(jnp.float32)
-                grads = {**grads, 'params': {**p, 'theta0': g[0], 'theta1': g[1]}}
+                grads = {**grads, 'params': {**p, **{k: g[i] for i, k in enumerate(names)}}}
             new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
             if use_loss_scale:
                 # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period

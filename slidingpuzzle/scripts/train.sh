@@ -50,6 +50,7 @@
 #                       estimated distance to the fixed point from S_(n+1), S_n (_hhconv; needs HALT_MAX_SKIP=1,
 #                       MIN_THINK_ITERS=1; HALT_SIGNAL=kl reads sqrt(2 KL), S_1 against uniform; use STABLE_KL=1).
 #                       Its settings (run-name suffix only when not the default):
+#     HALT_SPLIT=0|1      untie f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n) (default 0; 1: _hsplit)
 #     HALT_OFFSET=none|uniform  o_n = -log(T - n), c ~ Uniform{1..T} at init (_hoffuniform; default none)
 #     HALT_REPLAY=1|0     the loss replays the rollout's features (default 1; 0: _hnoreplay)
 #     HALT_PRECOND=1|0    SGD on Sigma^-1 g, Sigma the decisions' Fisher (default 1; 0: Adam, _hnoprecond)
@@ -118,7 +119,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; HALT_TRUST="${HALT_TRUST:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_SPLIT="${HALT_SPLIT:-0}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; HALT_TRUST="${HALT_TRUST:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -171,6 +172,7 @@ if [[ "$ARM" == mem_halt ]]; then
                        [[ "$HALT_HEAD_WIDTH" != 32 ]] && RUN+="${HALT_HEAD_WIDTH}"
                        [[ "$HALT_HEAD" != none ]] && RUN+="_look" ;;
     convtest) ARM_FLAGS+=(--halt_head=convtest); RUN+="_hhconv"
+      [[ "$HALT_SPLIT" == 1 ]] && { ARM_FLAGS+=(--halt_convtest_split); RUN+="_hsplit"; }
       [[ "$HALT_OFFSET" != none ]] && { ARM_FLAGS+=(--halt_offset="$HALT_OFFSET"); RUN+="_hoff${HALT_OFFSET}"; }
       [[ "$HALT_REPLAY" == 0 ]] && { ARM_FLAGS+=(--no-halt_replay_features); RUN+="_hnoreplay"; }
       [[ "$HALT_PRECOND" == 0 ]] && { ARM_FLAGS+=(--no-halt_precondition); RUN+="_hnoprecond"; }
