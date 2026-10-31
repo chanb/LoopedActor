@@ -104,6 +104,7 @@ class Args:
                                           # board size); off: the models see raw observations and checkpoints store an identity normalizer
     # stabilization (all off by default)
     max_grad_norm: float = 0.0            # 0 = no gradient clipping
+    weight_decay: float = 0.0             # decoupled weight decay (AdamW) on every param except the halting head's; 0 = Adam
     target_kl: float = 0.0                # 0 = no KL early stop; else skip remaining minibatch updates in a rollout once approx_kl_action
                                           # (KL of the action policy pi_c(a|s) only, not the think time c) exceeds this
     anneal_lr: bool = False               # linearly decay lr to 0 over training
@@ -294,8 +295,8 @@ HALT_PARAMS = ('halt_hidden', 'halt_out', 'theta0', 'theta1', 'theta2')  # the h
 
 
 def make_optimizer(args, init_params=None):
-    """init_params is only needed (and required) when args.freeze_except_halt or the halting head's Adam betas are not
-    the defaults - its pytree structure labels halt_hidden/halt_out apart from every other param group."""
+    """init_params is only needed (and required) when args.freeze_except_halt, weight_decay or the halting head's Adam
+    betas are not the defaults - its pytree structure labels the halting head apart from every other param group."""
     if args.anneal_lr:
         total_grad_steps = (
             args.num_training_step
@@ -310,6 +311,8 @@ def make_optimizer(args, init_params=None):
     clip = lambda tx: optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx) if args.max_grad_norm > 0.0 else tx
     halt_tx = optax.adam(learning_rate=learning_rate, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
     halt_betas = (args.halt_adam_b1, args.halt_adam_b2) != (0.9, 0.999)
+    # The trunk (every param but the halting head's): AdamW with weight_decay, else Adam; the head is never decayed
+    trunk_tx = optax.adamw(learning_rate, weight_decay=args.weight_decay) if args.weight_decay > 0.0 else optax.adam(learning_rate)
 
     def labels(other):  # 'train' for the halting head's param groups, `other` for the rest
         return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in HALT_PARAMS else other, v)
@@ -319,16 +322,16 @@ def make_optimizer(args, init_params=None):
         # (theta0, theta1): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step), or Adam; clipping covers
         # the rest only, so the preconditioned head gradient does not scale the trunk's update.
         head = optax.sgd(args.halt_lr) if args.halt_precondition else optax.adam(args.halt_lr, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
-        return optax.multi_transform({'train': head, 'rest': clip(optax.adam(learning_rate=learning_rate))}, labels('rest'))
+        return optax.multi_transform({'train': head, 'rest': clip(trunk_tx)}, labels('rest'))
 
     if args.freeze_except_halt:
         assert init_params is not None, "freeze_except_halt needs init_params to build the freeze mask"
         # optax.masked() passes ungated gradients through unchanged for mask=False leaves - not a freeze. Use
         # multi_transform instead: 'frozen' groups get optax.set_to_zero(), an actual zero update.
         return optax.multi_transform({'train': clip(halt_tx), 'frozen': optax.set_to_zero()}, labels('frozen'))
-    if halt_betas:  # the halting head gets its own Adam moments; clipping stays global over all params
-        assert init_params is not None, "halt_adam_b1 / halt_adam_b2 need init_params to label the halting head"
-        return clip(optax.multi_transform({'train': halt_tx, 'rest': optax.adam(learning_rate=learning_rate)}, labels('rest')))
+    if halt_betas or args.weight_decay > 0.0:  # the halting head gets its own Adam; clipping stays global over all params
+        assert init_params is not None, "halt_adam_b1 / halt_adam_b2 / weight_decay need init_params to label the halting head"
+        return clip(optax.multi_transform({'train': halt_tx, 'rest': trunk_tx}, labels('rest')))
     return clip(optax.adam(learning_rate=learning_rate))
 
 
