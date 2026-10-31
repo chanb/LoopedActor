@@ -18,7 +18,7 @@ class State:
 
 def make_env(args):
     """Build the environment class and config from an env id
-    (sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>)."""
+    (sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>[-<train>-<eval>])."""
     sok = re.fullmatch(r"sokoban-([a-z_]+)-([a-z_]+)", args.env_id)  # sokoban-<train_split>-<eval_split>
     if sok is not None:
         from envs.sokoban_env import SokobanEnv, default_config as sokoban_config
@@ -46,13 +46,15 @@ def make_env(args):
         # Held-out (eval_reset) episodes: 0 = the training episode length.
         config.eval_episode_length = getattr(args, 'lightsout_eval_episode_length', 0) or config.episode_length
         return LightsOutEnv, config
-    sp = re.fullmatch(r"slidingpuzzle-(\d+)x(\d+)", args.env_id)  # slidingpuzzle-<N>x<N>, procedurally generated
+    # slidingpuzzle-<N>x<N> (procedural scrambles) or slidingpuzzle-<N>x<N>-<train_split>-<eval_split> (level banks)
+    sp = re.fullmatch(r"slidingpuzzle-(\d+)x(\d+)(?:-([a-z0-9_]+)-([a-z0-9_]+))?", args.env_id)
     if sp is not None:
         if sp.group(1) != sp.group(2):
             raise ValueError(f"slidingpuzzle needs a square board, got {args.env_id}")
         from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config as slidingpuzzle_config
         config = slidingpuzzle_config()
         config.grid_size = int(sp.group(1))
+        config.train_split, config.eval_split = sp.group(3) or '', sp.group(4) or ''
         config.episode_length = getattr(args, 'slidingpuzzle_episode_length', 40)
         config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
         config.min_random_moves = getattr(args, 'slidingpuzzle_min_random_moves', 0)
@@ -64,4 +66,4 @@ def make_env(args):
         config.eval_episode_length = getattr(args, 'slidingpuzzle_eval_episode_length', 0) or config.episode_length
         return SlidingPuzzleEnv, config
     raise ValueError(f"Environment {args.env_id} not supported (expected sokoban-<train>-<eval>, "
-                     f"rushhour-<train>-<eval>, lightsout-<m>x<n> or slidingpuzzle-<N>x<N>)")
+                     f"rushhour-<train>-<eval>, lightsout-<m>x<n> or slidingpuzzle-<N>x<N>[-<train>-<eval>])")

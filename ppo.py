@@ -63,7 +63,7 @@ class Args:
     save_checkpoint: bool = True
 
     # environment
-    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>
+    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>[-<train>-<eval>]
     num_envs: int = 2048
     num_eval_envs: int = 128
     sokoban_max_train_levels: int = 0     # sokoban-*: cap on training levels (0 = whole split)

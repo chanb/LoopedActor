@@ -72,3 +72,20 @@ def test_negative_zipf_favours_long_scrambles():
     ramp = _env(num_random_moves=200, min_random_moves=1, eval_num_random_moves=200, random_moves_zipf=-1.0)
     d_uniform, d_ramp = _manhattan(uniform, _boards(uniform, 'reset')), _manhattan(ramp, _boards(ramp, 'reset'))
     assert (d_ramp <= 4).mean() < 0.5 * (d_uniform <= 4).mean() and d_ramp.mean() > 1.1 * d_uniform.mean()
+
+
+def test_bank_resets_3x3():
+    # slidingpuzzle-3x3-train-test: resets draw from the banks (train optimal length <= 28, test > 28), blank is tracked.
+    from types import SimpleNamespace
+    from envs.utils import make_env
+    from envs.slidingpuzzle_env import load_bank
+    cls, cfg = make_env(SimpleNamespace(env_id='slidingpuzzle-3x3-train-test'))
+    env = cls(cfg)
+    assert env.train_bank['puzzle'].shape[0] == 180457 and env.eval_bank['puzzle'].shape[0] == 983
+    for reset, bank in (('reset', env.train_bank), ('eval_reset', env.eval_bank)):
+        st = jax.vmap(getattr(env, reset))(jax.random.split(jax.random.PRNGKey(0), 256))
+        boards = {tuple(b) for b in np.asarray(bank['puzzle']).reshape(len(bank['puzzle']), -1)}
+        p = np.asarray(st.data.puzzle).reshape(256, -1)
+        assert all(tuple(b) in boards for b in p)
+        assert np.array_equal(p[np.arange(256), np.asarray(st.data.blank[:, 0] * 3 + st.data.blank[:, 1])], np.zeros(256))
+    assert int(load_bank(3, 'test')['moves'].min()) == 29 and int(load_bank(3, 'train')['moves'].max()) == 28

@@ -11,6 +11,9 @@ reversals allowed, so the scramble can be shallower than its length and occasion
 Training resets (`reset`) use `num_random_moves` (or, with `min_random_moves` > 0, a length drawn per reset
 from [min_random_moves, num_random_moves] with p(k) ∝ k^-random_moves_zipf; 0 = uniform, < 0 favours long scrambles), evaluation resets (`eval_reset`) always use the fixed
 `eval_num_random_moves` (default: the same, as in Stoix; raise it to evaluate on deeper scrambles).
+With `train_split` / `eval_split` set (env id slidingpuzzle-<N>x<N>-<train>-<eval>), resets instead draw a board uniformly
+from a level bank <DATA_DIR>/<N>x<N>/<split>.npz (puzzle [L,N,N] int8, moves [L] int16 optimal length), built by
+data_scripts/build_slidingpuzzle_banks.py (3x3: train = optimal length <= 28, test = > 28). No scrambling is done then.
 
 Observation: per-cell one-hot of the tile id (channel k = tile k, channel 0 = blank), cell-major flat
 vector of size N*N*N^2 (obs_channels N^2; the actor reshapes it to [N*N, N^2] tokens). No goal vector
@@ -21,6 +24,8 @@ Reward (sparse, jumanji SparseRewardFn): 1 when the board is solved (episode end
 Episode length set in the config (Stoix time_limit 40).
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -29,6 +34,7 @@ from ml_collections import config_dict
 
 from envs.utils import State
 
+DATA_DIR = os.environ.get('SLIDINGPUZZLE_DATA_DIR', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'slidingpuzzle'))
 MOVES = jnp.array([[-1, 0], [0, 1], [1, 0], [0, -1]], jnp.int32)  # blank moves: up, right, down, left
 BLANK = 0
 
@@ -48,6 +54,8 @@ def default_config() -> config_dict.ConfigDict:
         min_random_moves=0,        # > 0: each training reset draws its length from [this, num_random_moves] (0 = fixed)
         random_moves_zipf=0.0,     # min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform; > 0 favours short, < 0 long scrambles)
         eval_num_random_moves=10,  # evaluation scramble length
+        train_split='',            # non-empty: training resets draw from this level bank instead of scrambling
+        eval_split='',             # non-empty: evaluation resets draw from this level bank instead of scrambling
         step_penalty=0.0,          # 0 = sparse reward (jumanji SparseRewardFn)
         solve_reward=1.0,
     )
@@ -65,6 +73,8 @@ class SlidingPuzzleEnv:
         self.obs_channels = self.grid_size  # one-hot over the N^2 tile ids
         self.action_head = 'readout'
         self.solved = solved_puzzle(self.m)
+        self.train_bank = load_bank(self.m, config.train_split) if config.train_split else None
+        self.eval_bank = load_bank(self.m, config.eval_split) if config.eval_split else None
 
     @property
     def action_size(self): return 4
@@ -109,7 +119,15 @@ class SlidingPuzzleEnv:
             info={'rng': rng, 'target_goal': jnp.zeros((0,), jnp.float32)},
         )
 
+    def _reset_from_bank(self, rng, bank):
+        rng, key = jax.random.split(rng)
+        puzzle = bank['puzzle'][jax.random.randint(key, (), 0, bank['puzzle'].shape[0])]
+        b = jnp.argmin(puzzle.reshape(-1))  # the blank (0) is the only zero
+        return self._make_state(rng, SlidingPuzzleData(puzzle=puzzle, blank=jnp.stack([b // self.m, b % self.m])))
+
     def reset(self, rng: jax.Array) -> State:
+        if self.train_bank is not None:
+            return self._reset_from_bank(rng, self.train_bank)
         rng, key = jax.random.split(rng)
         cfg = self._config
         if cfg.min_random_moves <= 0:
@@ -120,6 +138,8 @@ class SlidingPuzzleEnv:
         return self._make_state(rng, self.scramble(key, cfg.num_random_moves, length))
 
     def eval_reset(self, rng: jax.Array) -> State:
+        if self.eval_bank is not None:
+            return self._reset_from_bank(rng, self.eval_bank)
         rng, key = jax.random.split(rng)
         return self._make_state(rng, self.scramble(key, self._config.eval_num_random_moves))
 
@@ -135,6 +155,11 @@ class SlidingPuzzleEnv:
             metrics={**state.metrics, 'success': success, 'reward': reward},
             info={**state.info, 'target_goal': state.info['target_goal']},
         )
+
+
+def load_bank(grid_size, split):
+    z = np.load(os.path.join(DATA_DIR, f'{grid_size}x{grid_size}', f'{split}.npz'))
+    return dict(puzzle=jnp.asarray(z['puzzle'].astype(np.int32)), moves=jnp.asarray(z['moves'].astype(np.int32)))
 
 
 def render_ascii(puzzle):
