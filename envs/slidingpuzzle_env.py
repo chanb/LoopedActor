@@ -14,6 +14,8 @@ from [min_random_moves, num_random_moves] with p(k) ∝ k^-random_moves_zipf; 0 
 With `train_split` / `eval_split` set (env id slidingpuzzle-<N>x<N>-<train>-<eval>), resets instead draw a board uniformly
 from a level bank <DATA_DIR>/<N>x<N>/<split>.npz (puzzle [L,N,N] int8, moves [L] int16 optimal length), built by
 data_scripts/build_slidingpuzzle_banks.py (3x3: train = optimal length <= 28, test = > 28). No scrambling is done then.
+Training resets draw the optimal length uniformly from the lengths in the bank, then a board of that length uniformly
+(short lengths have few boards, e.g. 4x4 d <= 14); evaluation resets draw a board uniformly from the bank.
 
 Observation: per-cell one-hot of the tile id (channel k = tile k, channel 0 = blank), cell-major flat
 vector of size N*N*N^2 (obs_channels N^2; the actor reshapes it to [N*N, N^2] tokens). No goal vector
@@ -119,15 +121,20 @@ class SlidingPuzzleEnv:
             info={'rng': rng, 'target_goal': jnp.zeros((0,), jnp.float32)},
         )
 
-    def _reset_from_bank(self, rng, bank):
-        rng, key = jax.random.split(rng)
-        puzzle = bank['puzzle'][jax.random.randint(key, (), 0, bank['puzzle'].shape[0])]
+    def _reset_from_bank(self, rng, bank, by_length=False):
+        rng, key, key_len = jax.random.split(rng, 3)
+        if by_length:  # uniform length, then a board of that length (the bank is sorted by length)
+            j = jax.random.randint(key_len, (), 0, bank['start'].shape[0])
+            idx = bank['start'][j] + jax.random.randint(key, (), 0, bank['count'][j])
+        else:
+            idx = jax.random.randint(key, (), 0, bank['puzzle'].shape[0])
+        puzzle = bank['puzzle'][idx]
         b = jnp.argmin(puzzle.reshape(-1))  # the blank (0) is the only zero
         return self._make_state(rng, SlidingPuzzleData(puzzle=puzzle, blank=jnp.stack([b // self.m, b % self.m])))
 
     def reset(self, rng: jax.Array) -> State:
         if self.train_bank is not None:
-            return self._reset_from_bank(rng, self.train_bank)
+            return self._reset_from_bank(rng, self.train_bank, by_length=True)
         rng, key = jax.random.split(rng)
         cfg = self._config
         if cfg.min_random_moves <= 0:
@@ -159,7 +166,11 @@ class SlidingPuzzleEnv:
 
 def load_bank(grid_size, split):
     z = np.load(os.path.join(DATA_DIR, f'{grid_size}x{grid_size}', f'{split}.npz'))
-    return dict(puzzle=jnp.asarray(z['puzzle'].astype(np.int32)), moves=jnp.asarray(z['moves'].astype(np.int32)))
+    order = np.argsort(z['moves'], kind='stable')
+    moves = z['moves'][order].astype(np.int32)
+    _, start, count = np.unique(moves, return_index=True, return_counts=True)  # per-length slices of the sorted bank
+    return dict(puzzle=jnp.asarray(z['puzzle'][order].astype(np.int32)), moves=jnp.asarray(moves),
+                start=jnp.asarray(start.astype(np.int32)), count=jnp.asarray(count.astype(np.int32)))
 
 
 def render_ascii(puzzle):

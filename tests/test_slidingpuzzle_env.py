@@ -89,3 +89,15 @@ def test_bank_resets_3x3():
         assert all(tuple(b) in boards for b in p)
         assert np.array_equal(p[np.arange(256), np.asarray(st.data.blank[:, 0] * 3 + st.data.blank[:, 1])], np.zeros(256))
     assert int(load_bank(3, 'test')['moves'].min()) == 29 and int(load_bank(3, 'train')['moves'].max()) == 28
+
+
+def test_bank_train_resets_uniform_in_length():
+    # Training resets draw the optimal length d uniformly, then a board of that length; eval resets stay uniform over boards.
+    from types import SimpleNamespace
+    from envs.utils import make_env
+    cls, cfg = make_env(SimpleNamespace(env_id='slidingpuzzle-3x3-train-test'))
+    env = cls(cfg)
+    moves = {p.tobytes(): int(m) for p, m in zip(np.asarray(env.train_bank['puzzle'], np.int8), np.asarray(env.train_bank['moves']))}
+    p = np.asarray(jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(0), 29 * 400)).data.puzzle, np.int8)
+    freq = np.bincount([moves[b.tobytes()] for b in p], minlength=29) / len(p)
+    assert np.all(np.abs(freq - 1 / 29) < 0.01), freq  # d = 0..28 each ~3.4% (binomial sd ~0.17%)
