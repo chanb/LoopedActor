@@ -162,6 +162,10 @@ class Args:
                                           # readout pass (T, or c with value_pass=halt) on the same target: V(s) at every depth
     halt_head: str = 'distance'           # fprm_mem_halt: halting MLP on h_n ('none'), on log S_(n+1) ('distance') or on [z_n, z_(n+1)] ('raw');
                                           # 'convtest': learned convergence test theta0 + theta1 f_n (models/fprm_mem_halt.py)
+                                          # 'sigmoid': sigmoid(beta - alpha log S_(n+1)), the kl_only-prev_latent head
+    halt_alpha_min: float = 0.0           # sigmoid: floor on the slope alpha (alpha = this + softplus(.), 1 at init)
+    halt_beta_head: bool = False          # sigmoid: state-dependent beta (Dense on h_(n+1)) instead of a scalar
+    halt_threshold_fixed: bool = False    # sigmoid: p(halt) = 1/2 at S = halt_kl throughout (beta = alpha log halt_kl)
     halt_convtest_split: bool = False     # convtest: untie f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
     halt_offset: str = 'none'             # convtest: 'uniform' adds o_n = -log(T - n) to the halt logit (c ~ Uniform at init)
     halt_replay_features: bool = True     # convtest: the loss replays the rollout's features f instead of recomputing them
@@ -291,7 +295,7 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     return make_policy
 
 
-HALT_PARAMS = ('halt_hidden', 'halt_out', 'theta0', 'theta1', 'theta2')  # the halting head's param groups
+HALT_PARAMS = ('halt_hidden', 'halt_out', 'theta0', 'theta1', 'theta2', 'halt_alpha_raw', 'halt_beta')  # the halting head's param groups
 
 
 def make_optimizer(args, init_params=None):
@@ -441,6 +445,10 @@ def main(args: Args):
             halt_offset=args.halt_offset,
             halt_convtest_split=args.halt_convtest_split,
             halt_head_width=args.halt_head_width,
+            halt_kl=args.halt_kl if args.halt_head == 'sigmoid' else 1e-3,
+            halt_alpha_min=args.halt_alpha_min,
+            halt_beta_head=args.halt_beta_head,
+            halt_threshold_fixed=args.halt_threshold_fixed,
             readout_token=args.readout_token,
             value_token=args.value_token,
             halt_token=args.halt_token,
@@ -692,6 +700,10 @@ def main(args: Args):
             c_idx = (data.extras['policy_extras']['compute_time'] - 1).astype(jnp.int32)
             res_c = jnp.take_along_axis(inter['intermediates']['latent_residual_t'][0], c_idx[None], axis=0)
             halt_metrics['latent_res_at_c'] = jnp.mean(res_c)
+            if args.halt_head == 'sigmoid':
+                hp = params['params']
+                halt_metrics['halt_alpha'] = args.halt_alpha_min + jax.nn.softplus(hp['halt_alpha_raw'])
+                halt_metrics['halt_beta'] = hp['halt_beta']['bias'][0]
             if args.halt_head == 'convtest':
                 theta0, theta1 = params['params']['theta0'], params['params']['theta1']
                 safe = jnp.abs(theta1) > 1e-6

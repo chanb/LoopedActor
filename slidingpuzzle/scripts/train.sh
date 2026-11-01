@@ -181,7 +181,11 @@ if [[ "$ARM" == mem_halt ]]; then
       [[ "$HALT_DAMPING" != 1e-3 ]] && { ARM_FLAGS+=(--halt_damping="$HALT_DAMPING"); RUN+="_hdamp${HALT_DAMPING}"; }
       [[ "$HALT_FISHER_EMA" != 0 ]] && { ARM_FLAGS+=(--halt_fisher_ema="$HALT_FISHER_EMA"); RUN+="_hfema${HALT_FISHER_EMA}"; }
       [[ "$HALT_TRUST" != 0 ]] && { ARM_FLAGS+=(--halt_trust_region="$HALT_TRUST"); RUN+="_htr${HALT_TRUST}"; } ;;
-    *) echo "HALT_HEAD must be none, distance, raw or convtest, got $HALT_HEAD"; exit 1 ;;
+    sigmoid) ARM_FLAGS+=(--halt_head=sigmoid --halt_kl="$HALT_KL"); RUN+="_hhsig_kl${HALT_KL}"  # kl_only-prev_latent head
+      [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_beta_head); RUN+="_hbeta"; }
+      [[ "${HALT_THRESHOLD_FIXED:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_hfixthr"; }
+      [[ "${HALT_ALPHA_MIN:-0}" != 0 ]] && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_hamin${HALT_ALPHA_MIN}"; } ;;
+    *) echo "HALT_HEAD must be none, distance, raw, convtest or sigmoid, got $HALT_HEAD"; exit 1 ;;
   esac
   case "$HALT_KL_REVERSE" in
     0) ;;

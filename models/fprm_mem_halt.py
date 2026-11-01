@@ -41,6 +41,10 @@ stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
 'convtest' (K = 1, also lookahead): logit p_n(0) = theta0 + theta1 f_n, f_n = convtest_features(S_{n+1}, S_n).
 `halt_convtest_split` unties the two terms of f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
 (theta2 = theta1 is the tied head; theta2 = 0 a test on the step size alone).
+'sigmoid' (K = 1, also lookahead; the kl_only-prev_latent head): logit p_n(0) = beta_{n+1} - alpha log S_{n+1},
+alpha = halt_alpha_min + softplus(.) (1 at init), beta a learned scalar (log halt_kl at init) or, with `halt_beta_head`,
+plus a zero-initialized Dense on rms_norm(h_{n+1}); p_n(0) = 1/2 at S = halt_kl at init. `halt_threshold_fixed`:
+beta = alpha log halt_kl, so the threshold stays at halt_kl and alpha only sets the sharpness.
 With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
 rate (KL's ratio would be its square); 'tv' is a distance as is. Decision 1's S_1 is against uniform ('kl', 'tv') or the
 initial latent ('latent').
@@ -335,6 +339,10 @@ class FPRMMemHaltActorValue(nn.Module):
     halt_convtest_split: bool = False  # convtest: theta0 + theta1 a_n + theta2 logit(L_n) (see the module docstring)
     halt_offset: str = 'none'      # convtest: 'none' | 'uniform' (o_n = -log(T - n): c ~ Uniform{1..T} at init)
     halt_head_width: int = 32      # hidden width of the halting MLP
+    halt_kl: float = 1e-3          # sigmoid: initialization only, p_n(0) = 1/2 at S = halt_kl (beta = log halt_kl, alpha = 1)
+    halt_alpha_min: float = 0.0    # sigmoid: floor on alpha (alpha -> 0 is signal-blind halting)
+    halt_beta_head: bool = False   # sigmoid: beta = bias + Dense(rms_norm(h_{n+1})) (state-dependent); False: a scalar
+    halt_threshold_fixed: bool = False  # sigmoid: beta = alpha log halt_kl (see the module docstring)
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     value_token: str = ''          # '' (= readout_token) | 'thought' | 'sep': where the value is read from
     halt_token: str = ''           # '' (= readout_token) | 'thought' | 'sep': where the halting head's h_n is read from
@@ -359,9 +367,9 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.value_pass in ('last', 'halt'), self.value_pass
         assert 0 <= self.act_iters <= self.max_think_iters and (self.act_iters == 0 or not self.halting), self.act_iters
         assert (self.halt_token or self.readout_token) == self.readout_token or (
-            self.halting and (self.halt_head == 'none' or self.halt_signal == 'latent')), \
+            self.halting and (self.halt_head in ('none', 'sigmoid') or self.halt_signal == 'latent')), \
             'halt_token only matters for halt_head=none or halt_signal=latent'
-        assert self.halt_head in ('none', 'distance', 'raw', 'convtest'), self.halt_head
+        assert self.halt_head in ('none', 'distance', 'raw', 'convtest', 'sigmoid'), self.halt_head
         assert self.halt_offset in ('none', 'uniform'), self.halt_offset
         if self.halt_head == 'convtest':
             assert self.halting and self.halt_max_skip == 1 and self.min_think_iters == 1, \
@@ -371,6 +379,14 @@ class FPRMMemHaltActorValue(nn.Module):
             self.theta1 = self.param('theta1', lambda _: jnp.float32(0.0))
             if self.halt_convtest_split:
                 self.theta2 = self.param('theta2', lambda _: jnp.float32(0.0))
+        elif self.halt_head == 'sigmoid':
+            assert self.halting and self.halt_max_skip == 1, 'sigmoid needs halting and halt_max_skip=1'
+            assert self.halt_kl > 0 and 0.0 <= self.halt_alpha_min < 1.0, (self.halt_kl, self.halt_alpha_min)
+            assert not (self.halt_threshold_fixed and self.halt_beta_head), 'halt_threshold_fixed replaces beta'
+            a0 = 1.0 - self.halt_alpha_min
+            self.halt_alpha_raw = self.param('halt_alpha_raw', nn.initializers.constant(math.log(math.expm1(a0))), ())
+            self.halt_beta = nn.Dense(1, kernel_init=nn.initializers.zeros,
+                                      bias_init=nn.initializers.constant(math.log(self.halt_kl)))
         elif self.halting:
             self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
                 self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
@@ -426,7 +442,9 @@ class FPRMMemHaltActorValue(nn.Module):
             self.core(seq, seq, jnp.ones(seq.shape[:2], bool), grid_shape, prefix_len=0, suffix_len=1)
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
-            if self.halting and self.halt_head != 'convtest':
+            if self.halt_head == 'sigmoid':
+                self.halt_beta(jnp.zeros((1, H)))
+            elif self.halting and self.halt_head != 'convtest':
                 n_in = {'none': H, 'distance': 1, 'raw': 2 * (H if self.halt_signal == 'latent' else self.output_dim_1)}[self.halt_head]
                 self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
         params = self.variables['params']
@@ -460,6 +478,17 @@ class FPRMMemHaltActorValue(nn.Module):
         def halt_head(h_prev, h, logits_prev, logits, sig, finite):
             """Logits of k at this pass [B, K + 1] (row i; 'distance' / 'raw' are read by the decision at pass i - 1)."""
             sg = (lambda v: v) if self.halt_head_grad else jax.lax.stop_gradient
+            if self.halt_head == 'sigmoid':
+                alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
+                beta_p = self.variables['params']['halt_beta']
+                if self.halt_threshold_fixed:
+                    beta = alpha * math.log(self.halt_kl)
+                elif self.halt_beta_head:
+                    beta = (sg(rms_norm(h, eps=cfg.rms_norm_eps)).astype(jnp.float32) @ beta_p['kernel'] + beta_p['bias'])[:, 0]
+                else:
+                    beta = beta_p['bias'][0]
+                logit = beta - alpha * jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)
+                return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
             if self.halt_head == 'none':
                 x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
             elif self.halt_head == 'distance':
