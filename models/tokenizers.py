@@ -31,8 +31,8 @@ TOKENIZERS = ('cell', 'flat', 'conv')
 
 def check_tokenizer(tokenizer, action_head, obs_channels):
     assert tokenizer in TOKENIZERS, f'tokenizer must be one of {TOKENIZERS}, got {tokenizer!r}'
-    if action_head == 'per_cell':
-        assert tokenizer == 'cell', "the 'per_cell' action head needs tokenizer='cell'"
+    if action_head in ('per_cell', 'neighbour'):
+        assert tokenizer == 'cell', f"the {action_head!r} action head needs tokenizer='cell'"
     if tokenizer == 'conv':
         assert obs_channels > 0, "tokenizer='conv' needs a cell-major plane observation (obs_channels > 0)"
 

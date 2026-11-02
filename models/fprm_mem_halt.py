@@ -79,6 +79,12 @@ executed; the readout of pass c is selected afterwards, so passes after c get no
 Choice of c in `__call__`: `halt_steps` and `halt_path` given (the PPO loss replays the rollout's path) > `halt_key`
 given (rollout: a sampled path) > neither (evaluation: the most likely path).
 
+Action heads (`action_head`): 'per_cell' = one logit per cell latent (Lights Out presses), 'readout' = Dense(A) on the
+readout token (moves), 'neighbour' = 4 moves of the blank (sliding puzzle; observation channel 0 marks the blank) whose
+logits are the per-cell logits of the blank's up / right / down / left neighbours (the tile that would slide into it,
+the order of envs/slidingpuzzle_env.MOVES), off-board moves masked to probability 0. 'neighbour' reads the policy from
+the cell latents like 'per_cell' while keeping the 4-move action space.
+
 The value is read out from the last pass: since c is an action, a baseline that depended on it would bias the
 halting gradient.
 
@@ -97,6 +103,7 @@ import distrax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from models.fprm import (
     FPRMConfig,
@@ -198,6 +205,17 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
 
 
 _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the gradients NaN-free)
+_BLANK_MOVES = ((-1, 0), (0, 1), (1, 0), (0, -1))  # action_head='neighbour': up, right, down, left (envs/slidingpuzzle_env.MOVES)
+
+
+def neighbour_table(m, n):
+    """action_head='neighbour': for every blank cell, the cell index of its neighbour in each move [m*n, 4] (the blank
+    itself off the board) and whether that move stays on the board [m*n, 4]."""
+    r, c = np.divmod(np.arange(m * n), n)
+    tr = r[:, None] + np.array([dr for dr, _ in _BLANK_MOVES])
+    tc = c[:, None] + np.array([dc for _, dc in _BLANK_MOVES])
+    ok = (tr >= 0) & (tr < m) & (tc >= 0) & (tc < n)
+    return np.where(ok, tr * n + tc, np.arange(m * n)[:, None]), ok
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
@@ -350,14 +368,16 @@ class FPRMMemHaltActorValue(nn.Module):
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
-    action_head: str = 'per_cell'  # see FPRMThinkerActorValue
+    action_head: str = 'per_cell'  # 'per_cell' | 'readout' (see FPRMThinkerActorValue) | 'neighbour' (see the module docstring)
     remat: bool = True             # rematerialize each pass in the backward pass
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
 
     def setup(self):
-        assert self.action_head in ('per_cell', 'readout'), self.action_head
+        assert self.action_head in ('per_cell', 'readout', 'neighbour'), self.action_head
+        assert self.action_head != 'neighbour' or (self.output_dim_1 == 4 and self.obs_channels > 0), \
+            "'neighbour' needs 4 actions and a plane observation whose channel 0 marks the blank"
         assert self.max_think_iters >= 1, self.max_think_iters
         assert not self.halting or self.halt_max_skip >= 1
         assert self.halt_signal in ('kl', 'tv', 'latent'), self.halt_signal
@@ -405,7 +425,7 @@ class FPRMMemHaltActorValue(nn.Module):
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
         self.actor_head = nn.Dense(
-            self.output_dim_1 // (self.m * self.n) if self.action_head == 'per_cell' else self.output_dim_1,
+            {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1}.get(self.action_head, self.output_dim_1),
             bias_init=nn.initializers.zeros,
         )
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
@@ -417,6 +437,9 @@ class FPRMMemHaltActorValue(nn.Module):
         return jax.nn.gelu(x @ p_in['kernel'] + p_in['bias']) @ p_out['kernel'] + p_out['bias']
 
     def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None, halt_features=None):
+        if self.action_head == 'neighbour':  # the blank from the raw observation, before normalization
+            blank = jnp.argmax(x.reshape(-1, self.m * self.n, self.obs_channels)[..., 0], axis=-1)  # [B]
+            nbr_idx, nbr_ok = (jnp.asarray(t)[blank] for t in neighbour_table(self.m, self.n))  # [B, 4] each
         if normalizer_params is not None:
             x = (x - normalizer_params.mean) / (normalizer_params.std)
 
@@ -427,7 +450,7 @@ class FPRMMemHaltActorValue(nn.Module):
         H = cfg.d_model
         T = self.max_think_iters
         S = max(T - 1, 1)
-        per_cell = self.action_head == 'per_cell'
+        per_cell = self.action_head in ('per_cell', 'neighbour')
 
         if self.tokenizer == 'cell':
             cells = self.cell_projection(tokenize(x_flat, self.m, self.n, self.obs_channels))
@@ -459,6 +482,8 @@ class FPRMMemHaltActorValue(nn.Module):
             if per_cell:
                 cell_latents = rms_norm(z_cells, eps=cfg.rms_norm_eps)
                 logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
+                if self.action_head == 'neighbour':
+                    logits = jnp.where(nbr_ok, jnp.take_along_axis(logits, nbr_idx, axis=-1), _NEG)
             else:
                 logits = rms_norm(act_latent, eps=cfg.rms_norm_eps) @ actor_p['kernel'] + actor_p['bias']
             assert logits.shape[-1] == self.output_dim_1, (logits.shape, self.output_dim_1)

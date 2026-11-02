@@ -33,7 +33,7 @@ from models.transformer_baseline import TransformerActorValue  # noqa: E402
 def build_module(args, N):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
                       mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
-    kw = dict(m=N, n=N, config=cfg, output_dim_1=4, obs_channels=N * N, action_head='readout',
+    kw = dict(m=N, n=N, config=cfg, output_dim_1=4, obs_channels=N * N, action_head=args.action_head,
               tokenizer=args.tokenizer, tokenizer_conv_features=args.tokenizer_conv_features)
     if args.arch == 'fprm':
         return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
@@ -95,6 +95,8 @@ def main():
     ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--tokenizer', default='cell', choices=['cell', 'flat', 'conv'], help='the checkpoint\'s --tokenizer')
     ap.add_argument('--tokenizer_conv_features', type=int, default=64, help='the checkpoint\'s --tokenizer_conv_features')
+    ap.add_argument('--action_head', default='readout', choices=['readout', 'neighbour'],
+                    help='the checkpoint\'s --action_head (neighbour: fprm_mem only)')
     ap.add_argument('--grid', type=int, default=3, help='board size N (N x N) the checkpoint was trained on')
     ap.add_argument('--episode_length', type=int, default=40)
     ap.add_argument('--scramble_moves', type=int, nargs='+', default=[10, 50, 100, 200, 400])

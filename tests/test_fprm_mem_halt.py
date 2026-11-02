@@ -381,3 +381,45 @@ def test_readout_latent_sown(readout):
     assert h.shape == (4, 3, CFG.d_model)
     rn = lambda v: rms_norm(v, CFG.rms_norm_eps)
     assert jnp.allclose(jnp.linalg.norm(rn(h[1:]) - rn(h[:-1]), axis=-1), inter['halt_signal_t'][1:], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize('N', [3, 4])
+def test_neighbour_table_matches_env_moves(N):
+    # action_head='neighbour' must index the tile each of the env's 4 blank moves slides, and mask the no-op moves.
+    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
+    from models.fprm_mem_halt import neighbour_table
+    env = SlidingPuzzleEnv(config=default_config().copy_and_resolve_references())
+    env.m = env.n = N
+    idx, ok = neighbour_table(N, N)
+    puzzle = jnp.arange(N * N, dtype=jnp.int32).reshape(N, N)
+    for b in range(N * N):
+        for a in range(4):
+            _, target, moved = env.move(puzzle, jnp.array([b // N, b % N]), a)
+            assert bool(moved) == ok[b, a] and int(target[0] * N + target[1]) == idx[b, a], (b, a)
+
+
+@pytest.mark.parametrize('halting', [False, True])
+def test_neighbour_head_gathers_the_cell_logits(halting):
+    # 'neighbour' logits = the per-cell logits (same params) of the blank's neighbours, off-board moves at _NEG, also
+    # with observation normalization (the blank is read from the raw observation).
+    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
+    from models.fprm_mem_halt import _NEG, neighbour_table
+    from utils import running_statistics
+    N = 3
+    env = SlidingPuzzleEnv(config=default_config())
+    obs = jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), 16))
+    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True,
+              **({'halt_head': 'sigmoid'} if halting else {}))
+    nbr, cell = _net(action_head='neighbour', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=N * N, **kw)
+    params = nbr.init(jax.random.PRNGKey(1), obs)['params']
+    norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
+    blank = jnp.argmax(obs.reshape(16, N * N, N * N)[..., 0], axis=-1)
+    idx, ok = (jnp.asarray(t)[blank] for t in neighbour_table(N, N))
+    assert int(ok.sum(-1).min()) >= 2 and int(ok.sum(-1).max()) <= 4
+    key = 'policy_log_probs_t' if halting else 'logits'  # by pass [T, B, A]; without halting the last pass's [B, A]
+    for n in (None, norm):
+        got = jax.nn.log_softmax(_intermediates(nbr, params, obs, normalizer_params=n)[key])
+        logits = _intermediates(cell, params, obs, normalizer_params=n)[key]
+        want = jax.nn.log_softmax(jnp.where(ok, jnp.take_along_axis(logits, jnp.broadcast_to(idx, logits.shape[:-1] + (4,)), -1), _NEG))
+        assert jnp.allclose(got, want, atol=1e-5)
+        assert bool(jnp.all(jnp.where(ok, True, jnp.exp(got) == 0.0)))
