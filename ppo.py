@@ -124,7 +124,10 @@ class Args:
     tokenizer: str = 'cell'
     tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
     action_head: str = ''                 # '' = the env's own ('per_cell' / 'readout'); 'neighbour' (fprm_mem / fprm_mem_halt,
-                                          # slidingpuzzle-*): the blank's 4 moves read from its neighbours' cell latents
+                                          # slidingpuzzle-*): the blank's 4 moves read from its neighbours' cell latents;
+                                          # 'blank' (same archs and envs): Dense(4) on the blank's own cell latent, unmasked
+    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem / fprm_mem_halt, slidingpuzzle-*): cell tokens
+                                          # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
@@ -401,10 +404,13 @@ def main(args: Args):
     obs_channels = getattr(env, 'obs_channels', 0)          # > 0 = plane-tokenized grid observation (Boxoban, Rush Hour)
     action_head = getattr(env, 'action_head', 'readout' if obs_channels > 0 else 'per_cell')  # plane-tokenized envs use the readout head by default
     if args.action_head:
-        assert args.action_head != 'neighbour' or (args.env_id.startswith('slidingpuzzle-')
+        assert args.action_head not in ('neighbour', 'blank') or (args.env_id.startswith('slidingpuzzle-')
                                                    and args.architecture in ('fprm_mem', 'fprm_mem_halt')), \
-            "action_head='neighbour' needs a slidingpuzzle-* env and architecture fprm_mem / fprm_mem_halt"
+            f"action_head={args.action_head!r} needs a slidingpuzzle-* env and architecture fprm_mem / fprm_mem_halt"
         action_head = args.action_head
+    assert args.cell_geometry or (args.env_id.startswith('slidingpuzzle-') and args.tokenizer == 'cell'
+                                  and args.architecture in ('fprm_mem', 'fprm_mem_halt')), \
+        '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem / fprm_mem_halt'
 
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
@@ -465,6 +471,7 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
+            cell_geometry=args.cell_geometry,
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,

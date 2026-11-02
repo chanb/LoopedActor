@@ -74,6 +74,8 @@
 #   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 #   ACTION_HEAD=neighbour  iso_mem / mem_halt: read the logit of each blank move from the cell latent of the tile that
 #                       would slide (off-board moves masked) instead of the readout token's Dense(4) (_anbr; default: readout)
+#   ACTION_HEAD=blank   iso_mem / mem_halt: Dense(4) on the blank's own cell latent, unmasked (_ablank)
+#   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
@@ -123,7 +125,7 @@ MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGH
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; WEIGHT_DECAY="${WEIGHT_DECAY:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_SPLIT="${HALT_SPLIT:-0}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; HALT_TRUST="${HALT_TRUST:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
-TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"; ACTION_HEAD="${ACTION_HEAD:-readout}"
+TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"; ACTION_HEAD="${ACTION_HEAD:-readout}"; CELL_GEOMETRY="${CELL_GEOMETRY:-1}"
 RUN="$ARM"
 case "$ARM" in
   looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
@@ -244,7 +246,17 @@ case "$ACTION_HEAD" in
   neighbour) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] \
                || { echo "ACTION_HEAD=neighbour needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
              ARM_FLAGS+=(--action_head=neighbour); RUN+="_anbr" ;;
-  *) echo "ACTION_HEAD must be readout or neighbour, got $ACTION_HEAD"; exit 1 ;;
+  blank) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] \
+           || { echo "ACTION_HEAD=blank needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
+         ARM_FLAGS+=(--action_head=blank); RUN+="_ablank" ;;
+  *) echo "ACTION_HEAD must be readout, neighbour or blank, got $ACTION_HEAD"; exit 1 ;;
+esac
+case "$CELL_GEOMETRY" in
+  1) ;;
+  0) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] \
+       || { echo "CELL_GEOMETRY=0 needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
+     ARM_FLAGS+=(--no-cell_geometry); RUN+="_nogeo" ;;
+  *) echo "CELL_GEOMETRY must be 0 or 1, got $CELL_GEOMETRY"; exit 1 ;;
 esac
 [[ "$GRID" =~ ^[0-9]+$ ]] || { echo "GRID must be an integer N (board N x N), got $GRID"; exit 1; }
 [[ "$GRID" != 3 ]] && RUN+="_g${GRID}"

@@ -40,7 +40,7 @@ def build_module(args, N):
                                      halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_mem':
         return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
-                                 thought_norm=args.thought_norm, **kw)
+                                 thought_norm=args.thought_norm, cell_geometry=not args.no_cell_geometry, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
@@ -95,8 +95,9 @@ def main():
     ap.add_argument('--compute_dtype', default='float32', choices=['float32', 'float16', 'bfloat16'], help='block computation dtype (any checkpoint)')
     ap.add_argument('--tokenizer', default='cell', choices=['cell', 'flat', 'conv'], help='the checkpoint\'s --tokenizer')
     ap.add_argument('--tokenizer_conv_features', type=int, default=64, help='the checkpoint\'s --tokenizer_conv_features')
-    ap.add_argument('--action_head', default='readout', choices=['readout', 'neighbour'],
-                    help='the checkpoint\'s --action_head (neighbour: fprm_mem only)')
+    ap.add_argument('--action_head', default='readout', choices=['readout', 'neighbour', 'blank'],
+                    help='the checkpoint\'s --action_head (neighbour / blank: fprm_mem only)')
+    ap.add_argument('--no_cell_geometry', action='store_true', help='fprm_mem: the checkpoint was trained with --no-cell_geometry')
     ap.add_argument('--grid', type=int, default=3, help='board size N (N x N) the checkpoint was trained on')
     ap.add_argument('--episode_length', type=int, default=40)
     ap.add_argument('--scramble_moves', type=int, nargs='+', default=[10, 50, 100, 200, 400])

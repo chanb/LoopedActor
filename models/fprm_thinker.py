@@ -86,19 +86,21 @@ def grid_geometry(m, n, B):
     return jnp.broadcast_to(geometry[None], (B, m * n, 6))
 
 
-def grid_channel_features(x_flat, m, n, channels):
+def grid_channel_features(x_flat, m, n, channels, geometry=True):
     """Per-cell features [B, m*n, channels + 6] from a cell-major flat observation
-    of m*n*channels values (e.g. Sokoban wall/box/target/player planes)."""
+    of m*n*channels values (e.g. Sokoban wall/box/target/player planes); geometry=False: the planes alone [B, m*n, channels]."""
     B = x_flat.shape[0]
     cells = x_flat.reshape(B, m * n, channels)
-    return jnp.concatenate([cells, grid_geometry(m, n, B)], axis=-1)
+    return jnp.concatenate([cells, grid_geometry(m, n, B)], axis=-1) if geometry else cells
 
 
-def tokenize(x_flat, m, n, obs_channels):
-    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes)."""
+def tokenize(x_flat, m, n, obs_channels, geometry=True):
+    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes, without the 6
+    geometry features if geometry=False)."""
     if obs_channels > 0:
         assert x_flat.shape[-1] == m * n * obs_channels, (x_flat.shape, m, n, obs_channels)
-        return grid_channel_features(x_flat, m, n, obs_channels)
+        return grid_channel_features(x_flat, m, n, obs_channels, geometry)
+    assert geometry, 'geometry=False needs a plane observation (obs_channels > 0)'
     grid_size = m * n
     assert x_flat.shape[-1] == 2 * grid_size, (x_flat.shape, m, n)
     return flat_grid_cell_features(x_flat[:, :grid_size], x_flat[:, grid_size:], m, n)

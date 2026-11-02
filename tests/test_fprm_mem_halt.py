@@ -423,3 +423,50 @@ def test_neighbour_head_gathers_the_cell_logits(halting):
         want = jax.nn.log_softmax(jnp.where(ok, jnp.take_along_axis(logits, jnp.broadcast_to(idx, logits.shape[:-1] + (4,)), -1), _NEG))
         assert jnp.allclose(got, want, atol=1e-5)
         assert bool(jnp.all(jnp.where(ok, True, jnp.exp(got) == 0.0)))
+
+
+def _puzzle_obs(n_boards=16):
+    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
+    env = SlidingPuzzleEnv(config=default_config())
+    return jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), n_boards))
+
+
+@pytest.mark.parametrize('halting', [False, True])
+def test_blank_head_reads_the_blank_cell(halting):
+    # 'blank' logits = the blank cell's 4 logits of a per_cell net with 4 outputs per cell (same params), unmasked, also
+    # with observation normalization (the blank is read from the raw observation).
+    from utils import running_statistics
+    N = 3
+    obs = _puzzle_obs()
+    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True,
+              **({'halt_head': 'sigmoid'} if halting else {}))
+    blk, cell = _net(action_head='blank', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=4 * N * N, **kw)
+    params = blk.init(jax.random.PRNGKey(1), obs)['params']
+    norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
+    blank = jnp.argmax(obs.reshape(16, N * N, N * N)[..., 0], axis=-1)
+    key = 'policy_log_probs_t' if halting else 'logits'
+    for n in (None, norm):
+        got = jax.nn.log_softmax(_intermediates(blk, params, obs, normalizer_params=n)[key])
+        logits = _intermediates(cell, params, obs, normalizer_params=n)[key]
+        logits = logits.reshape(logits.shape[:-1] + (N * N, 4))
+        idx = jnp.broadcast_to(blank[:, None, None], logits.shape[:-2] + (1, 1))
+        want = jax.nn.log_softmax(jnp.take_along_axis(logits, idx, axis=-2)[..., 0, :])
+        assert jnp.allclose(got, want, atol=1e-5)
+        assert bool(jnp.all(jnp.exp(got) > 0.0))  # no masked move
+
+
+@pytest.mark.parametrize('action_head', ['neighbour', 'blank'])
+def test_no_cell_geometry_drops_the_geometry_features(action_head):
+    # cell_geometry=False = cell_geometry=True with the cell projection's 6 geometry rows zeroed.
+    N = 3
+    obs = _puzzle_obs()
+    kw = dict(halting=False, obs_channels=N * N, action_head=action_head, output_dim_1=4)
+    geo, nogeo = _net(**kw), _net(cell_geometry=False, **kw)
+    params = nogeo.init(jax.random.PRNGKey(1), obs)['params']
+    assert params['cell_projection']['kernel'].shape[0] == N * N
+    k = params['cell_projection']['kernel']
+    params_geo = {**params, 'cell_projection': {**params['cell_projection'],
+                                                'kernel': jnp.concatenate([k, jnp.zeros((6, k.shape[1]), k.dtype)])}}
+    got = _intermediates(nogeo, params, obs)['logits']
+    want = _intermediates(geo, params_geo, obs)['logits']
+    assert jnp.allclose(got, want, atol=1e-5)
