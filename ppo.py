@@ -191,6 +191,8 @@ class Args:
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss);
                                           # 'sac' = discrete soft actor-critic over the passes on the same J_n (halt_soft_tau)
     halt_soft_tau: float = 0.01           # halt_objective='sac': entropy temperature of the halting decisions only
+    halt_soft_backup: str = 'sampled'     # halt_objective='sac': 'sampled' (the rollout's passes n <= c) | 'full' (every
+                                          # pass to T: soft policy iteration)
     halt_clip: str = 'joint'              # halt_objective='pg': PPO clip of one ratio over log p(path) + log pi_c(a|s) ('joint'),
                                           # or of pi_c(a|s) apart from p(path) as a whole ('path') or from each decision ('each')
     halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) on G - V in J_n
@@ -419,6 +421,8 @@ def main(args: Args):
     assert not args.halt_natural_grad or (args.halt_head == 'sigmoid' and not args.halt_beta_head
                                           and not args.halt_threshold_fixed and not args.freeze_except_halt), \
         'halt_natural_grad needs halt_head=sigmoid with a scalar learned beta'
+    assert args.halt_objective != 'sac' or (args.halt_max_skip == 1 and args.halt_soft_backup in ('sampled', 'full')), \
+        "halt_objective='sac' needs halt_max_skip=1 and halt_soft_backup sampled / full"
 
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
@@ -770,24 +774,31 @@ def main(args: Args):
                 best_k = jnp.argmax(gain, axis=-1)
                 halt_metrics.update({'halt_best_k': jnp.sum(jnp.where(valid, best_k, 0)) / n_valid,
                                      'halt_continue_better_frac': jnp.sum(valid & (best_k > 0)) / n_valid})
-            else:  # 'sac'
-                # Discrete SAC over the passes, on the same J: at pass n, Q_n(0) = J_n (halt) and Q_n(k) = W_min(n+k, T)
-                # (k more passes), with the head's soft value W_n = sum_k p_n(k) (Q_n(k) - tau log p_n(k)) and W_T = J_T.
-                # The head minimizes sum_k p_n(k) (tau log p_n(k) - Q_n(k)) at every decision pass, Q held fixed.
-                lp = inter['intermediates']['halt_step_log_probs'][0][:-1]  # [T - 1, B, K + 1], row n - 1: the decision at pass n
-                K = lp.shape[-1] - 1
+            else:  # 'sac' (halt_max_skip = 1)
+                # Discrete SAC on the thinking MDP: halting at pass n pays d^(n-1) Jl_n with Jl_n = d^(1-c) (V + rho_n (G - V))
+                # (= J_n d^(1-n)), and each decision pass n earns d^(n-1) tau H(p_n), d = discount_compute. In pass-n units:
+                # Q_n(halt) = Jl_n, Q_n(continue) = d W_(n+1), W_n = sum_k p_n(k) (Q_n(k) - tau log p_n(k)), W_T = Jl_T; the
+                # head minimizes d^(n-1) sum_k p_n(k) (tau log p_n(k) - Q_n(k)) per state, Q held fixed. halt_soft_backup:
+                # 'full' backs up every pass to T and trains every decision pass (soft policy iteration); 'sampled' uses only
+                # the rollout's passes n <= c, with W_(c+1) ~ Jl_(c+1) (halt at the lookahead pass).
+                d, tau, sampled = args.discount_compute, args.halt_soft_tau, args.halt_soft_backup == 'sampled'
+                n = jnp.arange(1, T_max + 1)[:, None]
+                Jl = J * d ** (1.0 - n)  # [T, B]
+                lp = inter['intermediates']['halt_step_log_probs'][0]  # [T, B, 2], row n - 1: the decision at pass n
 
-                def backup(W_next, x):  # W_next [K, B]: W_(n+1) .. W_(n+K), capped at T
-                    lp_n, J_n = x
-                    Q_n = jnp.concatenate([J_n[None], W_next], axis=0).T  # [B, K + 1]
-                    W_n = jnp.sum(jnp.exp(lp_n) * (Q_n - args.halt_soft_tau * lp_n), axis=-1)
-                    return jnp.concatenate([W_n[None], W_next[:-1]], axis=0), Q_n
+                def backup(W_next, x):  # W_next: W_(n+1) [B]
+                    n_, lp_n, Jl_n, Jl_next = x
+                    Q_n = jnp.stack([Jl_n, d * jnp.where(sampled & (n_ == c), Jl_next, W_next)], axis=-1)  # [B, 2]
+                    W_n = jnp.where(n_ == T_max, Jl_n, jnp.sum(jnp.exp(lp_n) * (Q_n - tau * lp_n), axis=-1))
+                    return W_n, Q_n
 
-                _, Q = jax.lax.scan(backup, jnp.broadcast_to(J[-1], (K,) + J[-1].shape), (jax.lax.stop_gradient(lp), J[:-1]),
-                                    reverse=True)  # [T - 1, B, K + 1]
-                lp, Q = lp[args.min_think_iters - 1:], Q[args.min_think_iters - 1:]  # the passes that decide
-                halt_loss = jnp.mean(jnp.sum(jnp.exp(lp) * (args.halt_soft_tau * lp - Q), axis=-1))
-                halt_metrics['halt_soft_continue_gain'] = jnp.mean(jnp.max(Q[..., 1:], axis=-1) - Q[..., 0])
+                _, Q = jax.lax.scan(backup, Jl[-1], (n, jax.lax.stop_gradient(lp), Jl, jnp.concatenate([Jl[1:], Jl[-1:]])),
+                                    reverse=True)  # [T, B, 2]
+                valid = (n >= args.min_think_iters) & (n < T_max) & ((n <= c) | (not sampled))  # [T, B]: trained decisions
+                per_pass = d ** (n - 1.0) * jnp.sum(jnp.exp(lp) * (tau * lp - Q), axis=-1)
+                halt_loss = jnp.sum(jnp.where(valid, per_pass, 0.0)) / c.shape[0]
+                halt_metrics['halt_soft_continue_gain'] = (jnp.sum(jnp.where(valid, Q[..., 1] - Q[..., 0], 0.0))
+                                                           / jnp.maximum(jnp.sum(valid), 1))
             halt_metrics['halt_loss'] = halt_loss
             halt_log_prob = 0.0
         if stochastic_halt and args.halt_prior_coef > 0:
