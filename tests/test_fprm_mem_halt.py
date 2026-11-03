@@ -470,3 +470,19 @@ def test_no_cell_geometry_drops_the_geometry_features(action_head):
     got = _intermediates(nogeo, params, obs)['logits']
     want = _intermediates(geo, params_geo, obs)['logits']
     assert jnp.allclose(got, want, atol=1e-5)
+
+
+@pytest.mark.parametrize('token', ['thought', 'sep'])
+def test_linear_head_is_sigmoid_of_halt_token_latent(token):
+    # halt_head='linear': p_n(0) = sigmoid(w . rms_norm(h_n) + b), h_n at halt_token, no lookahead; 1/2 at init.
+    kw = dict(min_think_iters=1, halt_head='linear', halt_token=token)
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = _net(**kw).init(jax.random.PRNGKey(0), x)['params']
+    assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_prob'], 0.5)
+    w = jax.random.normal(jax.random.PRNGKey(2), params['halt_linear']['kernel'].shape)
+    params = _with(params, 'halt_linear', kernel=w, bias=jnp.array([0.3]))
+    out = _intermediates(_net(**kw), params, x)
+    # h_n: readout_latent_t is the latent at readout_token, so read it with readout_token=token
+    h = _intermediates(_net(readout_token=token, **kw), params, x)['readout_latent_t']  # [T, B, H]
+    want = jax.nn.sigmoid((rms_norm(h, eps=CFG.rms_norm_eps) @ w)[..., 0] + 0.3)
+    assert jnp.allclose(out['halt_prob'][:-1], want[:-1], atol=1e-5)  # pass T never decides

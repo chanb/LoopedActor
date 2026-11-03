@@ -45,6 +45,7 @@ stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
 alpha = halt_alpha_min + softplus(.) (1 at init), beta a learned scalar (log halt_kl at init) or, with `halt_beta_head`,
 plus a zero-initialized Dense on rms_norm(h_{n+1}); p_n(0) = 1/2 at S = halt_kl at init. `halt_threshold_fixed`:
 beta = alpha log halt_kl, so the threshold stays at halt_kl and alpha only sets the sharpness.
+'linear' (K = 1, no lookahead): p_n(0) = sigmoid(w . rms_norm(h_n) + b), w and b zero at init (p_n(0) = 1/2).
 With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
 rate (KL's ratio would be its square); 'tv' is a distance as is. Decision 1's S_1 is against uniform ('kl', 'tv') or the
 initial latent ('latent').
@@ -393,9 +394,9 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.value_pass in ('last', 'halt'), self.value_pass
         assert 0 <= self.act_iters <= self.max_think_iters and (self.act_iters == 0 or not self.halting), self.act_iters
         assert (self.halt_token or self.readout_token) == self.readout_token or (
-            self.halting and (self.halt_head in ('none', 'sigmoid') or self.halt_signal == 'latent')), \
+            self.halting and (self.halt_head in ('none', 'sigmoid', 'linear') or self.halt_signal == 'latent')), \
             'halt_token only matters for halt_head=none or halt_signal=latent'
-        assert self.halt_head in ('none', 'distance', 'raw', 'convtest', 'sigmoid'), self.halt_head
+        assert self.halt_head in ('none', 'distance', 'raw', 'convtest', 'sigmoid', 'linear'), self.halt_head
         assert self.halt_offset in ('none', 'uniform'), self.halt_offset
         if self.halt_head == 'convtest':
             assert self.halting and self.halt_max_skip == 1 and self.min_think_iters == 1, \
@@ -413,6 +414,9 @@ class FPRMMemHaltActorValue(nn.Module):
             self.halt_alpha_raw = self.param('halt_alpha_raw', nn.initializers.constant(math.log(math.expm1(a0))), ())
             self.halt_beta = nn.Dense(1, kernel_init=nn.initializers.zeros,
                                       bias_init=nn.initializers.constant(math.log(self.halt_kl)))
+        elif self.halt_head == 'linear':
+            assert self.halting and self.halt_max_skip == 1, 'linear needs halting and halt_max_skip=1'
+            self.halt_linear = nn.Dense(1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
         elif self.halting:
             self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
                 self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
@@ -474,6 +478,8 @@ class FPRMMemHaltActorValue(nn.Module):
             self.value_head(jnp.zeros((1, H)))
             if self.halt_head == 'sigmoid':
                 self.halt_beta(jnp.zeros((1, H)))
+            elif self.halt_head == 'linear':
+                self.halt_linear(jnp.zeros((1, H)))
             elif self.halting and self.halt_head != 'convtest':
                 n_in = {'none': H, 'distance': 1, 'raw': 2 * (H if self.halt_signal == 'latent' else self.output_dim_1)}[self.halt_head]
                 self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
@@ -522,6 +528,10 @@ class FPRMMemHaltActorValue(nn.Module):
                 else:
                     beta = beta_p['bias'][0]
                 logit = beta - alpha * jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)
+                return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
+            if self.halt_head == 'linear':  # logit of halting; continuing is 0, so p_n(0) = sigmoid(logit)
+                p = self.variables['params']['halt_linear']
+                logit = (sg(rms_norm(h, eps=cfg.rms_norm_eps)).astype(jnp.float32) @ p['kernel'] + p['bias'])[:, 0]
                 return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
             if self.halt_head == 'none':
                 x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
@@ -621,7 +631,7 @@ class FPRMMemHaltActorValue(nn.Module):
     def _halt(self, head_t, sig_t, halt_key, halt_steps, halt_path, B, T, batch_shape, halt_features=None):
         """Halting: the think time c [B] and the signal that decided it; sows the halting intermediates."""
         sig_prev_t = sig_t  # unshifted: row n - 1 holds S_n
-        if self.halt_head != 'none':  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
+        if self.halt_head not in ('none', 'linear'):  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
             head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
             sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
         if self.halt_head == 'convtest':  # logit_halt_n = theta0 + theta1 f_n + o_n, logit_continue_n = 0
