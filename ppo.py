@@ -189,7 +189,7 @@ class Args:
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss)
     halt_clip: str = 'joint'              # halt_objective='pg': PPO clip of one ratio over log p(path) + log pi_c(a|s) ('joint'),
                                           # or of pi_c(a|s) apart from p(path) as a whole ('path') or from each decision ('each')
-    halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) in J_n
+    halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) on G - V in J_n
     halt_prior_coef: float = 0.0          # fprm_mem_halt: weight of KL(p_n || q) at every decision pass, decayed linearly
                                           # to 0 over training; q favours continuing (0 = off)
     halt_prior_halt: float = 0.1          # q(k = 0); q(k) = (1 - q(0)) / K for every k >= 1
@@ -736,15 +736,17 @@ def main(args: Args):
         halt_loss = 0.0
         if next_halt:
             # The halting head's softmax over k at the rollout's think time c, scored by where each k leads: J_n =
-            # discount_compute^(n - c) * min(pi_n(a|s) / mu(a|s), rho_max) * G estimates the return of acting with pass n
-            # (mu the behaviour policy, G the return target, which carries discount_compute^(c - 1)), each k is scored as a
-            # halt at c + k (the cap: T), and the head maximizes sum_k p_c(k) (J_(c+k) - J_c). A think time at the cap
+            # discount_compute^(n - c) * (V + min(pi_n(a|s) / mu(a|s), rho_max) * (G - V)) estimates the return of acting
+            # with pass n (mu the behaviour policy, G the return target, which carries discount_compute^(c - 1), V the
+            # rollout's value; E_mu[rho_n] = 1, so V only removes the sign of G from the ratio's ranking), each k is scored
+            # as a halt at c + k (the cap: T), and the head maximizes sum_k p_c(k) (J_(c+k) - J_c). A think time at the cap
             # (c = T) has no halt decision. PPO's ratio then covers pi_c(a|s) alone.
             lp_a = jnp.take_along_axis(inter['intermediates']['policy_log_probs_t'][0], data.action[None, :, None].astype(jnp.int32), axis=-1)[..., 0]
             rho = jnp.minimum(jnp.exp(lp_a - data.extras['policy_extras']['action_log_prob']), args.halt_rho_max)  # [T, B]
             T_max = rho.shape[0]
             c = data.extras['policy_extras']['compute_time'].astype(jnp.int32)
-            J = jax.lax.stop_gradient(args.discount_compute ** (jnp.arange(1, T_max + 1)[:, None] - c) * rho * value_targets)
+            J = jax.lax.stop_gradient(args.discount_compute ** (jnp.arange(1, T_max + 1)[:, None] - c)
+                                      * (data.value + rho * (value_targets - data.value)))
             lp_c = jnp.take_along_axis(inter['intermediates']['halt_step_log_probs'][0], (c - 1)[None, :, None], axis=0)[0]  # [B, K + 1]
             gain = jnp.take_along_axis(J, jnp.minimum(c[None] + jnp.arange(lp_c.shape[-1])[:, None], T_max) - 1, axis=0).T  # [B, K + 1]
             gain = gain - gain[:, :1]  # J_(c+k) - J_c
