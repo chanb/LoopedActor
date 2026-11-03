@@ -634,6 +634,8 @@ class FPRMMemHaltActorValue(nn.Module):
         if self.halt_head not in ('none', 'linear'):  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
             head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
             sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
+        if self.halt_head == 'sigmoid':  # log S_(n+1) at row n, the feature alpha multiplies (ppo.py's halt_natural_grad Fisher)
+            self.sow('intermediates', 'halt_log_sig_t', jnp.log(jnp.maximum(sig_t, 0.0) + _KL_EPS))
         if self.halt_head == 'convtest':  # logit_halt_n = theta0 + theta1 f_n + o_n, logit_continue_n = 0
             if halt_features is None:
                 if self.halt_signal == 'kl':  # sqrt(2 KL): a distance (local Fisher-Rao length), so S_(n+1) / S_n is L, not L^2

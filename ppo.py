@@ -172,6 +172,8 @@ class Args:
     halt_alpha_min: float = 0.0           # sigmoid: floor on the slope alpha (alpha = this + softplus(.), 1 at init)
     halt_beta_head: bool = False          # sigmoid: state-dependent beta (Dense on h_(n+1)) instead of a scalar
     halt_threshold_fixed: bool = False    # sigmoid: p(halt) = 1/2 at S = halt_kl throughout (beta = alpha log halt_kl)
+    halt_natural_grad: bool = False       # sigmoid (scalar beta): update (beta, alpha_raw) by SGD (halt_lr) on Sigma^-1 g, the
+                                          # convtest preconditioning (halt_damping / halt_fisher_ema / halt_trust_region apply)
     halt_convtest_split: bool = False     # convtest: untie f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
     halt_offset: str = 'none'             # convtest: 'uniform' adds o_n = -log(T - n) to the halt logit (c ~ Uniform at init)
     halt_replay_features: bool = True     # convtest: the loss replays the rollout's features f instead of recomputing them
@@ -328,10 +330,10 @@ def make_optimizer(args, init_params=None):
         return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in HALT_PARAMS else other, v)
                            for k, v in init_params['params'].items()}}
 
-    if args.halt_head == 'convtest' and not args.freeze_except_halt:
-        # (theta0, theta1): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step), or Adam; clipping covers
-        # the rest only, so the preconditioned head gradient does not scale the trunk's update.
-        head = optax.sgd(args.halt_lr) if args.halt_precondition else optax.adam(args.halt_lr, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
+    if (args.halt_head == 'convtest' or args.halt_natural_grad) and not args.freeze_except_halt:
+        # (theta0, theta1) / sigmoid (beta, alpha_raw): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step),
+        # or Adam; clipping covers the rest only, so the preconditioned head gradient does not scale the trunk's update.
+        head = optax.sgd(args.halt_lr) if args.halt_precondition or args.halt_natural_grad else optax.adam(args.halt_lr, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
         return optax.multi_transform({'train': head, 'rest': clip(trunk_tx)}, labels('rest'))
 
     if args.freeze_except_halt:
@@ -412,6 +414,9 @@ def main(args: Args):
     assert args.cell_geometry or (args.env_id.startswith('slidingpuzzle-') and args.tokenizer == 'cell'
                                   and args.architecture in ('fprm_mem', 'fprm_mem_halt')), \
         '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem / fprm_mem_halt'
+    assert not args.halt_natural_grad or (args.halt_head == 'sigmoid' and not args.halt_beta_head
+                                          and not args.halt_threshold_fixed and not args.freeze_except_halt), \
+        'halt_natural_grad needs halt_head=sigmoid with a scalar learned beta'
 
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
@@ -719,6 +724,11 @@ def main(args: Args):
                 hp = params['params']
                 halt_metrics['halt_alpha'] = args.halt_alpha_min + jax.nn.softplus(hp['halt_alpha_raw'])
                 halt_metrics['halt_beta'] = hp['halt_beta']['bias'][0]
+                if args.halt_natural_grad:  # d logit = d beta + f d alpha_raw, f = -softplus'(alpha_raw) log S
+                    f = -jax.nn.sigmoid(hp['halt_alpha_raw']) * inter['intermediates']['halt_log_sig_t'][0][:-1]
+                    p = jnp.exp(inter['intermediates']['halt_step_log_probs'][0][:-1, :, 0])
+                    dec = ((path[None] >> jnp.arange(f.shape[0])[:, None]) & 1) == 1
+                    halt_metrics['halt_fisher'] = jax.lax.stop_gradient(convtest_fisher(f, p, dec, args.halt_damping))
             if args.halt_head == 'convtest':
                 theta0, theta1 = params['params']['theta0'], params['params']['theta1']
                 safe = jnp.abs(theta1) > 1e-6
@@ -847,10 +857,13 @@ def main(args: Args):
                 fisher = fisher_ema / (1.0 - beta ** (training_state.step + 1).astype(jnp.float32))
             if fisher is not None:
                 metrics.update({f'halt_fisher_{i}{j}': fisher[i, j] for i in range(len(fisher)) for j in range(i, len(fisher))})
-            if fisher is not None and args.halt_precondition:  # convtest: head gradient g -> Sigma^-1 g (SGD in the optimizer)
+            if fisher is not None and (args.halt_precondition or args.halt_natural_grad):  # head gradient g -> Sigma^-1 g (SGD in the optimizer)
                 p = grads['params']
-                names = ('theta0', 'theta1', 'theta2')[:len(fisher)]
-                g_raw = jnp.stack([p[k] for k in names])
+                if args.halt_natural_grad:  # sigmoid: (beta, alpha_raw), the order of the Fisher's [1, f]
+                    g_raw = jnp.stack([p['halt_beta']['bias'][0], p['halt_alpha_raw']])
+                else:
+                    names = ('theta0', 'theta1', 'theta2')[:len(fisher)]
+                    g_raw = jnp.stack([p[k] for k in names])
                 g = jnp.linalg.solve(fisher, g_raw)
                 g_nat = jnp.dot(g_raw, g)  # g^T Sigma^-1 g: the predicted KL of an SGD step is halt_lr^2 g_nat / 2
                 metrics['halt_step_kl'] = 0.5 * args.halt_lr ** 2 * g_nat
@@ -859,7 +872,11 @@ def main(args: Args):
                     g = g * shrink
                     metrics['halt_trust_shrink'] = shrink
                     metrics['halt_trust_active'] = (shrink < 1.0).astype(jnp.float32)
-                grads = {**grads, 'params': {**p, **{k: g[i] for i, k in enumerate(names)}}}
+                if args.halt_natural_grad:
+                    new = {'halt_beta': {**p['halt_beta'], 'bias': g[:1]}, 'halt_alpha_raw': g[1]}
+                else:
+                    new = {k: g[i] for i, k in enumerate(names)}
+                grads = {**grads, 'params': {**p, **new}}
             new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
             if use_loss_scale:
                 # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
