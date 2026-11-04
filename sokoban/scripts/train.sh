@@ -11,8 +11,7 @@
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
 #   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_MAX_SKIP=K     mem_halt: each halting decision picks k in 0..K more passes (0 = halt); K = 1 is a yes/no halt at
-#                       every pass (default 1; run names get _hk<K>)
+#   HALT_KL=k           mem_halt: initial halting threshold, h_n = 1/2 at KL_(n+1) = k (run names get _hk1_hhsig_kl<k>)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #                       (mem_halt always halts with lookahead: on KL(pi_{c+1} || pi_c), acting with pi_c; run names get _look)
@@ -51,8 +50,8 @@
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
 #   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
 #               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
-#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(MLP(log KL_(n+1))) pick how many more
-#               passes to run; the PPO ratio uses log p(path|s) + log pi_c(a|s); value from the last pass
+#   mem_halt  : iso_mem with stochastic learned halting: a yes/no halt at every pass,
+#               h_n = sigmoid(beta - alpha log KL_(n+1)); the PPO ratio uses log p(c|s) + log pi_c(a|s); value from the last pass
 #               (models/fprm_mem_halt.py)
 # Requires data/boxoban/*.npz (python data_scripts/build_boxoban_banks.py).
 # Usage:
@@ -67,7 +66,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.999}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"
 RUN="$ARM"
 case "$ARM" in
@@ -95,14 +94,13 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  [[ "$HALT_MAX_SKIP" =~ ^[1-9][0-9]*$ ]] || { echo "HALT_MAX_SKIP must be an integer >= 1, got $HALT_MAX_SKIP"; exit 1; }
-  ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP" --halt_head=distance); RUN+="_hk${HALT_MAX_SKIP}_hhdist_look"  # MLP of log KL, lookahead
+  ARM_FLAGS+=(--halt_kl="$HALT_KL"); RUN+="_hk1_hhsig_kl${HALT_KL}"  # sigmoid(beta - alpha log KL), lookahead
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
     *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_MAX_SKIP / HALT_HEAD_GRAD / HALT_KL_REVERSE (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE (shared study settings)
 [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] && { ARM_FLAGS+=(--readout_token=thought); RUN+="_rthought"; }  # SEP token in every pass since 25 Oct
 case "$THOUGHT_NORM" in
   0) ;;

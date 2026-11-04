@@ -23,9 +23,10 @@
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
 #   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3)
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_OBJECTIVE=pg|next  mem_halt: train the halting head through PPO's ratio (pg, default) or by scoring its softmax
+#   HALT_OBJECTIVE=pg|next|score  mem_halt: train the halting head through PPO's ratio (pg, default) or by scoring its softmax
 #                       over k at the sampled c with J_(c+k) - J_c, J_n the clipped importance-weighted return of acting
-#                       with pass n (_hobjnext)
+#                       with pass n (_hobjnext), or by REINFORCE on log h_c with weight pi_c(a|s) G -
+#                       DISCOUNT_COMPUTE pi_(c+1)(a|s) G (_hobjscore)
 #   HALT_CLIP=joint|path|each  mem_halt, HALT_OBJECTIVE=pg: one PPO clip over the joint ratio p(path) pi_c(a|s) (joint,
 #                       default), or pi_c(a|s) clipped apart from p(path) as a whole (_hclippath) or from each decision (_hclipeach)
 #   HALT_RHO_MAX=r      mem_halt, HALT_OBJECTIVE=next: clip of the ratio in J_n (default 2; _rho<r> if not 2)
@@ -40,34 +41,20 @@
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
 #   STABLE_SOFTMAX=0|1  iso_mem / mem_halt: collapse-free log-softmax for the action policy (mem_halt also: the
 #                       halting head) (default 0, run names get _ssm)
-#   HALT_MAX_SKIP=K     mem_halt: each halting decision picks k in 0..K more passes from softmax(MLP(...)) (HALT_HEAD)
-#                       (0 = halt; decide again after k passes; scored by the sampled decision path). K = 1 is a yes/no
-#                       halt at every pass (default 1; run names get _hk<K>)
-#   HALT_HEAD=none|distance|raw  mem_halt: the halting head, a GELU MLP on the readout latent h_n (_hhnone), on log S_(n+1)
-#                       (_hhdist) or on [z_n, z_(n+1)] (_hhraw) (default distance). distance / raw look ahead: decide
-#                       on pass c+1, act with pi_c (_look)
-#   HALT_SIGNAL=kl|latent  mem_halt, HALT_HEAD=distance|raw: z = the policies, S = KL; or z = the readout latents h,
-#                       S = ||rms_norm(h_(n+1)) - rms_norm(h_n)|| (_hlat) (default kl)
-#   HALT_HEAD=convtest  mem_halt: learned convergence test, logit_halt_n = theta0 + theta1 f_n (+ o_n), f_n = log of the
-#                       estimated distance to the fixed point from S_(n+1), S_n (_hhconv; needs HALT_MAX_SKIP=1,
-#                       MIN_THINK_ITERS=1; HALT_SIGNAL=kl reads sqrt(2 KL), S_1 against uniform; use STABLE_KL=1).
-#                       Its settings (run-name suffix only when not the default):
-#     HALT_SPLIT=0|1      untie f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n) (default 0; 1: _hsplit)
-#     HALT_OFFSET=none|uniform  o_n = -log(T - n), c ~ Uniform{1..T} at init (_hoffuniform; default none)
-#     HALT_REPLAY=1|0     the loss replays the rollout's features (default 1; 0: _hnoreplay)
-#     HALT_PRECOND=1|0    SGD on Sigma^-1 g, Sigma the decisions' Fisher (default 1; 0: Adam, _hnoprecond)
-#     HALT_LR=lr          learning rate of theta0 / theta1 (default 1e-2; _hlr<lr>)
-#     HALT_DAMPING=d      damping added to Sigma (default 1e-3; _hdamp<d>)
-#     HALT_FISHER_EMA=b   precondition with an EMA of Sigma over updates, decay b (default 0 = per minibatch; _hfema<b>)
-#     HALT_TRUST=d        cap each preconditioned step's predicted KL of the decisions at d (default 0 = off; _htr<d>)
-#   HALT_HEAD_WIDTH=W   mem_halt: hidden width of the halting MLP (default 32; run names get W if not 32)
+#   HALT_KL=k           mem_halt: the halting head h_n = sigmoid(beta - alpha log S_(n+1)) (lookahead: decide on pass
+#                       c+1, act with pi_c) starts at h_n = 1/2 for S = k (run names get _hk1_hhsig_kl<k>). Its settings:
+#     HALT_BETA_HEAD=1    beta = bias + Dense(rms_norm(h_(n+1))) (_hbeta; default 0: a scalar)
+#     HALT_THRESHOLD_FIXED=1  beta = alpha log k, alpha only sets the sharpness (_hfixthr)
+#     HALT_ALPHA_MIN=a    floor on alpha (_hamin<a>; default 0)
+#   HALT_SIGNAL=kl|tv|latent  mem_halt: S = KL of the policies, their TV (_htv), or ||rms_norm(h_(n+1)) - rms_norm(h_n)||
+#                       of the readout latents (_hlat) (default kl)
 #   READOUT=thought|sep  iso_mem / mem_halt: every pass runs [cells, SEP, thought] (SEP's latent carried, the thought's K/V kept in
 #                       memory); read actions / value / halting from the newest thought or from SEP (default thought;
 #                       run names get _rthought / _rsep)
 #   VALUE_TOKEN=thought|sep  iso_mem / mem_halt: read the value from this token instead of READOUT's (_v<tok>; default: READOUT)
 #   ACT_ITERS=c         iso_mem: act with pass c <= MAX_THINK_ITERS; the value still reads pass MAX_THINK_ITERS (_a<c>; default 0 = MAX_THINK_ITERS)
 #   HALT_TOKEN=thought|sep   mem_halt: the halting head's h_n from this token instead of READOUT's (_ht<tok>; default: READOUT);
-#                       only with HALT_HEAD=none or HALT_SIGNAL=latent (the KL heads never read h_n)
+#                       (read with HALT_BETA_HEAD=1 or HALT_SIGNAL=latent)
 #   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
 #                       KL(pi_1 || uniform))
 #   TOKENIZER=t         observation tokenization, all arms (default cell; see models/tokenizers.py):
@@ -112,8 +99,8 @@
 #   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
 #   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
 #               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
-#   mem_halt  : iso_mem with stochastic learned halting: decisions k ~ softmax(MLP(...)) (HALT_HEAD) pick how many more
-#               passes to run; the PPO ratio uses log p(path|s) + log pi_c(a|s); value from the last pass
+#   mem_halt  : iso_mem with stochastic learned halting: a yes/no halt at every pass,
+#               h_n = sigmoid(beta - alpha log S_(n+1)); the PPO ratio uses log p(c|s) + log pi_c(a|s); value from the last pass
 #               (models/fprm_mem_halt.py)
 # Usage:
 # MAX_THINK_ITERS=4 slidingpuzzle/scripts/train.sh looped 1 exp/slidingpuzzle 0 &
@@ -127,7 +114,7 @@ DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.99
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; WEIGHT_DECAY="${WEIGHT_DECAY:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_KL="${HALT_KL:-1e-3}"
-HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; HALT_MAX_SKIP="${HALT_MAX_SKIP:-1}"; HALT_HEAD="${HALT_HEAD:-distance}"; HALT_HEAD_WIDTH="${HALT_HEAD_WIDTH:-32}"; HALT_OFFSET="${HALT_OFFSET:-none}"; HALT_SPLIT="${HALT_SPLIT:-0}"; HALT_REPLAY="${HALT_REPLAY:-1}"; HALT_PRECOND="${HALT_PRECOND:-1}"; HALT_LR="${HALT_LR:-1e-2}"; HALT_DAMPING="${HALT_DAMPING:-1e-3}"; HALT_FISHER_EMA="${HALT_FISHER_EMA:-0}"; HALT_TRUST="${HALT_TRUST:-0}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
+HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; HALT_SIGNAL="${HALT_SIGNAL:-kl}"; READOUT="${READOUT:-thought}"; VALUE_TOKEN="${VALUE_TOKEN:-}"; HALT_TOKEN="${HALT_TOKEN:-}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"; ACT_ITERS="${ACT_ITERS:-0}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"; ACTION_HEAD="${ACTION_HEAD:-readout}"; CELL_GEOMETRY="${CELL_GEOMETRY:-1}"
 RUN="$ARM"
 case "$ARM" in
@@ -159,7 +146,8 @@ if [[ "$ARM" == mem_halt ]]; then
         esac ;;
     next) ARM_FLAGS+=(--halt_objective=next); RUN+="_hobjnext"
       [[ "${HALT_RHO_MAX:-2}" != 2 ]] && { ARM_FLAGS+=(--halt_rho_max="$HALT_RHO_MAX"); RUN+="_rho${HALT_RHO_MAX}"; } ;;
-    *) echo "HALT_OBJECTIVE must be pg or next, got $HALT_OBJECTIVE"; exit 1 ;;
+    score) ARM_FLAGS+=(--halt_objective=score); RUN+="_hobjscore" ;;
+    *) echo "HALT_OBJECTIVE must be pg, next or score, got $HALT_OBJECTIVE"; exit 1 ;;
   esac
   if awk -v b="${HALT_PRIOR_COEF:-0}" 'BEGIN { exit !(b > 0) }'; then
     ARM_FLAGS+=(--halt_prior_coef="$HALT_PRIOR_COEF"); RUN+="_hprior${HALT_PRIOR_COEF}"
@@ -173,27 +161,10 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  [[ "$HALT_MAX_SKIP" =~ ^[1-9][0-9]*$ ]] || { echo "HALT_MAX_SKIP must be an integer >= 1, got $HALT_MAX_SKIP"; exit 1; }
-  ARM_FLAGS+=(--halt_max_skip="$HALT_MAX_SKIP"); RUN+="_hk${HALT_MAX_SKIP}"
-  case "$HALT_HEAD" in
-    none|distance|raw) ARM_FLAGS+=(--halt_head="$HALT_HEAD" --halt_head_width="$HALT_HEAD_WIDTH"); RUN+="_hh${HALT_HEAD/distance/dist}"
-                       [[ "$HALT_HEAD_WIDTH" != 32 ]] && RUN+="${HALT_HEAD_WIDTH}"
-                       [[ "$HALT_HEAD" != none ]] && RUN+="_look" ;;
-    convtest) ARM_FLAGS+=(--halt_head=convtest); RUN+="_hhconv"
-      [[ "$HALT_SPLIT" == 1 ]] && { ARM_FLAGS+=(--halt_convtest_split); RUN+="_hsplit"; }
-      [[ "$HALT_OFFSET" != none ]] && { ARM_FLAGS+=(--halt_offset="$HALT_OFFSET"); RUN+="_hoff${HALT_OFFSET}"; }
-      [[ "$HALT_REPLAY" == 0 ]] && { ARM_FLAGS+=(--no-halt_replay_features); RUN+="_hnoreplay"; }
-      [[ "$HALT_PRECOND" == 0 ]] && { ARM_FLAGS+=(--no-halt_precondition); RUN+="_hnoprecond"; }
-      [[ "$HALT_LR" != 1e-2 ]] && { ARM_FLAGS+=(--halt_lr="$HALT_LR"); RUN+="_hlr${HALT_LR}"; }
-      [[ "$HALT_DAMPING" != 1e-3 ]] && { ARM_FLAGS+=(--halt_damping="$HALT_DAMPING"); RUN+="_hdamp${HALT_DAMPING}"; }
-      [[ "$HALT_FISHER_EMA" != 0 ]] && { ARM_FLAGS+=(--halt_fisher_ema="$HALT_FISHER_EMA"); RUN+="_hfema${HALT_FISHER_EMA}"; }
-      [[ "$HALT_TRUST" != 0 ]] && { ARM_FLAGS+=(--halt_trust_region="$HALT_TRUST"); RUN+="_htr${HALT_TRUST}"; } ;;
-    sigmoid) ARM_FLAGS+=(--halt_head=sigmoid --halt_kl="$HALT_KL"); RUN+="_hhsig_kl${HALT_KL}"  # kl_only-prev_latent head
-      [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_beta_head); RUN+="_hbeta"; }
-      [[ "${HALT_THRESHOLD_FIXED:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_hfixthr"; }
-      [[ "${HALT_ALPHA_MIN:-0}" != 0 ]] && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_hamin${HALT_ALPHA_MIN}"; } ;;
-    *) echo "HALT_HEAD must be none, distance, raw, convtest or sigmoid, got $HALT_HEAD"; exit 1 ;;
-  esac
+  ARM_FLAGS+=(--halt_kl="$HALT_KL"); RUN+="_hk1_hhsig_kl${HALT_KL}"  # kl_only-prev_latent head
+  [[ "${HALT_BETA_HEAD:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_beta_head); RUN+="_hbeta"; }
+  [[ "${HALT_THRESHOLD_FIXED:-0}" == 1 ]] && { ARM_FLAGS+=(--halt_threshold_fixed); RUN+="_hfixthr"; }
+  [[ "${HALT_ALPHA_MIN:-0}" != 0 ]] && { ARM_FLAGS+=(--halt_alpha_min="$HALT_ALPHA_MIN"); RUN+="_hamin${HALT_ALPHA_MIN}"; }
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
@@ -208,9 +179,9 @@ if [[ "$ARM" == mem_halt ]]; then
     kl) ;;
     latent) ARM_FLAGS+=(--halt_signal=latent); RUN+="_hlat" ;;
     tv) ARM_FLAGS+=(--halt_signal=tv); RUN+="_htv" ;;
-    *) echo "HALT_SIGNAL must be kl, tv or latent (no signal: HALT_HEAD=none), got $HALT_SIGNAL"; exit 1 ;;
+    *) echo "HALT_SIGNAL must be kl, tv or latent got $HALT_SIGNAL"; exit 1 ;;
   esac
-fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL / HALT_MAX_SKIP (shared study settings)
+fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE / STABLE_KL (shared study settings)
 if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then
   case "$STABLE_SOFTMAX" in
     0) ;;

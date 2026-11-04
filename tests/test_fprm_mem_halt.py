@@ -10,8 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fprm import FPRMConfig, rms_norm  # noqa: E402
 from models.fprm_mem_halt import (  # noqa: E402
-    FPRMMemHaltActorValue, best_step_path, sample_step_path, step_decision_log_probs, step_expected_c, step_path_entropy,
-    step_path_log_prob,
+    FPRMMemHaltActorValue, c_log_probs, decision_log_probs, decision_mask, sample_c,
 )
 
 CFG = FPRMConfig(d_model=16, num_heads=2)
@@ -31,20 +30,15 @@ def _with(params, name, **leaves):
 
 
 def _random_head(params, key=2, scale=1.0):
-    """The halting MLP's zero-initialized output layer made random, so the head is no longer uniform."""
-    w = params['halt_out']['kernel']
-    return _with(params, 'halt_out', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape))
+    """The halting head moved off its init: a random state-dependent beta (read with halt_beta_head) and alpha != 1."""
+    w = params['halt_beta']['kernel']
+    params = _with(params, 'halt_beta', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape), bias=jnp.array([-3.0]))
+    return {**params, 'halt_alpha_raw': jnp.float32(0.3)}
 
 
-def _paths(T, n, K):
-    """Every (mask, c) reachable from a decision at pass n, by enumeration (bit n-1 = decision at pass n)."""
-    out = [(1 << (n - 1), n)]  # k = 0
-    for k in range(1, K + 1):
-        if n + k >= T:
-            out.append((1 << (n - 1), T))
-        else:
-            out += [((1 << (n - 1)) | m, c) for m, c in _paths(T, n + k, K)]
-    return list(set(out))  # overshooting k's are one outcome (stop at T)
+def _eager(params):
+    """A halting head that halts at its first decision."""
+    return _with(params, 'halt_beta', bias=jnp.array([50.0]))
 
 
 def _k1_path(c, min_iters, T):
@@ -60,34 +54,26 @@ def test_latent_residual_sown():
     assert res.shape == (4, 2) and bool(jnp.all(jnp.isfinite(res))) and bool(jnp.all(res >= 0))
 
 
-@pytest.mark.parametrize('K', [1, 4])
-def test_head_starts_uniform(K):
-    net = _net(min_think_iters=1, halt_max_skip=K)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    p = _intermediates(net, net.init(jax.random.PRNGKey(0), x)['params'], x)['halt_step_probs']
-    assert p.shape == (4, 3, K + 1) and jnp.allclose(p, 1 / (K + 1), atol=1e-6)
-
-
-@pytest.mark.parametrize('K', [1, 4])
-def test_can_halt_after_one_pass(K):
-    net = _net(min_think_iters=1, halt_max_skip=K)
+def test_can_halt_after_one_pass():
+    net = _net(min_think_iters=1)
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
-    params = net.init(jax.random.PRNGKey(0), x)['params']
-    eager = _with(params, 'halt_out', bias=jnp.zeros(K + 1).at[0].set(20.0))
+    eager = _eager(net.init(jax.random.PRNGKey(0), x)['params'])
     assert bool(jnp.all(_intermediates(net, eager, x)['fp_iterations'] == 1))
     assert bool(jnp.all(_intermediates(net, eager, x, halt_key=jax.random.PRNGKey(3))['fp_iterations'] == 1))
 
 
-def test_k1_is_sigmoid_halting():
-    # K = 1 is a yes/no halt at every pass: p(c | s) = h_c prod_{i<c} (1 - h_i), h_n = p_n(k = 0), h_T = 1.
+def test_log_p_c_is_sigmoid_halting():
+    # A yes/no halt at every pass: p(c | s) = h_c prod_{i<c} (1 - h_i), h_T = 1.
     T, min_iters = 4, 2
     net = _net(min_think_iters=min_iters)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'], scale=0.05)  # h strictly inside (0, 1) in fp32
+    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
     h = _intermediates(net, params, x)['halt_prob']
+    assert bool(jnp.all((h > 1e-3) & (h < 1 - 1e-3)))  # strictly inside (0, 1) in fp32
     log_pc = []
     for c in range(min_iters, T + 1):
-        replay = _intermediates(net, params, x, halt_steps=jnp.full((3,), c), halt_path=jnp.full((3,), _k1_path(c, min_iters, T)))
+        replay = _intermediates(net, params, x, halt_steps=jnp.full((3,), c))
+        assert jnp.array_equal(replay['halt_path'], jnp.full((3,), _k1_path(c, min_iters, T)))
         want = jnp.sum(jnp.log(1 - h[min_iters - 1:c - 1]), axis=0) + (jnp.log(h[c - 1]) if c < T else 0.0)
         assert jnp.allclose(replay['halt_log_prob'], want, atol=1e-5)
         log_pc.append(want)
@@ -98,34 +84,41 @@ def test_k1_is_sigmoid_halting():
     assert jnp.allclose(inter['halt_entropy'], -jnp.sum(jnp.exp(log_pc) * log_pc, axis=0), atol=1e-5)
 
 
-@pytest.mark.parametrize('K,min_iters', [(1, 1), (4, 1), (4, 2)])
-def test_best_path_and_entropy_match_enumeration(K, min_iters):
-    T, B = 7, 5
-    lp = jax.nn.log_softmax(2.0 * jax.random.normal(jax.random.PRNGKey(0), (T, B, K + 1)), axis=-1)
-    paths = _paths(T, min_iters, K)
-    log_p = jnp.stack([step_path_log_prob(lp, jnp.full((B,), m), jnp.full((B,), c)) for m, c in paths])  # [paths, B]
-    mask, c = best_step_path(lp, min_iters)
-    i = jnp.argmax(log_p, axis=0)
-    assert jnp.array_equal(mask, jnp.array([paths[j][0] for j in i])) and jnp.array_equal(c, jnp.array([paths[j][1] for j in i]))
-    assert jnp.allclose(step_path_entropy(lp, min_iters), -jnp.sum(jnp.exp(log_p) * log_p, axis=0), atol=1e-5)
-    cs = jnp.array([c for _, c in paths], jnp.float32)[:, None]
-    assert jnp.allclose(step_expected_c(lp, min_iters), jnp.sum(jnp.exp(log_p) * cs, axis=0), atol=1e-4)
+@pytest.mark.parametrize('min_iters', [1, 3, 7])
+def test_c_distribution_by_hand(min_iters):
+    # c_log_probs against a loop over c, its terms by decision pass, the decision mask, and sample_c's frequencies.
+    T, B = 7, 3
+    lp = jax.nn.log_softmax(jax.random.normal(jax.random.PRNGKey(0), (T, B, 2)), axis=-1)
+    m = min(min_iters, T)
+    want = jnp.full((T, B), -1e9)
+    for c in range(m, T + 1):
+        want = want.at[c - 1].set(sum((lp[n - 1, :, 1] for n in range(m, c)), jnp.zeros(B)) + (lp[c - 1, :, 0] if c < T else 0.0))
+    lp_c = c_log_probs(lp, min_iters)
+    assert jnp.allclose(lp_c, want, atol=1e-6) and jnp.allclose(jnp.sum(jnp.exp(lp_c), axis=0), 1.0, atol=1e-5)
+    for c in range(m, T + 1):
+        cs = jnp.full((B,), c)
+        d = decision_log_probs(lp, cs, min_iters)
+        assert jnp.allclose(jnp.sum(d, axis=0), lp_c[c - 1], atol=1e-6)
+        assert jnp.array_equal(decision_mask(cs, T, min_iters), jnp.full((B,), _k1_path(c, m, T)))
+    n = 20000
+    c = jax.vmap(lambda k: sample_c(lp, min_iters, k))(jax.random.split(jax.random.PRNGKey(1), n))  # [n, B]
+    freq = jnp.stack([jnp.mean(c == k, axis=0) for k in range(1, T + 1)])
+    assert jnp.allclose(freq, jnp.exp(lp_c), atol=0.015)
 
 
 @pytest.mark.parametrize('head_grad', [False, True])
 def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
-    net = _net(halt_head='none', halt_head_grad=head_grad)  # reads h_n, so the trunk is reachable
+    net = _net(halt_beta_head=True, halt_head_grad=head_grad)  # beta reads h_(n+1), so the trunk is reachable
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'], scale=0.3)
-    path = jnp.array([_k1_path(2, 2, 4), _k1_path(3, 2, 4)])
 
     def halt_loss(p):
-        return jnp.sum(_intermediates(net, p, x, halt_steps=jnp.array([2, 3]), halt_path=path)['halt_log_prob'])
+        return jnp.sum(_intermediates(net, p, x, halt_steps=jnp.array([2, 3]))['halt_log_prob'])
 
     g = jax.grad(halt_loss)(params)
     trunk = sum(float(jnp.sum(jnp.abs(v))) for v in jax.tree_util.tree_leaves(g['core']))
     assert (trunk > 0) == head_grad
-    assert float(jnp.sum(jnp.abs(g['halt_hidden']['kernel']))) > 0
+    assert float(jnp.sum(jnp.abs(g['halt_beta']['kernel']))) > 0 and float(jnp.abs(g['halt_alpha_raw'])) > 0
 
 
 @pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
@@ -134,8 +127,7 @@ def test_lookahead_halts_with_previous_pass(signal):
     # signal of pass 2.
     net = _net(min_think_iters=1, halt_signal=signal)
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
-    params = net.init(jax.random.PRNGKey(0), x)['params']
-    eager = _with(params, 'halt_out', bias=jnp.array([20.0, 0.0]))
+    eager = _eager(net.init(jax.random.PRNGKey(0), x)['params'])
     inter = _intermediates(net, eager, x)
     assert bool(jnp.all(inter['fp_iterations'] == 1))
     one_pass = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=1, halt_signal=signal), eager, x)
@@ -143,20 +135,17 @@ def test_lookahead_halts_with_previous_pass(signal):
     assert jnp.allclose(inter['fp_residual'], inter['halt_signal_t'][1], atol=1e-6)
 
 
-@pytest.mark.parametrize('K', [1, 4])
 @pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
-def test_distance_head_reads_the_next_signal(K, signal):
-    # 'distance': the decision at pass n is softmax(MLP(log S_{n+1})), a GELU MLP of the scalar.
-    net = _net(min_think_iters=1, halt_signal=signal, halt_max_skip=K)
+def test_head_reads_the_next_signal(signal):
+    # The decision at pass n is sigmoid(beta - alpha log S_(n+1)).
+    net = _net(min_think_iters=1, halt_signal=signal)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
     inter = _intermediates(net, params, x)
     if signal == 'kl':
         assert jnp.allclose(inter['halt_signal_t'], inter['policy_kl_t'])
-    u = jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)[..., None]
-    hid, out = params['halt_hidden'], params['halt_out']
-    g = jax.nn.gelu(u @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
-    assert jnp.allclose(inter['halt_step_probs'][:-1], jax.nn.softmax(g, axis=-1), atol=1e-5)
+    logit = -3.0 - jax.nn.softplus(0.3) * jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)
+    assert jnp.allclose(inter['halt_prob'][:-1], jax.nn.sigmoid(logit), atol=1e-5)
 
 
 def test_latent_signal_is_l2_of_readout_latents():
@@ -172,17 +161,6 @@ def test_latent_signal_is_l2_of_readout_latents():
     # kl and latent see the same passes; only S differs
     kl_net = _net(halt_signal='kl')
     assert jnp.allclose(_intermediates(kl_net, params, x)['policy_kl_t'], _intermediates(net, params, x)['policy_kl_t'])
-
-
-@pytest.mark.parametrize('K', [1, 4])
-def test_no_lookahead_without_signal(K):
-    # halt_head='none' (a plain halting head on h_n): the decision at pass 1 reads pass 1 only, as in a 1-pass net.
-    kw = dict(min_think_iters=1, halt_head='none', halt_max_skip=K)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _random_head(_net(**kw).init(jax.random.PRNGKey(0), x)['params'])
-    four = _intermediates(_net(**kw), params, x)
-    one = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=1, **kw), params, x)
-    assert jnp.allclose(four['halt_step_probs'][0], one['halt_step_probs'][0], atol=1e-4)
 
 
 def test_sep_token_in_every_pass():
@@ -201,11 +179,11 @@ def test_sep_token_in_every_pass():
         assert float(jnp.abs(jax.grad(value_sum)(params['sep'])).sum()) > 0
 
 
-@pytest.mark.parametrize('signal,head', [('kl', 'none'), ('latent', 'distance'), ('latent', 'raw')])
-def test_value_and_halt_tokens(signal, head):
+def test_value_and_halt_tokens():
+    # (halt_signal='latent': with 'kl' S comes from the acting policy, which halt_token does not move.)
     # value_token / halt_token move one readout to the other token: the action stays with readout_token's, the value
     # and the halting head match readout_token='sep'.
-    kw = dict(action_head='readout', output_dim_1=4, min_think_iters=1, halt_signal=signal, halt_head=head)
+    kw = dict(action_head='readout', output_dim_1=4, min_think_iters=1, halt_signal='latent', halt_beta_head=True)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = _random_head(_net(**kw).init(jax.random.PRNGKey(0), x)['params'])
     out = {r: _intermediates(_net(readout_token=r, **kw), params, x) for r in ('thought', 'sep')}
@@ -214,43 +192,23 @@ def test_value_and_halt_tokens(signal, head):
     assert jnp.allclose(split['value'], out['sep']['value'], atol=1e-6)
     assert jnp.allclose(split['halt_step_probs'], out['sep']['halt_step_probs'], atol=1e-6)
     assert not jnp.allclose(split['halt_step_probs'], out['thought']['halt_step_probs'], atol=1e-4)
-    with pytest.raises(AssertionError):  # the KL heads never read h_n
-        _net(halt_token='sep', **{**kw, 'halt_signal': 'kl', 'halt_head': 'distance'}).init(jax.random.PRNGKey(0), x)
 
 
-@pytest.mark.parametrize('min_iters', [1, 2])
-def test_step_path_probabilities_sum_to_one(min_iters):
-    T = 7
-    lp = jax.nn.log_softmax(jax.random.normal(jax.random.PRNGKey(0), (T, 1, 5)), axis=-1)
-    paths = _paths(T, min_iters, 4)
-    total = sum(float(jnp.exp(step_path_log_prob(lp, jnp.array([m]), jnp.array([c])))[0]) for m, c in paths)
-    assert abs(total - 1.0) < 1e-5, total
-
-
-def test_step_path_log_prob_by_hand():
-    # T = 8: decide at 1 (k = 2), at 3 (k = 4), at 7 (any k >= 1 reaches the cap) -> c = 8.
-    lp = jax.nn.log_softmax(jax.random.normal(jax.random.PRNGKey(1), (8, 1, 5)), axis=-1)
-    mask = (1 << 0) | (1 << 2) | (1 << 6)
-    want = lp[0, 0, 2] + lp[2, 0, 4] + jax.scipy.special.logsumexp(lp[6, 0, 1:])
-    assert jnp.allclose(step_path_log_prob(lp, jnp.array([mask]), jnp.array([8]))[0], want, atol=1e-6)
-
-
-@pytest.mark.parametrize('K', [1, 4])
-def test_replay_matches_rollout(K):
-    # The loss replays (c, path) from the rollout and must recover the rollout's log p(path).
-    net = _net(min_think_iters=1, halt_max_skip=K)
+def test_replay_matches_rollout():
+    # The loss replays c from the rollout and must recover the rollout's log p(c | s).
+    net = _net(min_think_iters=1)
     x = jax.random.normal(jax.random.PRNGKey(1), (6, 18))
     params = net.init(jax.random.PRNGKey(0), x)['params']
     roll = _intermediates(net, params, x, halt_key=jax.random.PRNGKey(3))
-    replay = _intermediates(net, params, x, halt_steps=roll['fp_iterations'], halt_path=roll['halt_path'])
+    replay = _intermediates(net, params, x, halt_steps=roll['fp_iterations'])
     assert jnp.allclose(roll['halt_log_prob'], replay['halt_log_prob'], atol=1e-5)
     assert bool(jnp.all(roll['halt_log_prob'] < 0)) and bool(jnp.all((roll['fp_iterations'] >= 1) & (roll['fp_iterations'] <= 4)))
 
 
 def test_halting_batched_jit():
-    # Batched jit of the halting path sampling (an earlier head's concat was miscompiled by XLA GPU at batch > 1).
+    # Batched jit of the halting sampling (an earlier head's concat was miscompiled by XLA GPU at batch > 1).
     net = FPRMMemHaltActorValue(m=5, n=5, config=FPRMConfig(num_layers=2), max_think_iters=4, min_think_iters=1,
-                                halt_max_skip=4, output_dim_1=4, action_head='readout')
+                                output_dim_1=4, action_head='readout')
     x = jax.random.normal(jax.random.PRNGKey(1), (8, 50))
     params = net.init(jax.random.PRNGKey(0), x)
     _, inter = jax.jit(lambda p, x, k: net.apply(p, x, halt_key=k, mutable=['intermediates']))(params, x, jax.random.PRNGKey(2))
@@ -272,51 +230,6 @@ def test_stable_softmax_and_kl():
     assert bool(jnp.any(big)) and jnp.allclose(kl[big], kl_std[big], rtol=1e-3)
 
 
-def _signal_head_case(K, signal, head):
-    kw = dict(min_think_iters=1, halt_max_skip=K, halt_signal=signal, halt_head=head, halt_head_width=8)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _net(**kw).init(jax.random.PRNGKey(0), x)['params']
-    out = params['halt_out']
-    out = {'kernel': jax.random.normal(jax.random.PRNGKey(2), out['kernel'].shape),
-           'bias': jax.random.normal(jax.random.PRNGKey(3), out['bias'].shape)}
-    return kw, x, params, {**params, 'halt_out': out}
-
-
-@pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
-@pytest.mark.parametrize('head', ['none', 'distance', 'raw'])
-def test_every_head_starts_uniform(K, signal, head):
-    kw, x, params, _ = _signal_head_case(K, signal, head)
-    assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'], 1 / (K + 1), atol=1e-6)
-
-
-@pytest.mark.parametrize('K', [1, 4])
-@pytest.mark.parametrize('signal', ['kl', 'tv'])
-def test_raw_policy_head_reads_both_policies(K, signal):
-    # The decision at pass 1 is softmax(g([log pi_1, log pi_2])); pi_n = the policy of an n-pass net.
-    kw, x, _, params = _signal_head_case(K, signal, 'raw')
-    log_pi = [jax.nn.log_softmax(_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=n, **kw), params, x,
-                                        halt_steps=jnp.full((3,), n), halt_path=jnp.zeros((3,), int))['logits'], -1)
-          for n in (1, 2)]  # replaying c = n just selects pi_n
-    hid, out = params['halt_hidden'], params['halt_out']
-    g = jax.nn.gelu(jnp.concatenate(log_pi, -1) @ hid['kernel'] + hid['bias']) @ out['kernel'] + out['bias']
-    assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_step_probs'][0], jax.nn.softmax(g, -1), atol=1e-4)
-
-
-def test_raw_latent_head_varies_and_trains():
-    kw, x, _, params = _signal_head_case(1, 'latent', 'raw')
-    path = jnp.array([_k1_path(c, 1, 4) for c in (1, 2, 3)])
-
-    def halt_loss(p):
-        return jnp.sum(_intermediates(_net(**kw), p, x, halt_steps=jnp.array([1, 2, 3]), halt_path=path)['halt_log_prob'])
-
-    h = _intermediates(_net(**kw), params, x)['halt_prob'][:-1]
-    assert float(jnp.max(h) - jnp.min(h)) > 1e-3
-    g = jax.grad(halt_loss)(params)
-    assert float(jnp.sum(jnp.abs(g['halt_hidden']['kernel']))) > 0
-    assert sum(float(jnp.sum(jnp.abs(v))) for v in jax.tree_util.tree_leaves(g['core'])) == 0  # stop-gradient'ed inputs
-
-
 def test_no_halting_acts_with_the_last_pass():
     # halting=False (iso_mem): no halting parameters, c = T for every state, and the same readout as the halting model
     # forced to act at the last pass.
@@ -326,19 +239,8 @@ def test_no_halting_acts_with_the_last_pass():
     iso = _intermediates(_net(halting=False), params, x)
     assert bool(jnp.all(iso['fp_iterations'] == 4)) and 'halt_log_prob' not in iso
     head = {k: v for k, v in _net().init(jax.random.PRNGKey(0), x)['params'].items() if k.startswith('halt_')}
-    forced = _intermediates(_net(), {**params, **head}, x, halt_steps=jnp.full((3,), 4),
-                            halt_path=jnp.full((3,), _k1_path(4, 2, 4)))
+    forced = _intermediates(_net(), {**params, **head}, x, halt_steps=jnp.full((3,), 4))
     assert jnp.allclose(iso['logits'], forced['logits'], atol=1e-6) and jnp.allclose(iso['value'], forced['value'], atol=1e-6)
-
-
-def test_step_decision_log_probs_sum_to_path():
-    T, B, K = 8, 5, 4
-    lp = jax.nn.log_softmax(jax.random.normal(jax.random.PRNGKey(3), (T, B, K + 1)), axis=-1)
-    mask, c = sample_step_path(lp, 1, jax.random.PRNGKey(4))
-    d = step_decision_log_probs(lp, mask, c)
-    dec = ((mask[None] >> jnp.arange(T)[:, None]) & 1) == 1
-    assert jnp.allclose(jnp.sum(d, axis=0), step_path_log_prob(lp, mask, c), atol=1e-6)
-    assert jnp.all(jnp.where(dec, True, d == 0.0)) and jnp.all(jnp.where(dec, d < 0.0, True))
 
 
 def test_value_pass_halt_reads_the_value_at_c():
@@ -347,7 +249,7 @@ def test_value_pass_halt_reads_the_value_at_c():
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
     params = net.init(jax.random.PRNGKey(0), x)['params']
     c = jnp.array([1, 2, 4])
-    kw = dict(halt_steps=c, halt_path=jnp.array([_k1_path(int(n), 1, 4) for n in c]))
+    kw = dict(halt_steps=c)
     by_c = [_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=int(n), min_think_iters=1), params, x)
             ['value'] for n in c]  # pass n = the last pass of a T = n model
     last = _intermediates(net, params, x, **kw)['value']
@@ -408,8 +310,7 @@ def test_neighbour_head_gathers_the_cell_logits(halting):
     N = 3
     env = SlidingPuzzleEnv(config=default_config())
     obs = jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), 16))
-    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True,
-              **({'halt_head': 'sigmoid'} if halting else {}))
+    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True)
     nbr, cell = _net(action_head='neighbour', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=N * N, **kw)
     params = nbr.init(jax.random.PRNGKey(1), obs)['params']
     norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
@@ -471,19 +372,3 @@ def test_no_cell_geometry_drops_the_geometry_features(action_head):
     got = _intermediates(nogeo, params, obs)['logits']
     want = _intermediates(geo, params_geo, obs)['logits']
     assert jnp.allclose(got, want, atol=1e-5)
-
-
-@pytest.mark.parametrize('token', ['thought', 'sep'])
-def test_linear_head_is_sigmoid_of_halt_token_latent(token):
-    # halt_head='linear': p_n(0) = sigmoid(w . rms_norm(h_n) + b), h_n at halt_token, no lookahead; 1/2 at init.
-    kw = dict(min_think_iters=1, halt_head='linear', halt_token=token)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _net(**kw).init(jax.random.PRNGKey(0), x)['params']
-    assert jnp.allclose(_intermediates(_net(**kw), params, x)['halt_prob'], 0.5)
-    w = jax.random.normal(jax.random.PRNGKey(2), params['halt_linear']['kernel'].shape)
-    params = _with(params, 'halt_linear', kernel=w, bias=jnp.array([0.3]))
-    out = _intermediates(_net(**kw), params, x)
-    # h_n: readout_latent_t is the latent at readout_token, so read it with readout_token=token
-    h = _intermediates(_net(readout_token=token, **kw), params, x)['readout_latent_t']  # [T, B, H]
-    want = jax.nn.sigmoid((rms_norm(h, eps=CFG.rms_norm_eps) @ w)[..., 0] + 0.3)
-    assert jnp.allclose(out['halt_prob'][:-1], want[:-1], atol=1e-5)  # pass T never decides

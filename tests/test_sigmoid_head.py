@@ -1,4 +1,4 @@
-"""halt_head='sigmoid' (CPU, tiny model): h_n = sigmoid(beta_{n+1} - alpha log KL_{n+1}), the kl_only-prev_latent head."""
+"""The halting head (CPU, tiny model): h_n = sigmoid(beta_{n+1} - alpha log KL_{n+1}), the kl_only-prev_latent head."""
 import math
 import os
 import sys
@@ -30,7 +30,7 @@ def _kl_branch_log_pc(halt_logit, min_iters):
 def test_matches_kl_branch(kw):
     kw = dict(dict(min_think_iters=1), **kw)
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    net = FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=T, halt_head='sigmoid', **kw)
+    net = FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=T, **kw)
     params = net.init(jax.random.PRNGKey(0), x)['params']
     # Move alpha and beta away from their init so the test sees them.
     params = dict(params, halt_alpha_raw=jnp.float32(0.7), halt_beta={
@@ -55,14 +55,14 @@ def test_matches_kl_branch(kw):
     m = kw['min_think_iters']
     for c in range(m, T + 1):  # the replayed log p(c | s) of every reachable c; decisions at passes m..min(c, T - 1)
         path = (1 << min(c, T - 1)) - (1 << (m - 1))
-        _, inter = net.apply({'params': params}, x, mutable=['intermediates'],
-                             halt_steps=jnp.full((3,), c), halt_path=jnp.full((3,), path))
+        _, inter = net.apply({'params': params}, x, mutable=['intermediates'], halt_steps=jnp.full((3,), c))
+        np.testing.assert_array_equal(inter['intermediates']['halt_path'][0], path)
         np.testing.assert_allclose(inter['intermediates']['halt_log_prob'][0], log_pc[c - 1], rtol=1e-4, atol=1e-4)
 
 
 def test_init_half_at_halt_kl():
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    net = FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=T, halt_head='sigmoid', min_think_iters=1, halt_kl=1e-2)
+    net = FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=T, min_think_iters=1, halt_kl=1e-2)
     params = net.init(jax.random.PRNGKey(0), x)['params']
     _, inter = net.apply({'params': params}, x, mutable=['intermediates'])
     kl = inter['intermediates']['policy_kl_t'][0][1:]

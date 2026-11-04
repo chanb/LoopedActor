@@ -20,35 +20,21 @@ iteration cap.
 `halting=False` (the `fprm_mem` architecture, arm iso_mem): no halting head; every example runs all max_think_iters
 passes and acts with the last one (c = T).
 
-`halting=True` (`fprm_mem_halt`): halting is a chain of decisions. At a decision pass n a head picks k in 0..K
-(K = `halt_max_skip`) more passes: k = 0 halts and acts with pi_n; k > 0 runs k passes without deciding and decides again
-at n + k; any n + k >= T stops at the cap (c = T). The first decision is at min_think_iters. K = 1 is a yes/no halt at
-every pass (h_n = p_n(0)); K = 4 can skip up to 4 passes at once.
+`halting=True` (`fprm_mem_halt`): a yes/no halt at every pass n from min_think_iters on, with probability h_n; the
+first halt sets the think time c = n, and no halt before pass T stops at the cap (c = T).
 
 What a decision at pass n reads. Let h_n be the latent at the readout head (the readout token's output at pass n, from
 which pi_n is decoded). `halt_signal` picks the pair (z_n, z_{n+1}) a convergence test compares and its distance S:
   'kl':     z_n = pi_n,  S_{n+1} = KL(pi_{n+1} || pi_n)
   'tv':     z_n = pi_n,  S_{n+1} = TV(pi_{n+1}, pi_n) = 1/2 sum_a |pi_{n+1}(a) - pi_n(a)|
   'latent': z_n = h_n,   S_{n+1} = ||rms_norm(h_{n+1}) - rms_norm(h_n)||   (L2 of what the readout heads read)
-`halt_head` picks the head, each a one-hidden-layer GELU MLP (width `halt_head_width`) with K + 1 outputs and a
-zero-initialized output layer, so k is uniform at init:
-  'none':     p_n = softmax(MLP(rms_norm(h_n)))                      no signal, no lookahead (ACT / PonderNet style)
-  'distance': p_n = softmax(MLP(log S_{n+1}))
-  'raw':      p_n = softmax(MLP([z_n, z_{n+1}]))                     z = log pi (log-softmax) or rms_norm(h)
-'distance' and 'raw' look one pass ahead: pass n+1 is computed, and if the head halts, pass n acts (c = n means "pass
-n+1 agrees with pass n"), so c = 1 is decided by a real convergence test on pass 2 (use min_think_iters = 1). S is
-stop-gradient'ed; the h and pi inputs are too unless `halt_head_grad`.
-'convtest' (K = 1, also lookahead): logit p_n(0) = theta0 + theta1 f_n, f_n = convtest_features(S_{n+1}, S_n).
-`halt_convtest_split` unties the two terms of f_n = a_n + logit(L_n): theta0 + theta1 a_n + theta2 logit(L_n)
-(theta2 = theta1 is the tied head; theta2 = 0 a test on the step size alone).
-'sigmoid' (K = 1, also lookahead; the kl_only-prev_latent head): logit p_n(0) = beta_{n+1} - alpha log S_{n+1},
+The head (the kl_only-prev_latent head) looks one pass ahead: logit h_n = beta_{n+1} - alpha log S_{n+1}. Pass n+1 is
+computed, and if the head halts, pass n acts (c = n means "pass n+1 agrees with pass n"), so c = 1 is decided by a real
+convergence test on pass 2 (use min_think_iters = 1). S is stop-gradient'ed.
 alpha = halt_alpha_min + softplus(.) (1 at init), beta a learned scalar (log halt_kl at init) or, with `halt_beta_head`,
-plus a zero-initialized Dense on rms_norm(h_{n+1}); p_n(0) = 1/2 at S = halt_kl at init. `halt_threshold_fixed`:
-beta = alpha log halt_kl, so the threshold stays at halt_kl and alpha only sets the sharpness.
-'linear' (K = 1, no lookahead): p_n(0) = sigmoid(w . rms_norm(h_n) + b), w and b zero at init (p_n(0) = 1/2).
-With 'kl' it reads sqrt(2 KL), a distance (the local Fisher-Rao length), so S_{n+1} / S_n estimates the contraction
-rate (KL's ratio would be its square); 'tv' is a distance as is. Decision 1's S_1 is against uniform ('kl', 'tv') or the
-initial latent ('latent').
+plus a zero-initialized Dense on rms_norm(h_{n+1}) (stop-gradient'ed unless `halt_head_grad`); h_n = 1/2 at S = halt_kl
+at init. `halt_threshold_fixed`: beta = alpha log halt_kl, so the threshold stays at halt_kl and alpha only sets the
+sharpness. Decision 1's S_1 is against uniform ('kl', 'tv') or the initial latent ('latent').
 
 Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose latent is carried between passes like the
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
@@ -56,14 +42,11 @@ memory keeps. `readout_token` picks where every readout (logits, value, the halt
 thought's output ('thought') or SEP's latent ('sep'; the thoughts then only feed the memory and the next thought, so
 they need not be decodable as a policy themselves). `value_token` / `halt_token` ('' = readout_token) move the value
 or the halting head's h_n to the other token, e.g. readout_token='thought', value_token='sep', halt_token='sep': the
-thought acts, SEP evaluates and decides the halt. halt_token only matters where the head reads h_n (halt_head='none'
-or halt_signal='latent'), so it must equal readout_token otherwise.
+thought acts, SEP evaluates and decides the halt.
 
-The PPO ratio scores the sampled path, log p(path) = sum of the log-probabilities of its decisions (all k that reach
-the cap count as one outcome), so the rollout stores the decision passes (`halt_path`, a bitmask) along with c. For
-K = 1 the path is determined by c and log p(path) = log p(c | s). Evaluation takes the most likely path (a max-product
-recursion over passes; for K = 1 the most likely c), and 'halt_entropy' is the exact entropy of the path (= H(c) for
-K = 1), from the probability r_n of reaching a decision at pass n: H = sum_n r_n H(p_n).
+The PPO ratio scores log p(c | s) = sum_{n < c} log(1 - h_n) + log h_c (no h_T term: c = T is the cap). The rollout
+also stores the decision passes (`halt_path`, a bitmask: bit n-1 = a decision at pass n), a function of c. Evaluation
+takes the most likely c, and 'halt_entropy' is H(c).
 
 `halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead, the expectation under pi_{i-1}, i.e. under pi_c, the policy that
 acts; the two directions agree to second order for small policy changes.
@@ -73,12 +56,12 @@ computes KL_i from the logit difference, exact down to ~1e-6 relative (the stand
 floor in fp32 and is non-zero at equal policies). stable_softmax gives the policy and the halting head collapse-free
 log-probabilities (no zeroed gradient on an action whose margin exceeds ~16.6).
 
-The think time c (with its decision path) is an action of the joint policy: log p(c, a | s) = log p(path | s) +
+The think time c is an action of the joint policy: log p(c, a | s) = log p(c | s) +
 log pi_c(a | s). c = T is a forced halt: pi_T acts with no pass after it to check it against. All T passes are always
 executed; the readout of pass c is selected afterwards, so passes after c get no gradient from the actor loss.
 
-Choice of c in `__call__`: `halt_steps` and `halt_path` given (the PPO loss replays the rollout's path) > `halt_key`
-given (rollout: a sampled path) > neither (evaluation: the most likely path).
+Choice of c in `__call__`: `halt_steps` given (the PPO loss replays the rollout's c) > `halt_key` given (rollout: a
+sampled c) > neither (evaluation: the most likely c).
 
 Action heads (`action_head`): 'per_cell' = one logit per cell latent (Lights Out presses), 'readout' = Dense(A) on the
 readout token (moves), 'neighbour' = 4 moves of the blank (sliding puzzle; observation channel 0 marks the blank) whose
@@ -95,8 +78,8 @@ halting gradient.
 Sown intermediates: 'logits'/'value' (at the chosen c), 'fp_iterations' (= c), 'fp_residual' (S_{c+1}, the signal that
 decided the halt; KL_T without halting), 'fp_converged' / 'fp_stop_reason', 'halt_signal_t' (S_i by pass, [T, B],
 unshifted), with halting also 'halt_log_prob'
-(log p(path | s)), 'halt_decision_log_probs' (its terms by decision pass, [B, T], 0 off the path), 'halt_entropy', 'halt_expected_c' (E[c | s]), 'halt_path', 'halt_prob' (p_n(0), [T, B]), 'halt_step_probs' (p_n(k),
-[T, B, K + 1]), 'halt_step_log_probs' (log p_n(k), [T, B, K + 1]) and 'policy_log_probs_t' (log pi_n by pass, [T, B, A]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
+(log p(c | s)), 'halt_decision_log_probs' (its terms by decision pass, [B, T], 0 off the path), 'halt_entropy', 'halt_expected_c' (E[c | s]), 'halt_path', 'halt_prob' (h_n, [T, B]), 'halt_step_probs' ((h_n, 1 - h_n),
+[T, B, 2]), 'halt_step_log_probs' (their logs, [T, B, 2]), 'halt_log_sig_t' (log S_{n+1} at row n, [T, B]) and 'policy_log_probs_t' (log pi_n by pass, [T, B, A]), and always 'policy_kl_t' (KL_i by pass, [T, B], unshifted; pass 1 is
 against uniform) and 'latent_residual_t' (the max-token residual of the cell latents between consecutive passes, as
 fprm's halt_criterion='latent_residual'; [T, B], pass 1 is against the initial latent) and 'readout_latent_t' (the latent pi_n is decoded from, by pass, [T, B, H]).
 """
@@ -242,122 +225,46 @@ def split_dense(x, kernel, bias, eps):
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
-def convtest_features(s_next, s_prev, scale):
-    """halt_head='convtest' features (a, L, f) from the distances S_(n+1), S_n: f = a + logit(L) is the log of the
-    estimated distance to the fixed point (contraction rate L, step a normalized by `scale`: sqrt(H) for the rms-normed
-    latents, 1 for sqrt(2 KL))."""
-    a = jnp.clip(jnp.log((s_next + 1e-12) / scale), math.log(1e-4), math.log(2))
-    L = jnp.clip((s_next + 1e-12) / (s_prev + 1e-12), 1e-3, 0.999)
-    return a, L, a + jnp.log(L / (1 - L))
-
-
-def convtest_fisher(f, p, mask, damping):
-    """Fisher of the convtest head's (theta0, theta1[, theta2]): mean over states of sum over decision passes of
-    p (1 - p) phi phi^T, phi = [1, f], plus damping * I. f: [passes, B] or, split, [passes, B, 2]; p, mask: [passes, B]."""
+def natural_grad_fisher(f, p, mask, damping):
+    """Fisher of the halt logit's (beta, alpha_raw), d logit = d beta + f d alpha_raw: mean over states of sum over
+    decision passes of p (1 - p) phi phi^T, phi = [1, f], plus damping * I. f, p, mask: [passes, B]."""
     w = jnp.where(mask, p * (1 - p), 0.0)
-    phi = jnp.concatenate([jnp.ones(p.shape + (1,), f.dtype), f[..., None] if f.ndim == 2 else f], axis=-1)
-    return jnp.einsum('nb,nbi,nbj->ij', w, phi, phi) / p.shape[1] + damping * jnp.eye(phi.shape[-1])
+    phi = jnp.stack([jnp.ones_like(f), f], axis=-1)
+    return jnp.einsum('nb,nbi,nbj->ij', w, phi, phi) / p.shape[1] + damping * jnp.eye(2)
 
 
-def step_path_log_prob(lp, mask, c):
-    """log p(path) from per-pass log-probabilities lp [T, B, K + 1] of k, the decision
-    passes mask [B] (bit n-1 = a decision at pass n) and the think time c [B]."""
-    return jnp.sum(step_decision_log_probs(lp, mask, c), axis=0)
+def _decision_passes(T, min_iters):
+    """[T, 1] pass numbers n and whether pass n decides (min_iters <= n < T)."""
+    n = jnp.arange(1, T + 1)[:, None]
+    return n, (n >= min_iters) & (n < T)
 
 
-def step_decision_log_probs(lp, mask, c):
-    """The terms of step_path_log_prob: log p of the outcome at each decision pass, 0 elsewhere, [T, B]."""
-    T, B, K = lp.shape
-    n = jnp.arange(1, T + 1)[:, None]  # [T, 1]
-    dec = ((mask[None] >> (n - 1)) & 1).astype(bool)  # [T, B]
-    first_from = jax.lax.cummin(jnp.where(dec, n, T + 1)[::-1], axis=0)[::-1]  # first decision pass >= n
-    nxt = jnp.concatenate([first_from[1:], jnp.full((1, B), T + 1)], axis=0)  # first decision pass > n
-    lp_next = jnp.take_along_axis(lp, jnp.clip(nxt - n, 0, K - 1)[..., None], axis=-1)[..., 0]
-    reaches_cap = jnp.arange(K) >= jnp.maximum(1, T - n)[..., None]  # [T, 1, K]: the k with n + k >= T
-    lp_cap = jax.scipy.special.logsumexp(jnp.where(reaches_cap, lp, _NEG), axis=-1)
-    out = jnp.where((c[None] == n) & (n < T), lp[..., 0], jnp.where(nxt <= T, lp_next, lp_cap))
-    return jnp.where(dec, out, 0.0)
+def c_log_probs(lp, min_iters):
+    """log p(c | s) for c = 1..T, [T, B], from lp [T, B, 2] (row n - 1: log h_n, log(1 - h_n)); _NEG where c < min_iters."""
+    T = lp.shape[0]
+    n, dec = _decision_passes(T, min_iters)
+    lp_cont = jnp.where(dec, lp[..., 1], 0.0)
+    before = jnp.cumsum(jnp.concatenate([jnp.zeros_like(lp_cont[:1]), lp_cont[:-1]]), axis=0)  # sum over passes < c
+    return jnp.where(n >= min(min_iters, T), before + jnp.where(dec, lp[..., 0], 0.0), _NEG)
 
 
-def sample_step_path(lp, min_iters, key=None):
-    """Sample a path (k at each decision); returns (mask, c), [B]."""
-    T, B, _ = lp.shape
-    keys = jax.random.split(key, T)
-
-    def body(carry, inp):
-        nxt, done, mask, c = carry
-        n, lp_n, key_n = inp
-        k = jax.random.categorical(key_n, lp_n, axis=-1).astype(jnp.int32)
-        here = ~done & (nxt == n) & (n < T)
-        halt, cap = here & (k == 0), here & (k > 0) & (n + k >= T)
-        mask = jnp.where(here, mask | (1 << (n - 1)), mask)
-        c = jnp.where(halt, n, jnp.where(cap, T, c))
-        return (jnp.where(here & (k > 0), n + k, nxt), done | halt | cap, mask, c), None
-
-    init = (jnp.full((B,), min_iters, jnp.int32), jnp.zeros((B,), bool), jnp.zeros((B,), jnp.int32), jnp.full((B,), T, jnp.int32))
-    (_, _, mask, c), _ = jax.lax.scan(body, init, (jnp.arange(1, T + 1), lp, keys))
-    return mask, c
+def decision_log_probs(lp, c, min_iters):
+    """The terms of log p(c | s) by decision pass, [T, B]: log(1 - h_n) for n < c, log h_c at n = c < T, 0 elsewhere."""
+    n, dec = _decision_passes(lp.shape[0], min_iters)
+    return jnp.where(dec & (n < c), lp[..., 1], jnp.where(dec & (n == c), lp[..., 0], 0.0))
 
 
-def _decisions(lp, n):
-    """Outcomes of a decision at pass n from lp [T, B, K + 1]: [(next pass or None for the cap or a halt, c, log p)]."""
-    T, _, K1 = lp.shape
-    out = [(None, n, lp[n - 1, :, 0])] + [(n + k, None, lp[n - 1, :, k]) for k in range(1, K1) if n + k < T]
-    cap = [k for k in range(1, K1) if n + k >= T]
-    return out + ([(None, T, jax.scipy.special.logsumexp(lp[n - 1, :, cap[0]:], axis=-1))] if cap else [])
+def decision_mask(c, T, min_iters):
+    """The decision passes of the path ending at c as a bitmask [B] (bit n - 1 = a decision at pass n)."""
+    n, dec = _decision_passes(T, min_iters)
+    return jnp.sum(jnp.where(dec & (n <= c), 1 << (n - 1), 0), axis=0).astype(jnp.int32)
 
 
-def best_step_path(lp, min_iters):
-    """The most likely path (max-product over passes); returns (mask, c), [B]."""
-    T, B, _ = lp.shape
-    best = {min_iters: (jnp.zeros((B,)), jnp.zeros((B,), jnp.int32))}  # pass -> (log p of the best path to it, its mask)
-    ends = [(jnp.zeros((B,)), jnp.zeros((B,), jnp.int32), jnp.full((B,), T, jnp.int32))] if min_iters >= T else []
-    for n in range(min_iters, T):
-        if n not in best:
-            continue
-        score, mask = best.pop(n)
-        mask = mask | (1 << (n - 1))
-        for nxt, c, lp_k in _decisions(lp, n):
-            if nxt is None:
-                ends.append((score + lp_k, mask, jnp.full((B,), c, jnp.int32)))
-            else:
-                old = best.get(nxt, (jnp.full((B,), -jnp.inf), mask))
-                better = score + lp_k > old[0]
-                best[nxt] = (jnp.where(better, score + lp_k, old[0]), jnp.where(better, mask, old[1]))
-    i = jnp.argmax(jnp.stack([e[0] for e in ends]), axis=0)
-    pick = lambda j: jnp.take_along_axis(jnp.stack([e[j] for e in ends]), i[None], axis=0)[0]
-    return pick(1), pick(2)
-
-
-def step_path_entropy(lp, min_iters):
-    """Entropy of the path distribution, sum_n r_n H(p_n) with r_n the probability of a decision at pass n."""
-    T, B, _ = lp.shape
-    reach, ent = {min_iters: jnp.ones((B,))}, jnp.zeros((B,))
-    for n in range(min_iters, T):
-        if n not in reach:
-            continue
-        r = reach.pop(n)
-        for nxt, _, lp_k in _decisions(lp, n):
-            ent = ent - r * jnp.exp(lp_k) * lp_k
-            if nxt is not None:
-                reach[nxt] = reach.get(nxt, 0.0) + r * jnp.exp(lp_k)
-    return ent
-
-
-def step_expected_c(lp, min_iters):
-    """E[c | s] of the path distribution, [B] (as step_path_entropy, with c in place of -log p)."""
-    T, B, _ = lp.shape
-    reach, ec = {min_iters: jnp.ones((B,))}, jnp.zeros((B,)) if min_iters < T else jnp.full((B,), float(T))
-    for n in range(min_iters, T):
-        if n not in reach:
-            continue
-        r = reach.pop(n)
-        for nxt, c, lp_k in _decisions(lp, n):
-            if nxt is None:
-                ec = ec + r * jnp.exp(lp_k) * c
-            else:
-                reach[nxt] = reach.get(nxt, 0.0) + r * jnp.exp(lp_k)
-    return ec
+def sample_c(lp, min_iters, key):
+    """Sample c [B]: the first decision pass that halts, else T."""
+    n, dec = _decision_passes(lp.shape[0], min_iters)
+    halt = jax.random.categorical(key, lp, axis=-1) == 0  # [T, B]
+    return jnp.min(jnp.where(dec & halt, n, lp.shape[0]), axis=0).astype(jnp.int32)
 
 
 class FPRMMemHaltActorValue(nn.Module):
@@ -370,20 +277,15 @@ class FPRMMemHaltActorValue(nn.Module):
     min_think_iters: int = 2
     halting: bool = True           # False: no halting head, always act with pass max_think_iters (iso_mem)
     act_iters: int = 0             # halting=False: act with this pass instead (0 = max_think_iters); the value keeps value_pass
-    halt_max_skip: int = 1         # K: each decision picks k in 0..K more passes (1: halt yes/no at every pass)
-    halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through the head's h / pi inputs
+    halt_head_grad: bool = False   # let the halting loss backpropagate into the trunk through halt_beta_head's h input
     halt_kl_reverse: bool = False  # KL_i = KL(pi_{i-1} || pi_i) (see the module docstring)
     stable_kl: bool = False        # KL_i without the fp32 rounding floor (see the module docstring)
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
-    halt_signal: str = 'kl'        # 'kl' | 'tv' | 'latent': what 'distance' / 'raw' compare (see the module docstring)
-    halt_head: str = 'distance'    # 'none' | 'distance' | 'raw' | 'convtest' (see the module docstring)
-    halt_convtest_split: bool = False  # convtest: theta0 + theta1 a_n + theta2 logit(L_n) (see the module docstring)
-    halt_offset: str = 'none'      # convtest: 'none' | 'uniform' (o_n = -log(T - n): c ~ Uniform{1..T} at init)
-    halt_head_width: int = 32      # hidden width of the halting MLP
-    halt_kl: float = 1e-3          # sigmoid: initialization only, p_n(0) = 1/2 at S = halt_kl (beta = log halt_kl, alpha = 1)
-    halt_alpha_min: float = 0.0    # sigmoid: floor on alpha (alpha -> 0 is signal-blind halting)
-    halt_beta_head: bool = False   # sigmoid: beta = bias + Dense(rms_norm(h_{n+1})) (state-dependent); False: a scalar
-    halt_threshold_fixed: bool = False  # sigmoid: beta = alpha log halt_kl (see the module docstring)
+    halt_signal: str = 'kl'        # 'kl' | 'tv' | 'latent': the distance S the head reads (see the module docstring)
+    halt_kl: float = 1e-3          # initialization only, h_n = 1/2 at S = halt_kl (beta = log halt_kl, alpha = 1)
+    halt_alpha_min: float = 0.0    # floor on alpha (alpha -> 0 is signal-blind halting)
+    halt_beta_head: bool = False   # beta = bias + Dense(rms_norm(h_{n+1})) (state-dependent); False: a scalar
+    halt_threshold_fixed: bool = False  # beta = alpha log halt_kl (see the module docstring)
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     value_token: str = ''          # '' (= readout_token) | 'thought' | 'sep': where the value is read from
     halt_token: str = ''           # '' (= readout_token) | 'thought' | 'sep': where the halting head's h_n is read from
@@ -406,41 +308,20 @@ class FPRMMemHaltActorValue(nn.Module):
             'cell_geometry=False needs tokenizer=cell and a plane observation'
 
         assert self.max_think_iters >= 1, self.max_think_iters
-        assert not self.halting or self.halt_max_skip >= 1
         assert self.halt_signal in ('kl', 'tv', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         assert self.value_token in ('', 'thought', 'sep'), self.value_token
         assert self.halt_token in ('', 'thought', 'sep'), self.halt_token
         assert self.value_pass in ('last', 'halt'), self.value_pass
         assert 0 <= self.act_iters <= self.max_think_iters and (self.act_iters == 0 or not self.halting), self.act_iters
-        assert (self.halt_token or self.readout_token) == self.readout_token or (
-            self.halting and (self.halt_head in ('none', 'sigmoid', 'linear') or self.halt_signal == 'latent')), \
-            'halt_token only matters for halt_head=none or halt_signal=latent'
-        assert self.halt_head in ('none', 'distance', 'raw', 'convtest', 'sigmoid', 'linear'), self.halt_head
-        assert self.halt_offset in ('none', 'uniform'), self.halt_offset
-        if self.halt_head == 'convtest':
-            assert self.halting and self.halt_max_skip == 1 and self.min_think_iters == 1, \
-                'convtest needs halting, halt_max_skip=1 and min_think_iters=1'
-            theta0 = 0.0 if self.halt_offset == 'uniform' else -math.log(max(self.max_think_iters - 1, 1))
-            self.theta0 = self.param('theta0', lambda _: jnp.float32(theta0))
-            self.theta1 = self.param('theta1', lambda _: jnp.float32(0.0))
-            if self.halt_convtest_split:
-                self.theta2 = self.param('theta2', lambda _: jnp.float32(0.0))
-        elif self.halt_head == 'sigmoid':
-            assert self.halting and self.halt_max_skip == 1, 'sigmoid needs halting and halt_max_skip=1'
+        assert (self.halt_token or self.readout_token) == self.readout_token or self.halting, 'halt_token needs halting'
+        if self.halting:
             assert self.halt_kl > 0 and 0.0 <= self.halt_alpha_min < 1.0, (self.halt_kl, self.halt_alpha_min)
             assert not (self.halt_threshold_fixed and self.halt_beta_head), 'halt_threshold_fixed replaces beta'
             a0 = 1.0 - self.halt_alpha_min
             self.halt_alpha_raw = self.param('halt_alpha_raw', nn.initializers.constant(math.log(math.expm1(a0))), ())
             self.halt_beta = nn.Dense(1, kernel_init=nn.initializers.zeros,
                                       bias_init=nn.initializers.constant(math.log(self.halt_kl)))
-        elif self.halt_head == 'linear':
-            assert self.halting and self.halt_max_skip == 1, 'linear needs halting and halt_max_skip=1'
-            self.halt_linear = nn.Dense(1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
-        elif self.halting:
-            self.halt_hidden = nn.Dense(  # 'distance': a scalar input, so spread the GELU kinks over its range
-                self.halt_head_width, bias_init=nn.initializers.normal(stddev=1.0 if self.halt_head == 'distance' else 0.0))
-            self.halt_out = nn.Dense(self.halt_max_skip + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         H = self.config.d_model
         self.cell_projection = nn.Dense(H)
@@ -465,12 +346,7 @@ class FPRMMemHaltActorValue(nn.Module):
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
         self.latent_init = make_latent_init(self.config)
 
-    def _halt_mlp(self, x):
-        """The halting head's logits of k [..., K + 1] from its input x [..., in]."""
-        p_in, p_out = self.variables['params']['halt_hidden'], self.variables['params']['halt_out']
-        return jax.nn.gelu(x @ p_in['kernel'] + p_in['bias']) @ p_out['kernel'] + p_out['bias']
-
-    def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None, halt_path=None, halt_features=None):
+    def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None):
         if self.action_head in ('neighbour', 'blank'):  # the blank from the raw observation, before normalization
             blank = jnp.argmax(x.reshape(-1, self.m * self.n, self.obs_channels)[..., 0], axis=-1)  # [B]
         if self.action_head == 'neighbour':
@@ -500,13 +376,8 @@ class FPRMMemHaltActorValue(nn.Module):
             self.core(seq, seq, jnp.ones(seq.shape[:2], bool), grid_shape, prefix_len=0, suffix_len=1)
             self.actor_head(jnp.zeros((1, H)))
             self.value_head(jnp.zeros((1, H)))
-            if self.halt_head == 'sigmoid':
+            if self.halting:
                 self.halt_beta(jnp.zeros((1, H)))
-            elif self.halt_head == 'linear':
-                self.halt_linear(jnp.zeros((1, H)))
-            elif self.halting and self.halt_head != 'convtest':
-                n_in = {'none': H, 'distance': 1, 'raw': 2 * (H if self.halt_signal == 'latent' else self.output_dim_1)}[self.halt_head]
-                self.halt_out(self.halt_hidden(jnp.zeros((1, n_in))))
         params = self.variables['params']
         core_p, actor_p, value_p = params['core'], params['actor_head'], params['value_head']
 
@@ -540,34 +411,19 @@ class FPRMMemHaltActorValue(nn.Module):
         logits_init = jnp.zeros((B, self.output_dim_1), cells.dtype)
         value_init = jnp.zeros((B,), cells.dtype)
 
-        def halt_head(h_prev, h, logits_prev, logits, sig, finite):
-            """Logits of k at this pass [B, K + 1] (row i; 'distance' / 'raw' are read by the decision at pass i - 1)."""
-            sg = (lambda v: v) if self.halt_head_grad else jax.lax.stop_gradient
-            if self.halt_head == 'sigmoid':
-                alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
-                beta_p = self.variables['params']['halt_beta']
-                if self.halt_threshold_fixed:
-                    beta = alpha * math.log(self.halt_kl)
-                elif self.halt_beta_head:
-                    beta = (sg(rms_norm(h, eps=cfg.rms_norm_eps)).astype(jnp.float32) @ beta_p['kernel'] + beta_p['bias'])[:, 0]
-                else:
-                    beta = beta_p['bias'][0]
-                logit = beta - alpha * jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)
-                return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
-            if self.halt_head == 'linear':  # logit of halting; continuing is 0, so p_n(0) = sigmoid(logit)
-                p = self.variables['params']['halt_linear']
-                logit = (sg(rms_norm(h, eps=cfg.rms_norm_eps)).astype(jnp.float32) @ p['kernel'] + p['bias'])[:, 0]
-                return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
-            if self.halt_head == 'none':
-                x = sg(rms_norm(h, eps=cfg.rms_norm_eps))
-            elif self.halt_head == 'distance':
-                x = jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)[:, None]
-            elif self.halt_signal != 'latent':  # the policies
-                log_softmax = stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax
-                x = sg(jnp.concatenate([log_softmax(logits_prev), log_softmax(logits)], -1))
+        def halt_head(h, sig, finite):
+            """Logits of (halt, continue) at this pass [B, 2] (row i is read by the decision at pass i - 1)."""
+            alpha = self.halt_alpha_min + jax.nn.softplus(self.halt_alpha_raw)
+            beta_p = self.variables['params']['halt_beta']
+            if self.halt_threshold_fixed:
+                beta = alpha * math.log(self.halt_kl)
+            elif self.halt_beta_head:
+                sg = (lambda v: v) if self.halt_head_grad else jax.lax.stop_gradient
+                beta = (sg(rms_norm(h, eps=cfg.rms_norm_eps)).astype(jnp.float32) @ beta_p['kernel'] + beta_p['bias'])[:, 0]
             else:
-                x = sg(jnp.concatenate([rms_norm(h_prev, eps=cfg.rms_norm_eps), rms_norm(h, eps=cfg.rms_norm_eps)], -1))
-            return jnp.where(finite[:, None], self._halt_mlp(x.astype(jnp.float32)), 0.0)
+                beta = beta_p['bias'][0]
+            logit = beta - alpha * jnp.log(jnp.maximum(sig, 0.0) + _KL_EPS)
+            return jnp.where(finite[:, None], jnp.stack([logit, jnp.zeros_like(logit)], axis=-1), 0.0)
 
         def body(carry, i):
             # One pass (see the module docstring); never frozen. A nonfinite pass keeps the last finite state (and is flagged).
@@ -608,9 +464,7 @@ class FPRMMemHaltActorValue(nn.Module):
                 sig = 0.5 * jnp.sum(jnp.abs(jax.lax.stop_gradient(dp)), axis=-1)
             else:
                 sig = kl
-            logits_k = (halt_head(h_prev, h_new, logits_prev, logits, sig, finite)
-                        if self.halting and self.halt_head != 'convtest'
-                        else jnp.zeros((B, 2 if self.halting else 1), jnp.float32))  # convtest: in _halt
+            logits_k = halt_head(h_new, sig, finite) if self.halting else jnp.zeros((B, 1), jnp.float32)
             nonfinite = nonfinite | ~finite
             carry = (z_cells, out, logits, value, nonfinite, (mem_k, mem_v))
             return carry, (logits, value, logits_k, kl, sig, nonfinite, latent_res, z_cells[:, P] if sep else out)
@@ -620,12 +474,12 @@ class FPRMMemHaltActorValue(nn.Module):
         init = (z_init, token_init, logits_init, value_init, jnp.zeros((B,), bool), memory)
         _, (logits_t, value_t, head_t, kl_t, sig_t, nonfinite_t, latent_res_t, readout_latent_t) = jax.lax.scan(
             body, init, jnp.arange(T))
-        # logits_t [T, B, A]; head_t [T, B, K + 1]; value_t, kl_t, sig_t, nonfinite_t [T, B]
+        # logits_t [T, B, A]; head_t [T, B, 2]; value_t, kl_t, sig_t, nonfinite_t [T, B]
 
         self.sow('intermediates', 'policy_kl_t', kl_t)
         self.sow('intermediates', 'halt_signal_t', sig_t)
         if self.halting:
-            c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, halt_path, B, T, input_shape[:-1], halt_features)
+            c, sig_c = self._halt(head_t, sig_t, halt_key, halt_steps, B, T, input_shape[:-1])
             self.sow('intermediates', 'policy_log_probs_t',
                      (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t))
         else:
@@ -653,54 +507,30 @@ class FPRMMemHaltActorValue(nn.Module):
 
         return (stable_softmax.Categorical if self.stable_softmax else distrax.Categorical)(logits=logits), value
 
-    def _halt(self, head_t, sig_t, halt_key, halt_steps, halt_path, B, T, batch_shape, halt_features=None):
+    def _halt(self, head_t, sig_t, halt_key, halt_steps, B, T, batch_shape):
         """Halting: the think time c [B] and the signal that decided it; sows the halting intermediates."""
-        sig_prev_t = sig_t  # unshifted: row n - 1 holds S_n
-        if self.halt_head not in ('none', 'linear'):  # lookahead: row n holds pass n+1's head and signal (pass T never decides)
-            head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
-            sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
-        if self.halt_head == 'sigmoid':  # log S_(n+1) at row n, the feature alpha multiplies (ppo.py's halt_natural_grad Fisher)
-            self.sow('intermediates', 'halt_log_sig_t', jnp.log(jnp.maximum(sig_t, 0.0) + _KL_EPS))
-        if self.halt_head == 'convtest':  # logit_halt_n = theta0 + theta1 f_n + o_n, logit_continue_n = 0
-            if halt_features is None:
-                if self.halt_signal == 'kl':  # sqrt(2 KL): a distance (local Fisher-Rao length), so S_(n+1) / S_n is L, not L^2
-                    to_dist = lambda s: jnp.sqrt(2 * jnp.maximum(s, 0.0))
-                    a, L, f = convtest_features(to_dist(sig_t), to_dist(sig_prev_t), 1.0)
-                elif self.halt_signal == 'tv':  # already a distance
-                    a, L, f = convtest_features(sig_t, sig_prev_t, 1.0)
-                else:
-                    a, L, f = convtest_features(sig_t, sig_prev_t, math.sqrt(self.config.d_model))
-                if self.halt_convtest_split:  # [T, B, 2]
-                    f = jnp.stack([a, jnp.log(L / (1 - L))], axis=-1)
-            else:  # the rollout's features [B, T(, 2)] (replay: the path probability then moves with the head only)
-                f = jnp.asarray(halt_features, jnp.float32).reshape((B, T, 2) if self.halt_convtest_split else (B, T)).swapaxes(0, 1)
-            n = jnp.arange(1, T + 1)[:, None]
-            o = -jnp.log(jnp.maximum(T - n, 1)) if self.halt_offset == 'uniform' else 0.0
-            if self.halt_convtest_split:
-                logit = self.theta0 + self.theta1 * f[..., 0] + self.theta2 * f[..., 1] + o
-            else:
-                logit = self.theta0 + self.theta1 * f + o
-            head_t = jnp.stack([logit, jnp.zeros_like(logit)], axis=-1)
-            self.sow('intermediates', 'halt_feature_t', f)
-        lp_t = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(head_t)  # [T, B, K + 1]
+        # lookahead: row n holds pass n+1's head and signal (pass T never decides)
+        head_t = jnp.concatenate([head_t[1:], head_t[-1:]], axis=0)
+        sig_t = jnp.concatenate([sig_t[1:], sig_t[-1:]], axis=0)
+        self.sow('intermediates', 'halt_log_sig_t', jnp.log(jnp.maximum(sig_t, 0.0) + _KL_EPS))  # ppo.py's natural-grad Fisher
+        lp_t = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(head_t)  # [T, B, 2]
         min_iters = 1 if T == 1 else self.min_think_iters
+        lp_c = c_log_probs(lp_t, min_iters)  # [T, B]
         if halt_steps is not None:
-            c, mask = jnp.asarray(halt_steps, jnp.int32).reshape(B), jnp.asarray(halt_path, jnp.int32).reshape(B)
+            c = jnp.asarray(halt_steps, jnp.int32).reshape(B)
         elif halt_key is not None:
-            mask, c = sample_step_path(lp_t, min_iters, halt_key)
+            c = sample_c(lp_t, min_iters, halt_key)
         else:
-            mask, c = best_step_path(lp_t, min_iters)
-        halt_decision_log_probs = step_decision_log_probs(lp_t, mask, c)
-        halt_log_prob = jnp.sum(halt_decision_log_probs, axis=0)
-        halt_entropy = step_path_entropy(lp_t, min_iters)
-        h_t = jnp.exp(lp_t[..., 0])  # p(k = 0) at every pass
+            c = (jnp.argmax(lp_c, axis=0) + 1).astype(jnp.int32)
+        halt_decision_log_probs = decision_log_probs(lp_t, c, min_iters)
+        p_c = jnp.exp(lp_c)
         sig_c = jnp.take_along_axis(sig_t.T, (c - 1)[:, None], axis=-1)[:, 0]
-        self.sow('intermediates', 'halt_path', mask)
+        self.sow('intermediates', 'halt_path', decision_mask(c, T, min_iters))
         self.sow('intermediates', 'halt_step_probs', jnp.exp(lp_t))
-        self.sow('intermediates', 'halt_log_prob', halt_log_prob.reshape(batch_shape))
+        self.sow('intermediates', 'halt_log_prob', jnp.sum(halt_decision_log_probs, axis=0).reshape(batch_shape))
         self.sow('intermediates', 'halt_decision_log_probs', halt_decision_log_probs.T.reshape(batch_shape + (T,)))
-        self.sow('intermediates', 'halt_entropy', halt_entropy.reshape(batch_shape))
-        self.sow('intermediates', 'halt_expected_c', step_expected_c(lp_t, min_iters).reshape(batch_shape))
-        self.sow('intermediates', 'halt_prob', h_t)
+        self.sow('intermediates', 'halt_entropy', -jnp.sum(p_c * lp_c, axis=0).reshape(batch_shape))
+        self.sow('intermediates', 'halt_expected_c', jnp.sum(p_c * jnp.arange(1, T + 1)[:, None], axis=0).reshape(batch_shape))
+        self.sow('intermediates', 'halt_prob', jnp.exp(lp_t[..., 0]))
         self.sow('intermediates', 'halt_step_log_probs', lp_t)
         return c, sig_c
