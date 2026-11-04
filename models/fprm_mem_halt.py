@@ -84,8 +84,9 @@ Action heads (`action_head`): 'per_cell' = one logit per cell latent (Lights Out
 readout token (moves), 'neighbour' = 4 moves of the blank (sliding puzzle; observation channel 0 marks the blank) whose
 logits are the per-cell logits of the blank's up / right / down / left neighbours (the tile that would slide into it,
 the order of envs/slidingpuzzle_env.MOVES), off-board moves masked to probability 0. 'neighbour' reads the policy from
-the cell latents like 'per_cell' while keeping the 4-move action space. 'blank' = Dense(4) on the blank's own cell latent
-(the same 4 moves, unmasked: an off-board move is a no-op, as with 'readout'). `cell_geometry=False` drops the 6
+the cell latents like 'per_cell' while keeping the 4-move action space. 'blank' = 4 Dense(1) on the blank's own cell
+latent, move i's reading only the i-th quarter of its H features, rms-normed on its own (the same 4 moves, unmasked: an off-board move is a
+no-op, as with 'readout'). `cell_geometry=False` drops the 6
 geometry features (row, col, top, bottom, left, right) from the cell tokens, leaving the observation planes.
 
 The value is read out from the last pass: since c is an action, a baseline that depended on it would bias the
@@ -219,6 +220,25 @@ def neighbour_table(m, n):
     tc = c[:, None] + np.array([dc for _, dc in _BLANK_MOVES])
     ok = (tr >= 0) & (tr < m) & (tc >= 0) & (tc < n)
     return np.where(ok, tr * n + tc, np.arange(m * n)[:, None]), ok
+
+
+class SplitDense(nn.Module):
+    """action_head='blank': `features` Dense(1), the i-th reading only the i-th of `features` equal chunks of the input,
+    each chunk rms-normed on its own (kernel [in / features, features]: column i is head i's weights)."""
+    features: int
+    eps: float = 1e-6
+
+    @nn.compact
+    def __call__(self, x):
+        assert x.shape[-1] % self.features == 0, (x.shape, self.features)
+        kernel = self.param('kernel', nn.initializers.lecun_normal(), (x.shape[-1] // self.features, self.features))
+        bias = self.param('bias', nn.initializers.zeros, (self.features,))
+        return split_dense(x, kernel, bias, self.eps)
+
+
+def split_dense(x, kernel, bias, eps):
+    x = rms_norm(x.reshape(x.shape[:-1] + (kernel.shape[1], -1)), eps)
+    return jnp.einsum('...gd,dg->...g', x, kernel) + bias
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
@@ -434,10 +454,14 @@ class FPRMMemHaltActorValue(nn.Module):
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
-        self.actor_head = nn.Dense(
-            {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1}.get(self.action_head, self.output_dim_1),
-            bias_init=nn.initializers.zeros,
-        )
+        if self.action_head == 'blank':
+            assert H % self.output_dim_1 == 0, (H, self.output_dim_1)
+            self.actor_head = SplitDense(self.output_dim_1)
+        else:
+            self.actor_head = nn.Dense(
+                {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1}.get(self.action_head, self.output_dim_1),
+                bias_init=nn.initializers.zeros,
+            )
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
         self.latent_init = make_latent_init(self.config)
 
@@ -497,9 +521,10 @@ class FPRMMemHaltActorValue(nn.Module):
                 logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
                 if self.action_head == 'neighbour':
                     logits = jnp.where(nbr_ok, jnp.take_along_axis(logits, nbr_idx, axis=-1), _NEG)
+            elif self.action_head == 'blank':
+                act_latent = jnp.take_along_axis(z_cells, blank[:, None, None], axis=1)[:, 0]
+                logits = split_dense(act_latent, actor_p['kernel'], actor_p['bias'], cfg.rms_norm_eps)
             else:
-                if self.action_head == 'blank':
-                    act_latent = jnp.take_along_axis(z_cells, blank[:, None, None], axis=1)[:, 0]
                 logits = rms_norm(act_latent, eps=cfg.rms_norm_eps) @ actor_p['kernel'] + actor_p['bias']
             assert logits.shape[-1] == self.output_dim_1, (logits.shape, self.output_dim_1)
             value_latent = rms_norm(value_latent, eps=cfg.rms_norm_eps)

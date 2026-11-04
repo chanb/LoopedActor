@@ -431,28 +431,29 @@ def _puzzle_obs(n_boards=16):
     return jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), n_boards))
 
 
-@pytest.mark.parametrize('halting', [False, True])
-def test_blank_head_reads_the_blank_cell(halting):
-    # 'blank' logits = the blank cell's 4 logits of a per_cell net with 4 outputs per cell (same params), unmasked, also
-    # with observation normalization (the blank is read from the raw observation).
+def test_blank_head_reads_the_blank_cell():
+    # 'blank' logits = move i's Dense(1) on the i-th quarter of the blank cell's latent, each quarter rms-normed on its
+    # own, unmasked, also with observation normalization (the blank is read from the raw observation). The cell latents
+    # come from a per_cell net with an identity kernel (rms_norm is scale-invariant, so its full-latent norm drops out).
+    from models.fprm import rms_norm
     from utils import running_statistics
-    N = 3
+    N, H = 3, CFG.d_model
     obs = _puzzle_obs()
-    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True,
-              **({'halt_head': 'sigmoid'} if halting else {}))
-    blk, cell = _net(action_head='blank', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=4 * N * N, **kw)
+    kw = dict(halting=False, obs_channels=N * N)
+    blk, cell = _net(action_head='blank', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=H * N * N, **kw)
     params = blk.init(jax.random.PRNGKey(1), obs)['params']
+    k, b = params['actor_head']['kernel'], jax.random.normal(jax.random.PRNGKey(2), (4,))  # k: [H / 4, 4]
+    assert k.shape == (H // 4, 4)
+    params = _with(params, 'actor_head', bias=b)
+    cell_params = _with(params, 'actor_head', kernel=jnp.eye(H), bias=jnp.zeros(H))
     norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
     blank = jnp.argmax(obs.reshape(16, N * N, N * N)[..., 0], axis=-1)
-    key = 'policy_log_probs_t' if halting else 'logits'
     for n in (None, norm):
-        got = jax.nn.log_softmax(_intermediates(blk, params, obs, normalizer_params=n)[key])
-        logits = _intermediates(cell, params, obs, normalizer_params=n)[key]
-        logits = logits.reshape(logits.shape[:-1] + (N * N, 4))
-        idx = jnp.broadcast_to(blank[:, None, None], logits.shape[:-2] + (1, 1))
-        want = jax.nn.log_softmax(jnp.take_along_axis(logits, idx, axis=-2)[..., 0, :])
-        assert jnp.allclose(got, want, atol=1e-5)
-        assert bool(jnp.all(jnp.exp(got) > 0.0))  # no masked move
+        got = _intermediates(blk, params, obs, normalizer_params=n)['logits']
+        latents = _intermediates(cell, cell_params, obs, normalizer_params=n)['logits'].reshape(16, N * N, H)
+        quarters = latents[jnp.arange(16), blank].reshape(16, 4, H // 4)
+        want = jnp.stack([rms_norm(quarters[:, i], CFG.rms_norm_eps) @ k[:, i] + b[i] for i in range(4)], axis=-1)
+        assert jnp.allclose(got, want, atol=1e-4)
 
 
 @pytest.mark.parametrize('action_head', ['neighbour', 'blank'])

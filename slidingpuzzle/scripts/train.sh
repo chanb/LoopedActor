@@ -76,7 +76,8 @@
 #   TOKENIZER_CONV_FEATURES=N  TOKENIZER=conv: conv output channels = number of tokens (default 64)
 #   ACTION_HEAD=neighbour  iso_mem / mem_halt: read the logit of each blank move from the cell latent of the tile that
 #                       would slide (off-board moves masked) instead of the readout token's Dense(4) (_anbr; default: readout)
-#   ACTION_HEAD=blank   iso_mem / mem_halt: Dense(4) on the blank's own cell latent, unmasked (_ablank)
+#   ACTION_HEAD=blank   iso_mem / mem_halt: 4 Dense(1) on the blank's own cell latent, move i on its i-th quarter of
+#                       the features (rms-normed per quarter), unmasked (_ablank)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
