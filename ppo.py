@@ -192,6 +192,9 @@ class Args:
     halt_soft_tau: float = 0.0            # fprm_mem_halt, halt_objective='pg': entropy reward of the halting decisions only, tau *
                                           # sum_n discount_compute^(n-1) H(p_n) over the step's decision passes n, added to r_t
                                           # (so the value and GAE give the soft return) and to the loss for its direct gradient; 0: off
+    halt_soft_target_frac: float = 0.0    # halt_soft_tau > 0: tune tau (from halt_soft_tau) so the mean H(p_n) per decision is this
+                                          # fraction of ln(K + 1), by SAC's loss log tau * (H - H_target) with Adam; 0: tau fixed
+    halt_soft_tau_lr: float = 3e-4        # halt_soft_target_frac > 0: Adam step size on log tau
     halt_clip: str = 'joint'              # halt_objective='pg': PPO clip of one ratio over log p(path) + log pi_c(a|s) ('joint'),
                                           # or of pi_c(a|s) apart from p(path) as a whole ('path') or from each decision ('each')
     halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) on G - V in J_n
@@ -220,6 +223,8 @@ class PPOTrainingState(TrainState):
     loss_scale: Any  # () float32, dynamic fp16 loss scale (unused unless compute_dtype=float16 and dynamic_loss_scale)
     loss_scale_good_steps: Any  # () int32, consecutive finite-gradient steps since the last scale change
     halt_fisher: Any  # (2, 2) float32 ((3, 3) with halt_convtest_split), convtest: the EMA of the (damped) Fisher Sigma, before bias correction
+    halt_log_tau: Any  # () float32, log of the halting entropy reward's tau (halt_soft_tau)
+    halt_tau_opt_state: Any  # Adam state of halt_log_tau (halt_soft_target_frac > 0)
 
 
 class Transition(NamedTuple):
@@ -432,6 +437,7 @@ def main(args: Args):
         'halt_natural_grad needs halt_head=sigmoid with a scalar learned beta'
     assert args.halt_soft_tau == 0 or (args.architecture == 'fprm_mem_halt' and args.halt_objective == 'pg'), \
         'halt_soft_tau needs architecture=fprm_mem_halt and halt_objective=pg'
+    assert args.halt_soft_target_frac == 0 or args.halt_soft_tau > 0, 'halt_soft_target_frac needs an initial halt_soft_tau > 0'
 
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
@@ -523,6 +529,7 @@ def main(args: Args):
         init_params = {'params': merged}
         init_normalizer = ckpt_normalizer
 
+    tau_tx = optax.adam(args.halt_soft_tau_lr)
     training_state = PPOTrainingState.create(
         apply_fn=None,
         params=init_params,
@@ -532,6 +539,8 @@ def main(args: Args):
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
         halt_fisher=jnp.zeros((3, 3) if args.halt_convtest_split else (2, 2), jnp.float32),
+        halt_log_tau=jnp.log(jnp.asarray(max(args.halt_soft_tau, 1e-30), jnp.float32)),
+        halt_tau_opt_state=tau_tx.init(jnp.zeros((), jnp.float32)),
     )
     stochastic_halt = args.architecture == 'fprm_mem_halt'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt, args.discount_compute)
@@ -655,7 +664,7 @@ def main(args: Args):
         ) * truncation_mask
         return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
-    def compute_ppo_loss(params, normalizer_params, data, rng, progress):
+    def compute_ppo_loss(params, normalizer_params, data, rng, progress, tau=0.0):
         data, value_targets, advantages = data
 
         next_halt = stochastic_halt and args.halt_objective == 'next'
@@ -807,10 +816,13 @@ def main(args: Args):
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
         if args.halt_soft_tau > 0:  # the entropy reward's direct gradient at the rollout's paths (its effect on later rewards is in GAE)
-            soft_ent = jnp.mean(halt_soft_entropy(inter['intermediates']['halt_step_log_probs'][0],
-                                                  data.extras['policy_extras']['halt_path'], args.discount_compute))
-            entropy_loss = entropy_loss - args.halt_soft_tau * soft_ent
-            halt_metrics['halt_soft_entropy'] = soft_ent
+            lp_t, path = inter['intermediates']['halt_step_log_probs'][0], data.extras['policy_extras']['halt_path']
+            soft_ent = jnp.mean(halt_soft_entropy(lp_t, path, args.discount_compute))
+            entropy_loss = entropy_loss - tau * soft_ent
+            # mean H(p_n) per decision on the rollout's paths, what halt_soft_target_frac tunes tau on
+            n_dec = jnp.sum((path[:, None] >> jnp.arange(lp_t.shape[0])) & 1)
+            halt_metrics.update({'halt_soft_entropy': soft_ent, 'halt_soft_tau': tau,
+                                 'halt_decision_entropy': jnp.sum(halt_soft_entropy(lp_t, path, 1.0)) / jnp.maximum(n_dec, 1)})
         if 'value_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
             value_t = inter['intermediates']['value_t'][0]  # [T, B]
             if args.value_deep_supervision:  # passes 1..n_max all regress on the same target
@@ -855,7 +867,8 @@ def main(args: Args):
                     return loss * scale, aux
 
                 (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
+                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state),
+                    jnp.exp(training_state.halt_log_tau)
                 )
                 grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
                 finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
@@ -863,7 +876,8 @@ def main(args: Args):
                 grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
             else:
                 (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
+                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state),
+                    jnp.exp(training_state.halt_log_tau)
                 )
             grad_norm = optax.global_norm(grads)  # pre-clip
             metrics['grad_norm'] = grad_norm
@@ -898,6 +912,11 @@ def main(args: Args):
                     new = {k: g[i] for i, k in enumerate(names)}
                 grads = {**grads, 'params': {**p, **new}}
             new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
+            if args.halt_soft_target_frac > 0:  # SAC's temperature loss log tau * (H - H_target): tau rises while H < H_target
+                h_target = args.halt_soft_target_frac * jnp.log(args.halt_max_skip + 1.0)
+                upd, tau_opt = tau_tx.update(metrics['halt_decision_entropy'] - h_target, training_state.halt_tau_opt_state)
+                new_training_state = new_training_state.replace(halt_log_tau=training_state.halt_log_tau + upd,
+                                                                halt_tau_opt_state=tau_opt)
             if use_loss_scale:
                 # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
                 # consecutive finite steps.
@@ -932,7 +951,7 @@ def main(args: Args):
         compute_discount = args.discount_compute ** (compute_time - 1)
         rewards = rewards * compute_discount
         if args.halt_soft_tau > 0:  # the halting entropy reward, already discounted by discount_compute^(n - 1) within the step
-            rewards = rewards + args.halt_soft_tau * data.extras['policy_extras']['halt_soft_entropy']
+            rewards = rewards + jnp.exp(training_state.halt_log_tau) * data.extras['policy_extras']['halt_soft_entropy']
         discount = args.discount_act * compute_discount
 
         value_targets, advantages = compute_gae(
