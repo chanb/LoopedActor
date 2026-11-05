@@ -38,6 +38,7 @@
 #                       arXiv 2601.21739 suggests 0.99 / 0.99; run names get _hadam<b1>_<b2> if not the default)
 #   COORD_DESCENT_PERIOD=p  mem_halt: > 0 = coordinate descent, train the trunk (head frozen) then the halting head
 #                       (trunk frozen), switching every p rollouts (_cd<p>; default 0 = joint)
+#   HALT_UPDATE_PERIOD=p  mem_halt: trunk at every grad step, halting head only at every p-th (_hup<p>; default 1)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
@@ -157,6 +158,9 @@ if [[ "$ARM" == mem_halt ]]; then
   fi
   if [[ "${COORD_DESCENT_PERIOD:-0}" != 0 ]]; then
     ARM_FLAGS+=(--coord_descent_period="$COORD_DESCENT_PERIOD"); RUN+="_cd${COORD_DESCENT_PERIOD}"
+  fi
+  if [[ "${HALT_UPDATE_PERIOD:-1}" != 1 ]]; then
+    ARM_FLAGS+=(--halt_update_period="$HALT_UPDATE_PERIOD"); RUN+="_hup${HALT_UPDATE_PERIOD}"
   fi
   if [[ "$HALT_ADAM_B1" != 0.9 || "$HALT_ADAM_B2" != 0.999 ]]; then
     ARM_FLAGS+=(--halt_adam_b1="$HALT_ADAM_B1" --halt_adam_b2="$HALT_ADAM_B2"); RUN+="_hadam${HALT_ADAM_B1}_${HALT_ADAM_B2}"

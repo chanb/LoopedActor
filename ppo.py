@@ -204,6 +204,8 @@ class Args:
     coord_descent_period: int = 0         # fprm_mem_halt: > 0 = coordinate descent, alternating every this many rollouts
                                            # between training the trunk (halting head frozen; first) and the halting head
                                            # (halt_alpha_raw/halt_beta; trunk frozen). A frozen group's Adam state pauses.
+    halt_update_period: int = 1           # fprm_mem_halt: the trunk updates at every grad step, the halting head
+                                           # (halt_alpha_raw/halt_beta) only at every p-th; its Adam state pauses in between
 
 
 @flax.struct.dataclass
@@ -357,6 +359,11 @@ def make_optimizer(args, init_params=None):
         halt_phase = lambda count: (count // steps) % 2 == 1
         return optax.multi_transform({'train': gated(clip(halt_tx), halt_phase),
                                       'rest': gated(clip(trunk_tx), lambda c: ~halt_phase(c))}, labels('rest'))
+    if args.halt_update_period > 1:
+        assert init_params is not None, "halt_update_period needs init_params to label the halting head"
+        p = args.halt_update_period
+        return optax.multi_transform({'train': gated(clip(halt_tx), lambda c: c % p == p - 1),
+                                      'rest': clip(trunk_tx)}, labels('rest'))
     if args.halt_natural_grad and not args.freeze_except_halt:
         # (beta, alpha_raw): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step); clipping covers the rest
         # only, so the preconditioned head gradient does not scale the trunk's update.
@@ -445,6 +452,9 @@ def main(args: Args):
     assert args.coord_descent_period == 0 or (args.architecture == 'fprm_mem_halt' and args.target_kl == 0.0
                                               and not args.halt_natural_grad and not args.freeze_except_halt), \
         'coord_descent_period needs fprm_mem_halt, target_kl=0 (fixed grad steps per rollout), no halt_natural_grad / freeze_except_halt'
+    assert args.halt_update_period == 1 or (args.architecture == 'fprm_mem_halt' and args.coord_descent_period == 0
+                                            and not args.halt_natural_grad and not args.freeze_except_halt), \
+        'halt_update_period needs fprm_mem_halt, no coord_descent_period / halt_natural_grad / freeze_except_halt'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
 
