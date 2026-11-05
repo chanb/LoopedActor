@@ -36,6 +36,8 @@
 #                       _q<q0> if not 0.1)
 #   HALT_ADAM_B1=b1 HALT_ADAM_B2=b2  mem_halt: Adam betas of the halting head only (default 0.9 / 0.999 as the rest;
 #                       arXiv 2601.21739 suggests 0.99 / 0.99; run names get _hadam<b1>_<b2> if not the default)
+#   COORD_DESCENT_PERIOD=p  mem_halt: > 0 = coordinate descent, train the trunk (head frozen) then the halting head
+#                       (trunk frozen), switching every p rollouts (_cd<p>; default 0 = joint)
 #   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
 #   STABLE_KL=0|1       mem_halt: halting KL from the logit difference, no fp32 rounding floor (default 0, run names get _skl)
@@ -152,6 +154,9 @@ if [[ "$ARM" == mem_halt ]]; then
   if awk -v b="${HALT_PRIOR_COEF:-0}" 'BEGIN { exit !(b > 0) }'; then
     ARM_FLAGS+=(--halt_prior_coef="$HALT_PRIOR_COEF"); RUN+="_hprior${HALT_PRIOR_COEF}"
     [[ "${HALT_PRIOR_HALT:-0.1}" != 0.1 ]] && { ARM_FLAGS+=(--halt_prior_halt="$HALT_PRIOR_HALT"); RUN+="_q${HALT_PRIOR_HALT}"; }
+  fi
+  if [[ "${COORD_DESCENT_PERIOD:-0}" != 0 ]]; then
+    ARM_FLAGS+=(--coord_descent_period="$COORD_DESCENT_PERIOD"); RUN+="_cd${COORD_DESCENT_PERIOD}"
   fi
   if [[ "$HALT_ADAM_B1" != 0.9 || "$HALT_ADAM_B2" != 0.999 ]]; then
     ARM_FLAGS+=(--halt_adam_b1="$HALT_ADAM_B1" --halt_adam_b2="$HALT_ADAM_B2"); RUN+="_hadam${HALT_ADAM_B1}_${HALT_ADAM_B2}"
