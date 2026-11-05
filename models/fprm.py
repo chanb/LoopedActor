@@ -95,6 +95,13 @@ def rms_norm(x, eps):
     return y.astype(dtype)
 
 
+def simplicial(x, groups, tau):
+    """Simplicial embedding (Lavoie et al. 2022): split the last axis into `groups` equal chunks and softmax each
+    with temperature `tau`, so every chunk is a distribution."""
+    g = x.reshape(x.shape[:-1] + (groups, -1)).astype(jnp.float32)
+    return jax.nn.softmax(g / tau, axis=-1).reshape(x.shape).astype(x.dtype)
+
+
 def round_up_to_multiple(value, multiple):
     return ((value + multiple - 1) // multiple) * multiple
 

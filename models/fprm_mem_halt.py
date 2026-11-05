@@ -8,7 +8,8 @@ and one *thought* token alongside the cells:
              memory  K/V of t_1 .. t_{i-1}, per layer     (read by every token)
              [z_cells, z_sep, out_i] = Core([z_cells, SEP, t_i]; memory)
              write t_i's per-layer K/V into the memory
-    t_1 = BOT (learned),  t_i = latent_embed + out_{i-1}   (rms_norm(out_{i-1}) first if `thought_norm`)
+    t_1 = BOT (learned),  t_i = latent_embed + out_{i-1}   (rms_norm(out_{i-1}) first if `thought_norm`;
+                                                        simplicial(rms_norm(out_{i-1})) if `sem_thought`)
 
 The cells and SEP (a learned input embedding) carry their latents between passes; the thought's latent starts at
 latent_init every pass, so its only link to the previous pass is its input. A thought's keys/values are those computed
@@ -101,6 +102,7 @@ from models.fprm import (
     compute_residuals,
     make_latent_init,
     rms_norm,
+    simplicial,
 )
 from models import stable_softmax
 from models.fprm_thinker import tokenize
@@ -297,6 +299,10 @@ class FPRMMemHaltActorValue(nn.Module):
     cell_geometry: bool = True     # tokenizer='cell': append the 6 geometry features to each cell token (see the module docstring)
     remat: bool = True             # rematerialize each pass in the backward pass
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
+    sem_readout: bool = False      # actor/value heads read simplicial(rms_norm(latent)) instead of rms_norm(latent)
+    sem_thought: bool = False      # feed back simplicial(rms_norm(out_i)) as the next thought (replaces thought_norm)
+    sem_groups: int = 16           # SEM: number of softmax groups (d_model / sem_groups values per group)
+    sem_tau: float = 1.0           # SEM: softmax temperature
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
 
@@ -308,6 +314,9 @@ class FPRMMemHaltActorValue(nn.Module):
             'cell_geometry=False needs tokenizer=cell and a plane observation'
 
         assert self.max_think_iters >= 1, self.max_think_iters
+        assert not (self.sem_readout or self.sem_thought) or self.config.d_model % self.sem_groups == 0, self.sem_groups
+        assert not (self.sem_readout and self.action_head == 'blank'), "sem_readout: 'blank' rms-norms its own chunks"
+        assert not (self.sem_thought and self.thought_norm), 'sem_thought replaces thought_norm'
         assert self.halt_signal in ('kl', 'tv', 'latent'), self.halt_signal
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         assert self.value_token in ('', 'thought', 'sep'), self.value_token
@@ -386,9 +395,13 @@ class FPRMMemHaltActorValue(nn.Module):
         halt_sep = (self.halt_token or self.readout_token) == 'sep'
         sep_in = jnp.broadcast_to(self.sep, (B, 1, H))
 
+        def feat(h):  # what the actor/value heads read
+            h = rms_norm(h, eps=cfg.rms_norm_eps)
+            return simplicial(h, self.sem_groups, self.sem_tau) if self.sem_readout else h
+
         def readout(z_cells, act_latent, value_latent):
             if per_cell:
-                cell_latents = rms_norm(z_cells, eps=cfg.rms_norm_eps)
+                cell_latents = feat(z_cells)
                 logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
                 if self.action_head == 'neighbour':
                     logits = jnp.where(nbr_ok, jnp.take_along_axis(logits, nbr_idx, axis=-1), _NEG)
@@ -396,9 +409,9 @@ class FPRMMemHaltActorValue(nn.Module):
                 act_latent = jnp.take_along_axis(z_cells, blank[:, None, None], axis=1)[:, 0]
                 logits = split_dense(act_latent, actor_p['kernel'], actor_p['bias'], cfg.rms_norm_eps)
             else:
-                logits = rms_norm(act_latent, eps=cfg.rms_norm_eps) @ actor_p['kernel'] + actor_p['bias']
+                logits = feat(act_latent) @ actor_p['kernel'] + actor_p['bias']
             assert logits.shape[-1] == self.output_dim_1, (logits.shape, self.output_dim_1)
-            value_latent = rms_norm(value_latent, eps=cfg.rms_norm_eps)
+            value_latent = feat(value_latent)
             value = jnp.squeeze(value_latent @ value_p['kernel'] + value_p['bias'], axis=-1)
             return logits, value
 
@@ -428,7 +441,9 @@ class FPRMMemHaltActorValue(nn.Module):
         def body(carry, i):
             # One pass (see the module docstring); never frozen. A nonfinite pass keeps the last finite state (and is flagged).
             z, token, logits_prev, value_prev, nonfinite, (mem_k, mem_v) = carry  # z: cells + SEP latents
-            fed_back = rms_norm(token, eps=cfg.rms_norm_eps) if self.thought_norm else token
+            fed_back = rms_norm(token, eps=cfg.rms_norm_eps) if self.thought_norm or self.sem_thought else token
+            if self.sem_thought:
+                fed_back = simplicial(fed_back, self.sem_groups, self.sem_tau)
             thought = jnp.where(i == 0, bot, fed_back + self.latent_embed)
             z_in = jnp.concatenate([z, z0_thought], axis=1)
             x_in = jnp.concatenate([cells, sep_in, thought[:, None]], axis=1)

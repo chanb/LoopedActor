@@ -5,6 +5,7 @@ exact optimal solution length (max 31). Boards are split by optimal length:
   train  all boards with optimal length <= --max_train_moves (default 28: 180,457 boards)
   test   all boards with optimal length >  --max_train_moves (default: 983 boards, lengths 29-31)
 Within a split, boards are in BFS order (sorted by optimal length; ties in the deterministic BFS discovery order).
+Other thresholds: --max_train_moves 24 --suffix _d24 -> train_d24 (d <= 24, 140,135) / test_d24 (d > 24, 41,305).
 
 --grid 4 (15-puzzle, 16!/2 ~ 1.05e13 boards, so the banks are samples; uses data_scripts/slidingpuzzle4.c, compiled with gcc):
   train  2M boards with optimal length <= 60, balanced in length: every board with length <= 14 (61,865; fewer than the
@@ -18,6 +19,7 @@ Within a split, boards are sorted by optimal length (stable), so the level index
 Both odd and even lengths are included. Files: <out>/<split>.npz with puzzle [N,G,G] int8 (0 = blank), moves [N] int16
 (optimal length).
 Usage (repo root): python data_scripts/build_slidingpuzzle_banks.py [--grid 3|4] [--out data/slidingpuzzle/<G>x<G>]
+                   [--max_train_moves K --suffix _dK]   (3x3 only)
 """
 import argparse
 import os
@@ -30,6 +32,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--grid', type=int, default=3, choices=[3, 4])
 ap.add_argument('--out', default='')
 ap.add_argument('--max_train_moves', type=int, default=28, help='--grid 3 only')
+ap.add_argument('--suffix', default='', help='--grid 3 only: appended to the split names, e.g. _d24 -> train_d24 / test_d24')
 args = ap.parse_args()
 N = args.grid
 args.out = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'slidingpuzzle', f'{N}x{N}')
@@ -62,7 +65,7 @@ def build_3x3():
     moves = np.array(list(dist.values()), np.int16)
     print('boards', len(moves), 'max optimal length', moves.max())
     for name, mask in (('train', moves <= args.max_train_moves), ('test', moves > args.max_train_moves)):
-        save(name, puzzle[mask], moves[mask])
+        save(name + args.suffix, puzzle[mask], moves[mask])
 
 
 def decode(boards):

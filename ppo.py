@@ -190,6 +190,10 @@ class Args:
                                           # to 0 over training; q favours continuing (0 = off)
     halt_prior_halt: float = 0.1          # q(halt); q(continue) = 1 - q(halt)
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
+    sem_readout: bool = False             # fprm_mem*: simplicial embedding before the actor/value heads
+    sem_thought: bool = False             # fprm_mem*: simplicial embedding on each fed-back thought
+    sem_groups: int = 16                  # SEM: softmax groups (d_model / sem_groups values each)
+    sem_tau: float = 1.0                  # SEM: softmax temperature
     init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
                                            # checkpoint's core/actor_head/value_head) instead of a fresh random init;
                                            # groups the checkpoint lacks (e.g. fprm_mem_halt's halt_alpha_raw/halt_beta
@@ -222,6 +226,45 @@ class Transition(NamedTuple):
     discount: jnp.ndarray
     next_observation: jnp.ndarray
     extras: jnp.ndarray = ()
+
+
+def halt_signal_diag(x, gain, mask, head_logit, prefix, n_bins=5, newton_iters=20):
+    """Can log S predict gain_n = J_(n+1) - J_n (continue better: gain > 0)? x = log S_(n+1), gain, head_logit (the
+    head's halt-minus-continue logit), mask: [T, B]. Fits logit = beta - alpha x by |gain|-weighted logistic regression
+    of 1[gain < 0] (the cost-sensitive form of 'next''s per-decision objective) and scores heads by
+    E[p_halt (-gain)] (higher is better; 'const' = the best signal-blind constant p)."""
+    x, gain, head_logit = (v.reshape(-1) for v in (x, gain, head_logit))
+    m = mask.reshape(-1).astype(jnp.float32)
+    n = jnp.maximum(m.sum(), 1.0)
+    mean = lambda v: jnp.sum(m * v) / n
+    mx, mg = mean(x), mean(gain)
+    sx = jnp.sqrt(mean((x - mx) ** 2)) + 1e-8
+    z = (x - mx) / sx
+    y = (gain < 0).astype(jnp.float32)
+    w = m * jnp.abs(gain)
+    w = w / jnp.maximum(jnp.sum(w) / n, 1e-12)
+    phi = jnp.stack([jnp.ones_like(z), z], -1)
+
+    def newton(b, _):
+        p = jax.nn.sigmoid(phi @ b)
+        g = phi.T @ (w * (y - p)) / n - 1e-4 * b
+        H = (phi * (w * p * (1 - p))[:, None]).T @ phi / n + 1e-4 * jnp.eye(2)
+        return b + jnp.linalg.solve(H, g), None
+
+    b, _ = jax.lax.scan(newton, jnp.zeros(2), None, length=newton_iters)
+    alpha_fit, beta_fit = -b[1] / sx, b[0] - b[1] * mx / sx
+    score = lambda p: mean(p * -gain)
+    out = {'alpha_fit': alpha_fit, 'beta_fit': beta_fit, 'corr': mean((x - mx) * (gain - mg)) / (sx * jnp.sqrt(mean((gain - mg) ** 2)) + 1e-12),
+           'gain_mean': mg, 'halt_better_frac': mean(y), 'x_mean': mx, 'x_std': sx,
+           'obj_head': score(jax.nn.sigmoid(head_logit)), 'obj_fit': score(jax.nn.sigmoid(phi @ b)), 'obj_const': jnp.maximum(-mg, 0.0)}
+    edges = jnp.nanpercentile(jnp.where(m > 0, x, jnp.nan), jnp.linspace(0, 100, n_bins + 1)[1:-1])
+    bin_id = jnp.searchsorted(edges, x)
+    for k in range(n_bins):
+        mk = m * (bin_id == k)
+        nk = jnp.maximum(mk.sum(), 1.0)
+        out.update({f'bin{k}_x': jnp.sum(mk * x) / nk, f'bin{k}_gain': jnp.sum(mk * gain) / nk,
+                    f'bin{k}_halt_better': jnp.sum(mk * y) / nk})
+    return {f'halt_diag/{prefix}_{k}': jax.lax.stop_gradient(v) for k, v in out.items()}
 
 
 def score_halt_loss(lp_a, log_p_c, G, c, d):
@@ -479,6 +522,10 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
+            sem_readout=args.sem_readout,
+            sem_thought=args.sem_thought,
+            sem_groups=args.sem_groups,
+            sem_tau=args.sem_tau,
         )
     elif args.architecture in ('single_block', 'multi_block'):
         actor_critic_network = TransformerActorValue(
@@ -739,6 +786,13 @@ def main(args: Args):
             J = jax.lax.stop_gradient(args.discount_compute ** (jnp.arange(1, T_max + 1)[:, None] - c)
                                       * (data.value + rho * (value_targets - data.value)))
             halt_metrics['halt_rho_clip_frac'] = jnp.mean(rho >= args.halt_rho_max)
+            # Diagnostic: does log S_(n+1) predict gain_n = J_(n+1) - J_n, at every decision pass ('all') and on the path (n <= c)?
+            lp_t = inter['intermediates']['halt_step_log_probs'][0]
+            r = jnp.arange(T_max)[:, None]
+            dec_rows = (r >= args.min_think_iters - 1) & (r < T_max - 1)
+            diag_args = (inter['intermediates']['halt_log_sig_t'][0], jnp.concatenate([J[1:] - J[:-1], jnp.zeros_like(J[:1])]))
+            for name, mask in (('all', dec_rows), ('path', dec_rows & (r < c))):
+                halt_metrics.update(halt_signal_diag(*diag_args, jnp.broadcast_to(mask, J.shape), lp_t[..., 0] - lp_t[..., 1], name))
             if args.halt_objective == 'next':
                 lp_c = jnp.take_along_axis(inter['intermediates']['halt_step_log_probs'][0], (c - 1)[None, :, None], axis=0)[0]  # [B, 2]
                 gain = jnp.take_along_axis(J, jnp.minimum(c[None] + jnp.arange(lp_c.shape[-1])[:, None], T_max) - 1, axis=0).T  # [B, 2]
@@ -751,6 +805,17 @@ def main(args: Args):
                                      'halt_continue_better_frac': jnp.sum(valid & (best_k > 0)) / n_valid})
             elif args.halt_objective == 'score':  # G = value_targets; the gradient reaches every decision up to c
                 halt_loss = score_halt_loss(lp_a, halt_log_prob, value_targets, c, args.discount_compute)
+                # Diagnostic: score's weight w and its push on a scalar beta, d/dbeta sum_(n<=c) log p = (1 - h_c) - sum_(n<c) h_n
+                pi_a = jnp.exp(lp_a)
+                at = lambda v, k: jnp.take_along_axis(v, jnp.minimum(k, T_max)[None] - 1, axis=0)[0]
+                w = at(pi_a, c) * value_targets - args.discount_compute * at(pi_a, c + 1) * value_targets
+                h = jnp.exp(lp_t[..., 0])
+                dbeta = jnp.sum(jnp.where(dec_rows & (r < c - 1), -h, 0.0), 0) + jnp.where(c < T_max, 1 - at(h, c), 0.0)
+                valid = c < T_max
+                nv = jnp.maximum(jnp.sum(valid), 1)
+                halt_metrics.update({'halt_diag/score_w_mean': jnp.sum(jnp.where(valid, w, 0.0)) / nv,
+                                     'halt_diag/score_w_pos_frac': jnp.sum(valid & (w > 0)) / nv,
+                                     'halt_diag/score_beta_push': jnp.sum(jnp.where(valid, w * dbeta, 0.0)) / c.shape[0]})
             else:  # 'sac'
                 # Discrete SAC on the thinking MDP: halting at pass n pays d^(n-1) Jl_n with Jl_n = d^(1-c) (V + rho_n (G - V))
                 # (= J_n d^(1-n)), and each decision pass n earns d^(n-1) tau H(p_n), d = discount_compute. In pass-n units:
