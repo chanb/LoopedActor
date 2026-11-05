@@ -25,7 +25,7 @@
 #   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
 #   HALT_OBJECTIVE=pg|next|score  mem_halt: train the halting head through PPO's ratio (pg, default) or by scoring its softmax
 #                       over k at the sampled c with J_(c+k) - J_c, J_n the clipped importance-weighted return of acting
-#                       with pass n (_hobjnext), or by REINFORCE on log h_c with weight pi_c(a|s) G -
+#                       with pass n (_hobjnext), or by REINFORCE on log p(c|s) with weight pi_c(a|s) G -
 #                       DISCOUNT_COMPUTE pi_(c+1)(a|s) G (_hobjscore)
 #   HALT_CLIP=joint|path|each  mem_halt, HALT_OBJECTIVE=pg: one PPO clip over the joint ratio p(path) pi_c(a|s) (joint,
 #                       default), or pi_c(a|s) clipped apart from p(path) as a whole (_hclippath) or from each decision (_hclipeach)

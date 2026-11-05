@@ -179,7 +179,7 @@ class Args:
     halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(c|s) inside PPO's ratio; 'next' = the softmax over k
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss);
                                           # 'sac' = discrete soft actor-critic over the passes on the same J_n (halt_soft_tau);
-                                          # 'score' = REINFORCE on log h_c with weight pi_c(a|s) G - discount_compute pi_(c+1)(a|s) G
+                                          # 'score' = REINFORCE on log p(c|s) with weight pi_c(a|s) G - discount_compute pi_(c+1)(a|s) G
     halt_soft_tau: float = 0.01           # halt_objective='sac': entropy temperature of the halting decisions only
     halt_soft_backup: str = 'sampled'     # halt_objective='sac': 'sampled' (the rollout's passes n <= c) | 'full' (every
                                           # pass to T: soft policy iteration)
@@ -224,15 +224,15 @@ class Transition(NamedTuple):
     extras: jnp.ndarray = ()
 
 
-def score_halt_loss(lp_a, log_h, G, c, d):
-    """halt_objective='score': REINFORCE on log h_c, the halt decision at c (log_h = log h_n by pass [T, B]), with the
-    fixed weight w = pi_c(a|s) G - d pi_(c+1)(a|s) G (halting at c against one more pass), lp_a = log pi_n(a|s) by pass
-    [T, B]. Mean over the batch; c at the cap (no decision, no pass c + 1) adds 0."""
+def score_halt_loss(lp_a, log_p_c, G, c, d):
+    """halt_objective='score': REINFORCE on log p(c|s) = sum_(n<c) log(1 - h_n) + log h_c [B], with the fixed weight
+    w = pi_c(a|s) G - d pi_(c+1)(a|s) G (halting at c against one more pass), lp_a = log pi_n(a|s) by pass [T, B].
+    Mean over the batch; c at the cap (no pass c + 1) adds 0."""
     T = lp_a.shape[0]
     at = lambda x, n: jnp.take_along_axis(x, jnp.minimum(n, T)[None] - 1, axis=0)[0]
     pi = jnp.exp(lp_a)
     w = jax.lax.stop_gradient(at(pi, c) * G - d * at(pi, c + 1) * G)
-    return -jnp.mean(jnp.where(c < T, w * at(log_h, c), 0.0))
+    return -jnp.mean(jnp.where(c < T, w * log_p_c, 0.0))
 
 
 def value_loss(values, targets, expectile, mask=None):
@@ -749,9 +749,8 @@ def main(args: Args):
                 best_k = jnp.argmax(gain, axis=-1)
                 halt_metrics.update({'halt_best_k': jnp.sum(jnp.where(valid, best_k, 0)) / n_valid,
                                      'halt_continue_better_frac': jnp.sum(valid & (best_k > 0)) / n_valid})
-            elif args.halt_objective == 'score':  # G = value_targets; the gradient reaches the head only through log h_c
-                log_h = inter['intermediates']['halt_step_log_probs'][0][..., 0]  # [T, B]
-                halt_loss = score_halt_loss(lp_a, log_h, value_targets, c, args.discount_compute)
+            elif args.halt_objective == 'score':  # G = value_targets; the gradient reaches every decision up to c
+                halt_loss = score_halt_loss(lp_a, halt_log_prob, value_targets, c, args.discount_compute)
             else:  # 'sac'
                 # Discrete SAC on the thinking MDP: halting at pass n pays d^(n-1) Jl_n with Jl_n = d^(1-c) (V + rho_n (G - V))
                 # (= J_n d^(1-n)), and each decision pass n earns d^(n-1) tau H(p_n), d = discount_compute. In pass-n units:
