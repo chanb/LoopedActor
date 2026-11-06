@@ -129,7 +129,9 @@ class Args:
     cell_geometry: bool = True            # --no-cell_geometry (fprm_mem / fprm_mem_halt, slidingpuzzle-*): cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
-    mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
+    mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu' | 'sem' (GELU -> simplicial, option C)
+    mlp_sem_size: int = 8                 # mlp_type='sem': hidden units per softmax group
+    mlp_sem_tau: float = 1.0              # mlp_type='sem': softmax temperature
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
                                           # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
@@ -192,6 +194,7 @@ class Args:
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
     sem_readout: bool = False             # fprm_mem*: simplicial embedding before the actor/value heads
     sem_thought: bool = False             # fprm_mem*: simplicial embedding on each fed-back thought
+    sem_latent: bool = False              # fprm_mem*: carried latents = sqrt(V) * simplicial(rms_norm(h)) (option B)
     sem_groups: int = 16                  # SEM: softmax groups (d_model / sem_groups values each)
     sem_tau: float = 1.0                  # SEM: softmax temperature
     init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
@@ -472,6 +475,8 @@ def main(args: Args):
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
+        mlp_sem_size=args.mlp_sem_size,
+        mlp_sem_tau=args.mlp_sem_tau,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
     )
@@ -524,6 +529,7 @@ def main(args: Args):
             thought_norm=args.cot_thought_norm,
             sem_readout=args.sem_readout,
             sem_thought=args.sem_thought,
+            sem_latent=args.sem_latent,
             sem_groups=args.sem_groups,
             sem_tau=args.sem_tau,
         )

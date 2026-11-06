@@ -102,6 +102,7 @@ from models.fprm import (
     compute_residuals,
     make_latent_init,
     rms_norm,
+    mlp_activation,
     simplicial,
 )
 from models import stable_softmax
@@ -148,10 +149,11 @@ def _qkv(params, x, cfg: FPRMConfig):
     return q, k, v
 
 
-def _swiglu(params, x):
-    """The block MLP (FPRMSwiGLU) as a pure function; SwiGLU or GELU depending on which parameters exist."""
-    if 'up_proj' in params:  # mlp_type='gelu'
-        return jax.nn.gelu(x @ params['up_proj']['kernel'].astype(x.dtype)) @ params['down_proj']['kernel'].astype(x.dtype)
+def _swiglu(params, x, cfg: FPRMConfig):
+    """The block MLP (FPRMSwiGLU) as a pure function: SwiGLU, or GELU / SEM (mlp_type='gelu' / 'sem')."""
+    if 'up_proj' in params:  # mlp_type='gelu' | 'sem'
+        y = mlp_activation(x @ params['up_proj']['kernel'].astype(x.dtype), cfg)
+        return y @ params['down_proj']['kernel'].astype(x.dtype)
     gate, up = jnp.split(x @ params['gate_up_proj']['kernel'].astype(x.dtype), 2, axis=-1)
     return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel'].astype(x.dtype)
 
@@ -188,7 +190,7 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
                + jnp.einsum('bhqk,bkhd->bqhd', probs[..., N:], mem_v[i]))
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
-        h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps))
+        h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg)
         thought_kv.append((k[:, -1], v[:, -1]))
     return h.astype(x.dtype), thought_kv
 
@@ -301,6 +303,7 @@ class FPRMMemHaltActorValue(nn.Module):
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
     sem_readout: bool = False      # actor/value heads read simplicial(rms_norm(latent)) instead of rms_norm(latent)
     sem_thought: bool = False      # feed back simplicial(rms_norm(out_i)) as the next thought (replaces thought_norm)
+    sem_latent: bool = False       # option B: carried latents (cells, SEP) become sqrt(V) * simplicial(rms_norm(h)) every pass
     sem_groups: int = 16           # SEM: number of softmax groups (d_model / sem_groups values per group)
     sem_tau: float = 1.0           # SEM: softmax temperature
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
@@ -314,7 +317,7 @@ class FPRMMemHaltActorValue(nn.Module):
             'cell_geometry=False needs tokenizer=cell and a plane observation'
 
         assert self.max_think_iters >= 1, self.max_think_iters
-        assert not (self.sem_readout or self.sem_thought) or self.config.d_model % self.sem_groups == 0, self.sem_groups
+        assert not (self.sem_readout or self.sem_thought or self.sem_latent) or self.config.d_model % self.sem_groups == 0, self.sem_groups
         assert not (self.sem_readout and self.action_head == 'blank'), "sem_readout: 'blank' rms-norms its own chunks"
         assert not (self.sem_thought and self.thought_norm), 'sem_thought replaces thought_norm'
         assert self.halt_signal in ('kl', 'tv', 'latent'), self.halt_signal
@@ -453,6 +456,9 @@ class FPRMMemHaltActorValue(nn.Module):
             mem_v = jnp.where(write[None, None, :, None, None], jnp.stack([v for _, v in thought_kv])[:, :, None], mem_v)
 
             z_cells, out = h[:, :-1], h[:, -1]  # z_cells: cells + SEP
+            if self.sem_latent:  # B: every carried iterate lies in a compact convex set (sqrt(V) * product of simplices)
+                V = H // self.sem_groups
+                z_cells = math.sqrt(V) * simplicial(rms_norm(z_cells, eps=cfg.rms_norm_eps), self.sem_groups, self.sem_tau)
             logits, value = readout(z_cells[:, :P], z_cells[:, P] if sep else out, z_cells[:, P] if value_sep else out)
             finite = (jnp.all(jnp.isfinite(logits), axis=-1) & jnp.isfinite(value)
                       & jnp.all(jnp.isfinite(out), axis=-1) & jnp.all(jnp.isfinite(z_cells), axis=(-2, -1)))

@@ -59,6 +59,10 @@ class FPRMConfig:
     # gives 384, 1 gives the intended 341.
     mlp_type: str = 'swiglu'
     mlp_round_to: int = 256
+    # mlp_type='sem' (option C): the GELU MLP with the GELU replaced by a simplicial embedding over groups of
+    # mlp_sem_size hidden units (hidden width / mlp_sem_size groups), each a softmax at temperature mlp_sem_tau.
+    mlp_sem_size: int = 8
+    mlp_sem_tau: float = 1.0
     softmax_temp: float = 1.0
     rms_norm_eps: float = 1e-5
     # Mixed precision: dtype of the block computation ('float32' | 'float16' | 'bfloat16'). Parameters stay float32,
@@ -181,10 +185,19 @@ class FPRMAttention(nn.Module):
 
 def mlp_hidden_dim(cfg: FPRMConfig) -> int:
     """Hidden width of the block MLP (see FPRMConfig.mlp_type / mlp_round_to)."""
-    assert cfg.mlp_type in ('swiglu', 'gelu'), cfg.mlp_type
+    assert cfg.mlp_type in ('swiglu', 'gelu', 'sem'), cfg.mlp_type
     assert cfg.mlp_round_to >= 1, cfg.mlp_round_to
     width = cfg.expansion * cfg.d_model * (2 / 3 if cfg.mlp_type == 'swiglu' else 1)
-    return round_up_to_multiple(round(width), cfg.mlp_round_to)
+    width = round_up_to_multiple(round(width), cfg.mlp_round_to)
+    assert cfg.mlp_type != 'sem' or width % cfg.mlp_sem_size == 0, (width, cfg.mlp_sem_size)
+    return width
+
+
+def mlp_activation(y, cfg: FPRMConfig):
+    """The non-gated MLP's activation: GELU, or (mlp_type='sem') a simplicial embedding."""
+    if cfg.mlp_type == 'sem':
+        return simplicial(y, y.shape[-1] // cfg.mlp_sem_size, cfg.mlp_sem_tau)
+    return jax.nn.gelu(y)
 
 
 class FPRMSwiGLU(nn.Module):
@@ -200,9 +213,9 @@ class FPRMSwiGLU(nn.Module):
         inter = mlp_hidden_dim(cfg)
         cdt = jnp.dtype(cfg.compute_dtype)
 
-        if cfg.mlp_type == 'gelu':
+        if cfg.mlp_type in ('gelu', 'sem'):
             y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), dtype=cdt, name='up_proj')(x)
-            y = jax.nn.gelu(y)
+            y = mlp_activation(y, cfg)
             return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), dtype=cdt, name='down_proj')(y)
 
         gate_up = nn.Dense(
