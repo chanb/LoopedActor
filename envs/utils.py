@@ -18,7 +18,7 @@ class State:
 
 def make_env(args):
     """Build the environment class and config from an env id
-    (sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>[-<train>-<eval>])."""
+    (sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | minatar-<game> | slidingpuzzle-<N>x<N>[-<train>-<eval>])."""
     sok = re.fullmatch(r"sokoban-([a-z_]+)-([a-z_]+)", args.env_id)  # sokoban-<train_split>-<eval_split>
     if sok is not None:
         from envs.sokoban_env import SokobanEnv, default_config as sokoban_config
@@ -46,6 +46,13 @@ def make_env(args):
         # Held-out (eval_reset) episodes: 0 = the training episode length.
         config.eval_episode_length = getattr(args, 'lightsout_eval_episode_length', 0) or config.episode_length
         return LightsOutEnv, config
+    ma = re.fullmatch(r"minatar-([a-z_]+)", args.env_id)  # minatar-<asterix|breakout|freeway|seaquest|space_invaders>
+    if ma is not None:
+        from envs.minatar_env import MinAtarEnv, default_config as minatar_config
+        config = minatar_config()
+        config.game = ma.group(1)
+        config.episode_length = getattr(args, 'minatar_episode_length', 1000)
+        return MinAtarEnv, config
     # slidingpuzzle-<N>x<N> (procedural scrambles) or slidingpuzzle-<N>x<N>-<train_split>-<eval_split> (level banks)
     sp = re.fullmatch(r"slidingpuzzle-(\d+)x(\d+)(?:-([a-z0-9_]+)-([a-z0-9_]+))?", args.env_id)
     if sp is not None:
@@ -66,4 +73,4 @@ def make_env(args):
         config.eval_episode_length = getattr(args, 'slidingpuzzle_eval_episode_length', 0) or config.episode_length
         return SlidingPuzzleEnv, config
     raise ValueError(f"Environment {args.env_id} not supported (expected sokoban-<train>-<eval>, "
-                     f"rushhour-<train>-<eval>, lightsout-<m>x<n> or slidingpuzzle-<N>x<N>[-<train>-<eval>])")
+                     f"rushhour-<train>-<eval>, lightsout-<m>x<n>, minatar-<game> or slidingpuzzle-<N>x<N>[-<train>-<eval>])")

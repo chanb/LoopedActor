@@ -63,7 +63,7 @@ class Args:
     save_checkpoint: bool = True
 
     # environment
-    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | slidingpuzzle-<N>x<N>[-<train>-<eval>]
+    env_id: str = 'sokoban-unfiltered_train-unfiltered_valid'  # sokoban-<train>-<eval> | rushhour-<train>-<eval> | lightsout-<m>x<n> | minatar-<game> | slidingpuzzle-<N>x<N>[-<train>-<eval>]
     num_envs: int = 2048
     num_eval_envs: int = 128
     sokoban_max_train_levels: int = 0     # sokoban-*: cap on training levels (0 = whole split)
@@ -74,6 +74,7 @@ class Args:
     lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
     lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
+    minatar_episode_length: int = 1000    # minatar-*: steps per episode (time-out = truncation)
     slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
     slidingpuzzle_eval_episode_length: int = 0    # slidingpuzzle-*: steps per evaluation-scramble (eval/test_*) episode;
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
@@ -126,6 +127,8 @@ class Args:
     action_head: str = ''                 # '' = the env's own ('per_cell' / 'readout'); 'neighbour' (fprm_mem / fprm_mem_halt,
                                           # slidingpuzzle-*): the blank's 4 moves read from its neighbours' cell latents;
                                           # 'blank' (same archs and envs): Dense(4) on the blank's own cell latent, unmasked
+                                          # 'action_tokens' (any env / arch): |A| learned action tokens in the input, logit a
+                                          # read off action token a's latent
     cell_geometry: bool = True            # --no-cell_geometry (fprm_mem / fprm_mem_halt, slidingpuzzle-*): cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)

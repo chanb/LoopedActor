@@ -25,7 +25,7 @@ import flax.linen as nn
 import jax.numpy as jnp
 
 from models.fprm import FPRMConfig, FPRMCore, make_latent_init, rms_norm
-from models.fprm_thinker import PREFIX_LEN, tokenize
+from models.fprm_thinker import action_tokens, actor_head_width, prefix_and_actor_tokens, tokenize
 from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_grid_shape
 
 
@@ -61,11 +61,13 @@ class TransformerActorValue(nn.Module):
             FPRMCore(core_config(self.config, self.tokenizer), name=f'core_{i}')
             for i in range(self.num_blocks)
         ]
-        assert self.action_head in ('per_cell', 'readout'), self.action_head
+        assert self.action_head in ('per_cell', 'readout', 'action_tokens'), self.action_head
+        if self.action_head == 'action_tokens':
+            self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, self.config.d_model))
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
         # per_cell: k = output_dim_1 // (m*n) logits per cell token (k=1 for one logit per cell, k=2 for Rush Hour), flattened cell-major.
-        self.actor_head = nn.Dense(self.output_dim_1 // (self.m * self.n) if self.action_head == 'per_cell' else self.output_dim_1, bias_init=nn.initializers.zeros)
+        self.actor_head = nn.Dense(actor_head_width(self.action_head, self.output_dim_1, self.m, self.n), bias_init=nn.initializers.zeros)
         self.value_head = nn.Dense(
             self.output_dim_2, bias_init=nn.initializers.zeros
         )
@@ -90,16 +92,15 @@ class TransformerActorValue(nn.Module):
         readout_token = jnp.broadcast_to(
             self.readout, (B, 1, self.config.d_model)
         )
-        tokens = jnp.concatenate([readout_token, cell_tokens], axis=1)
+        tokens = jnp.concatenate([readout_token, *action_tokens(self, B), cell_tokens], axis=1)
         token_mask = jnp.ones(tokens.shape[:2], bool)
+        prefix_len, tok = prefix_and_actor_tokens(self.action_head, self.output_dim_1)
 
         def readout(z):
             readout_latent = rms_norm(z[:, 0], eps=self.config.rms_norm_eps)
-            cell_latents = rms_norm(
-                z[:, PREFIX_LEN:], eps=self.config.rms_norm_eps
-            )
-            if self.action_head == 'per_cell':
-                logits = self.actor_head(cell_latents).reshape(cell_latents.shape[0], -1)  # [B, m*n*k]
+            if self.action_head in ('per_cell', 'action_tokens'):
+                latents = rms_norm(z[:, tok], eps=self.config.rms_norm_eps)
+                logits = self.actor_head(latents).reshape(latents.shape[0], -1)  # [B, m*n*k] / [B, A]
             else:
                 logits = self.actor_head(readout_latent)
             assert logits.shape[-1] == self.output_dim_1, (
@@ -114,7 +115,7 @@ class TransformerActorValue(nn.Module):
             self.latent_init[None, None, :].astype(tokens.dtype), tokens.shape
         )
         for core in self.cores:
-            z = core(z, tokens, token_mask, grid_shape, PREFIX_LEN)
+            z = core(z, tokens, token_mask, grid_shape, prefix_len)
         logits, value = readout(z)
         self.sow('intermediates', 'logits', logits)
         self.sow('intermediates', 'value', value)

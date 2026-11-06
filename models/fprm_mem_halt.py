@@ -70,7 +70,8 @@ logits are the per-cell logits of the blank's up / right / down / left neighbour
 the order of envs/slidingpuzzle_env.MOVES), off-board moves masked to probability 0. 'neighbour' reads the policy from
 the cell latents like 'per_cell' while keeping the 4-move action space. 'blank' = 4 Dense(1) on the blank's own cell
 latent, move i's reading only the i-th quarter of its H features, rms-normed on its own (the same 4 moves, unmasked: an off-board move is a
-no-op, as with 'readout'). `cell_geometry=False` drops the 6
+no-op, as with 'readout'). 'action_tokens' = A learned action tokens after SEP (each pass runs [cells, SEP, a_1..a_A,
+thought]; their latents are carried between passes like SEP's), logit a = Dense(1) on action token a's latent. `cell_geometry=False` drops the 6
 geometry features (row, col, top, bottom, left, right) from the cell tokens, leaving the observation planes.
 
 The value is read out from the last pass: since c is an action, a baseline that depended on it would bias the
@@ -310,7 +311,7 @@ class FPRMMemHaltActorValue(nn.Module):
     tokenizer_conv_features: int = 64
 
     def setup(self):
-        assert self.action_head in ('per_cell', 'readout', 'neighbour', 'blank'), self.action_head
+        assert self.action_head in ('per_cell', 'readout', 'neighbour', 'blank', 'action_tokens'), self.action_head
         assert self.action_head not in ('neighbour', 'blank') or (self.output_dim_1 == 4 and self.obs_channels > 0), \
             f"{self.action_head!r} needs 4 actions and a plane observation whose channel 0 marks the blank"
         assert self.cell_geometry or (self.tokenizer == 'cell' and self.obs_channels > 0), \
@@ -344,6 +345,8 @@ class FPRMMemHaltActorValue(nn.Module):
         self.bot = self.param('bot', nn.initializers.normal(stddev=0.02), (1, H))
         self.latent_embed = self.param('latent_embed', nn.initializers.normal(stddev=0.02), (1, H))
         self.sep = self.param('sep', nn.initializers.normal(stddev=0.02), (1, H))
+        if self.action_head == 'action_tokens':
+            self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, H))
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
@@ -352,7 +355,7 @@ class FPRMMemHaltActorValue(nn.Module):
             self.actor_head = SplitDense(self.output_dim_1)
         else:
             self.actor_head = nn.Dense(
-                {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1}.get(self.action_head, self.output_dim_1),
+                {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1, 'action_tokens': 1}.get(self.action_head, self.output_dim_1),
                 bias_init=nn.initializers.zeros,
             )
         self.value_head = nn.Dense(self.output_dim_2, bias_init=nn.initializers.zeros)
@@ -397,13 +400,18 @@ class FPRMMemHaltActorValue(nn.Module):
         value_sep = (self.value_token or self.readout_token) == 'sep'
         halt_sep = (self.halt_token or self.readout_token) == 'sep'
         sep_in = jnp.broadcast_to(self.sep, (B, 1, H))
+        act_tokens = self.action_head == 'action_tokens'
+        act_in = jnp.broadcast_to(self.action_embed[None], (B, self.output_dim_1, H)) if act_tokens else sep_in[:, :0]
 
         def feat(h):  # what the actor/value heads read
             h = rms_norm(h, eps=cfg.rms_norm_eps)
             return simplicial(h, self.sem_groups, self.sem_tau) if self.sem_readout else h
 
-        def readout(z_cells, act_latent, value_latent):
-            if per_cell:
+        def readout(z_carried, act_latent, value_latent):  # z_carried: cells + SEP (+ action tokens)
+            z_cells = z_carried[:, :P]
+            if act_tokens:
+                logits = (feat(z_carried[:, P + 1:]) @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
+            elif per_cell:
                 cell_latents = feat(z_cells)
                 logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
                 if self.action_head == 'neighbour':
@@ -422,7 +430,7 @@ class FPRMMemHaltActorValue(nn.Module):
         z0_thought = jnp.broadcast_to(z0[None, None], (B, 1, H))
         kv_shape = (cfg.num_layers, B, S, cfg.num_heads, H // cfg.num_heads)
         memory = (jnp.zeros(kv_shape, cfg.compute_dtype), jnp.zeros(kv_shape, cfg.compute_dtype))
-        z_init = jnp.broadcast_to(z0[None, None], (B, P + 1, H))
+        z_init = jnp.broadcast_to(z0[None, None], (B, P + 1 + act_in.shape[1], H))
         token_init = jnp.zeros((B, H), cells.dtype)
         logits_init = jnp.zeros((B, self.output_dim_1), cells.dtype)
         value_init = jnp.zeros((B,), cells.dtype)
@@ -449,17 +457,17 @@ class FPRMMemHaltActorValue(nn.Module):
                 fed_back = simplicial(fed_back, self.sem_groups, self.sem_tau)
             thought = jnp.where(i == 0, bot, fed_back + self.latent_embed)
             z_in = jnp.concatenate([z, z0_thought], axis=1)
-            x_in = jnp.concatenate([cells, sep_in, thought[:, None]], axis=1)
+            x_in = jnp.concatenate([cells, sep_in, act_in, thought[:, None]], axis=1)
             h, thought_kv = mem_core(core_p, z_in, x_in, mem_k, mem_v, jnp.arange(S) < i, grid_shape, P, cfg)
             write = jnp.arange(S) == i
             mem_k = jnp.where(write[None, None, :, None, None], jnp.stack([k for k, _ in thought_kv])[:, :, None], mem_k)
             mem_v = jnp.where(write[None, None, :, None, None], jnp.stack([v for _, v in thought_kv])[:, :, None], mem_v)
 
-            z_cells, out = h[:, :-1], h[:, -1]  # z_cells: cells + SEP
+            z_cells, out = h[:, :-1], h[:, -1]  # z_cells: cells + SEP (+ action tokens)
             if self.sem_latent:  # B: every carried iterate lies in a compact convex set (sqrt(V) * product of simplices)
                 V = H // self.sem_groups
                 z_cells = math.sqrt(V) * simplicial(rms_norm(z_cells, eps=cfg.rms_norm_eps), self.sem_groups, self.sem_tau)
-            logits, value = readout(z_cells[:, :P], z_cells[:, P] if sep else out, z_cells[:, P] if value_sep else out)
+            logits, value = readout(z_cells, z_cells[:, P] if sep else out, z_cells[:, P] if value_sep else out)
             finite = (jnp.all(jnp.isfinite(logits), axis=-1) & jnp.isfinite(value)
                       & jnp.all(jnp.isfinite(out), axis=-1) & jnp.all(jnp.isfinite(z_cells), axis=(-2, -1)))
             z_cells = jnp.where(finite[:, None, None], z_cells, z)

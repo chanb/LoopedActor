@@ -129,7 +129,8 @@ class FPRMThinkerActorValue(nn.Module):
     output_dim_2: int = 1   # value
     # Input mode: 0 = flat grid + goal (2*m*n features); >0 = cell-major planes (m*n*obs_channels), used by Boxoban / Rush Hour.
     obs_channels: int = 0
-    # 'per_cell': one logit per cell token (one action per cell); 'readout': Dense(output_dim_1) on the readout token (Sokoban moves).
+    # 'per_cell': one logit per cell token (one action per cell); 'readout': Dense(output_dim_1) on the readout token (Sokoban moves);
+    # 'action_tokens': output_dim_1 learned action tokens after the readout token, logit a = Dense(1) on action token a's latent.
     action_head: str = 'per_cell'
     # Observation tokenization: 'cell' | 'flat' | 'conv' (see models/tokenizers.py).
     tokenizer: str = 'cell'
@@ -149,12 +150,14 @@ class FPRMThinkerActorValue(nn.Module):
             (1, 1, self.config.d_model),
         )
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
-        assert self.action_head in ('per_cell', 'readout'), self.action_head
+        assert self.action_head in ('per_cell', 'readout', 'action_tokens'), self.action_head
+        if self.action_head == 'action_tokens':
+            self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, self.config.d_model))
         # per_cell: shared per-cell logit head (no parameter depends on m * n); readout: logits from the readout token.
         if self.action_head == 'per_cell':
             assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
         # per_cell: k = output_dim_1 // (m*n) logits per cell token (k logits per cell), flattened cell-major.
-        self.actor_head = nn.Dense(self.output_dim_1 // (self.m * self.n) if self.action_head == 'per_cell' else self.output_dim_1, bias_init=nn.initializers.zeros)
+        self.actor_head = nn.Dense(actor_head_width(self.action_head, self.output_dim_1, self.m, self.n), bias_init=nn.initializers.zeros)
         self.value_head = nn.Dense(
             self.output_dim_2, bias_init=nn.initializers.zeros
         )
@@ -180,17 +183,16 @@ class FPRMThinkerActorValue(nn.Module):
         readout_token = jnp.broadcast_to(
             self.readout, (B, 1, self.config.d_model)
         )
-        tokens = jnp.concatenate([readout_token, cell_tokens], axis=1)
+        tokens = jnp.concatenate([readout_token, *action_tokens(self, B), cell_tokens], axis=1)
         token_mask = jnp.ones(tokens.shape[:2], bool)
-        per_cell = self.action_head == 'per_cell'
+        per_token = self.action_head in ('per_cell', 'action_tokens')
+        prefix_len, tok = prefix_and_actor_tokens(self.action_head, self.output_dim_1)
 
         def heads(z):
             readout_latent = rms_norm(z[:, 0], eps=self.config.rms_norm_eps)
-            cell_latents = rms_norm(
-                z[:, PREFIX_LEN:], eps=self.config.rms_norm_eps
-            )
-            if per_cell:
-                logits = self.actor_head(cell_latents).reshape(cell_latents.shape[0], -1)  # [B, m*n*k]
+            if per_token:
+                latents = rms_norm(z[:, tok], eps=self.config.rms_norm_eps)
+                logits = self.actor_head(latents).reshape(latents.shape[0], -1)  # [B, m*n*k] / [B, A]
             else:
                 logits = self.actor_head(readout_latent)  # [B, output_dim_1]
             assert logits.shape[-1] == self.output_dim_1, (
@@ -216,9 +218,9 @@ class FPRMThinkerActorValue(nn.Module):
 
             def halt_residual_fn(z_prev, z_new):
                 def log_pi(z):
-                    if per_cell:
+                    if per_token:
                         cells = rms_norm(
-                            z[:, PREFIX_LEN:], eps=self.config.rms_norm_eps
+                            z[:, tok], eps=self.config.rms_norm_eps
                         )
                         logits = (cells @ ah_kernel + ah_bias).reshape(cells.shape[0], -1)
                     else:
@@ -249,7 +251,7 @@ class FPRMThinkerActorValue(nn.Module):
             min_iters=self.min_think_iters,
             fp_thresh=fp_thresh,
             train=True,
-            prefix_len=PREFIX_LEN,
+            prefix_len=prefix_len,
             halt_residual_fn=halt_residual_fn,
         )
         logits, value = heads(state.z)
@@ -267,3 +269,23 @@ class FPRMThinkerActorValue(nn.Module):
         self.sow('intermediates', 'fp_stop_reason', state.stop_reason)
 
         return distrax.Categorical(logits=logits), value
+
+
+def action_tokens(module, B):
+    """action_head='action_tokens': the A learned action tokens [B, A, H] that follow [READOUT] (else nothing)."""
+    if module.action_head != 'action_tokens':
+        return ()
+    return (jnp.broadcast_to(module.action_embed[None], (B,) + module.action_embed.shape),)
+
+
+def prefix_and_actor_tokens(action_head, num_actions):
+    """(prefix length, token slice the per-token actor head reads): [READOUT, a_1..a_A] and the action tokens, or
+    [READOUT] and (per_cell) the cells."""
+    if action_head == 'action_tokens':
+        return PREFIX_LEN + num_actions, slice(PREFIX_LEN, PREFIX_LEN + num_actions)
+    return PREFIX_LEN, slice(PREFIX_LEN, None)
+
+
+def actor_head_width(action_head, num_actions, m, n):
+    """Logits per token the actor head reads: k per cell (per_cell), 1 per action token, or all on the readout."""
+    return {'per_cell': num_actions // (m * n), 'action_tokens': 1}.get(action_head, num_actions)
