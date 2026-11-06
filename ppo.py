@@ -68,6 +68,7 @@ class Args:
     num_eval_envs: int = 128
     sokoban_max_train_levels: int = 0     # sokoban-*: cap on training levels (0 = whole split)
     sokoban_episode_length: int = 120     # sokoban-*: steps per episode
+    sokoban_step_penalty: float = 0.1     # sokoban-*: reward -this per step (0 = no per-step penalty)
     rushhour_max_train_levels: int = 0    # rushhour-*: cap on training levels (0 = whole split)
     rushhour_episode_length: int = 150    # rushhour-*: steps per episode
     rushhour_shaping_weight: float = 1.0  # rushhour-*: potential-based shaping weight (0 = sparse solve reward only)

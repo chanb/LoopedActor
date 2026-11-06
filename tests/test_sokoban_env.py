@@ -75,3 +75,19 @@ def test_bank_reset_shapes():
     assert env.num_eval_levels == 1000
     s = jax.jit(env.eval_reset)(jax.random.PRNGKey(1))
     assert s.obs.shape == (400,) and int(jnp.sum(s.data.boxes)) == 4 and int(jnp.sum(s.data.targets)) == 4
+
+
+def test_step_penalty_flag():
+    """--sokoban_step_penalty=0 (via make_env): a plain move gives reward 0, the box/solve rewards stay."""
+    from types import SimpleNamespace
+    from envs.utils import make_env
+    if not os.path.exists(os.path.join(DATA_DIR, 'unfiltered_test.npz')):
+        pytest.skip('data/boxoban/unfiltered_test.npz missing (python data_scripts/build_boxoban_banks.py)')
+    env_class, cfg = make_env(SimpleNamespace(env_id='sokoban-unfiltered_test-unfiltered_test', sokoban_step_penalty=0.0))
+    env = env_class(cfg); step = jax.jit(env.step)
+    walls = np.ones((10, 10), bool); walls[1:9, 1:9] = False
+    boxes = np.zeros((10, 10), bool); boxes[4, 4] = True
+    targets = np.zeros((10, 10), bool); targets[4, 6] = True
+    assert float(step(_state(env, walls, boxes, targets, (4, 3)), 0).reward) == 0.0
+    s = step(step(_state(env, walls, boxes, targets, (4, 3)), 3), 3)
+    assert float(s.reward) == pytest.approx(11.0)

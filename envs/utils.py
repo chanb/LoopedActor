@@ -26,6 +26,7 @@ def make_env(args):
         config.train_split, config.eval_split = sok.group(1), sok.group(2)
         config.max_train_levels = getattr(args, 'sokoban_max_train_levels', 0)
         config.episode_length = getattr(args, 'sokoban_episode_length', 120)
+        config.step_penalty = getattr(args, 'sokoban_step_penalty', 0.1)
         return SokobanEnv, config
     rh = re.fullmatch(r"rushhour-([a-z_]+)-([a-z_]+)", args.env_id)  # rushhour-<train_split>-<eval_split>
     if rh is not None:
