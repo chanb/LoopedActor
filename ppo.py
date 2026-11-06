@@ -211,6 +211,8 @@ class Args:
     freeze_except_halt: bool = False      # fprm_mem_halt: zero the optimizer update for every param group except
                                            # halt_alpha_raw/halt_beta - trains only the halting head, typically paired
                                            # with init_checkpoint pointed at a halting=False checkpoint
+    halt_update_period: int = 1           # fprm_mem_halt: the trunk updates at every grad step, the halting head
+                                           # (halt_alpha_raw/halt_beta) only at every p-th; its Adam state pauses in between
 
 
 @flax.struct.dataclass
@@ -358,6 +360,21 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
 HALT_PARAMS = ('halt_alpha_raw', 'halt_beta')  # the halting head's param groups
 
 
+def gated(tx, active):
+    """tx while active(count) (count = updates so far), else a zero update with tx's state left as it was."""
+    def init(params):
+        return tx.init(params), jnp.zeros((), jnp.int32)
+
+    def update(updates, state, params=None):
+        inner, count = state
+        new_updates, new_inner = tx.update(updates, inner, params)
+        on = active(count)
+        new_updates = jax.tree_util.tree_map(lambda u: jnp.where(on, u, jnp.zeros_like(u)), new_updates)
+        new_inner = jax.tree_util.tree_map(lambda n, o: jnp.where(on, n, o), new_inner, inner)
+        return new_updates, (new_inner, count + 1)
+    return optax.GradientTransformation(init, update)
+
+
 def make_optimizer(args, init_params=None):
     """init_params is only needed (and required) when args.freeze_except_halt, weight_decay or the halting head's Adam
     betas are not the defaults - its pytree structure labels the halting head apart from every other param group."""
@@ -382,6 +399,11 @@ def make_optimizer(args, init_params=None):
         return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in HALT_PARAMS else other, v)
                            for k, v in init_params['params'].items()}}
 
+    if args.halt_update_period > 1:
+        assert init_params is not None, "halt_update_period needs init_params to label the halting head"
+        p = args.halt_update_period
+        return optax.multi_transform({'train': gated(clip(halt_tx), lambda c: c % p == p - 1),
+                                      'rest': clip(trunk_tx)}, labels('rest'))
     if args.halt_natural_grad and not args.freeze_except_halt:
         # (beta, alpha_raw): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step); clipping covers the rest
         # only, so the preconditioned head gradient does not scale the trunk's update.
@@ -467,6 +489,9 @@ def main(args: Args):
         '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem / fprm_mem_halt'
     assert not args.halt_natural_grad or (not args.halt_beta_head and not args.halt_threshold_fixed
                                           and not args.freeze_except_halt), 'halt_natural_grad needs a scalar learned beta'
+    assert args.halt_update_period == 1 or (args.architecture == 'fprm_mem_halt' and not args.halt_natural_grad
+                                            and not args.freeze_except_halt), \
+        'halt_update_period needs fprm_mem_halt, no halt_natural_grad / freeze_except_halt'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
 
