@@ -97,6 +97,7 @@ from models.fprm import (
     STOP_ITERATION_CAP,
     STOP_NONFINITE,
     compute_residuals,
+    fused_attention,
     make_latent_init,
     rms_norm,
     mlp_activation,
@@ -128,11 +129,6 @@ def _mixed_precision_input(h, a1, b1, cfg: FPRMConfig):
     if not isinstance(a1, float):
         a1, b1 = a1.astype(h.dtype), b1.astype(h.dtype)
     return h, a1, b1
-
-
-def _attn_softmax(logits):
-    """Attention softmax computed in float32, returned in the logits' dtype."""
-    return jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
 
 
 def _qkv(params, x, cfg: FPRMConfig):
@@ -178,12 +174,9 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
     for i in range(cfg.num_layers):
         p = params[f'block_{i}']
         q, k, v = _qkv(p['self_attn'], rms_norm(h, cfg.rms_norm_eps), cfg)  # [B, N, nh, hd]
-        logits_cur = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
-        logits_mem = jnp.einsum('bqhd,bkhd->bhqk', q, mem_k[i]) * scale
-        logits_mem = jnp.where(mem_valid[None, None, None, :], logits_mem, -jnp.inf)
-        probs = _attn_softmax(jnp.concatenate([logits_cur, logits_mem], axis=-1))
-        out = (jnp.einsum('bhqk,bkhd->bqhd', probs[..., :N], v)
-               + jnp.einsum('bhqk,bkhd->bqhd', probs[..., N:], mem_v[i]))
+        # keys [current tokens, memory]: the written memory slots are a prefix, so the valid keys are the first N + #written
+        out = fused_attention(q, jnp.concatenate([k, mem_k[i]], axis=1), jnp.concatenate([v, mem_v[i]], axis=1),
+                              scale, N + jnp.sum(mem_valid))
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg)

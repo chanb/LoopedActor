@@ -95,6 +95,21 @@ def rms_norm(x, eps):
     return y.astype(dtype)
 
 
+def fused_attention(q, k, v, scale, kv_len):
+    """Softmax attention [B, T, nh, hd] of q over the first kv_len ([B] or scalar) of the S keys / values, in one
+    kernel: cuDNN flash attention on GPU in bf16 / fp16 (softmax in fp32 inside), XLA otherwise. cuDNN needs even
+    sequence lengths in training, so q, k, v are zero-padded by one row when odd (padded keys lie past kv_len)."""
+    T, S = q.shape[1], k.shape[1]
+    cudnn = jax.default_backend() == 'gpu' and q.dtype in (jnp.bfloat16, jnp.float16)
+    if cudnn:
+        pad = lambda x, n: jnp.pad(x, ((0, 0), (0, n), (0, 0), (0, 0)))
+        q, k, v = pad(q, T % 2), pad(k, S % 2), pad(v, S % 2)
+    kv_len = jnp.broadcast_to(jnp.asarray(kv_len, jnp.int32), q.shape[:1])
+    out = jax.nn.dot_product_attention(q, k, v, scale=scale, key_value_seq_lengths=kv_len,
+                                       implementation='cudnn' if cudnn else 'xla')
+    return out[:, :T]
+
+
 def round_up_to_multiple(value, multiple):
     return ((value + multiple - 1) // multiple) * multiple
 
@@ -152,12 +167,13 @@ class FPRMAttention(nn.Module):
         value = qkv[:, :, 2 * num_heads :]
 
         scale = 1.0 / (math.sqrt(head_dim) * cfg.softmax_temp)
-        logits = jnp.einsum('bqhd,bkhd->bhqk', query, key) * scale
-        logits = jnp.where(token_mask[:, None, None, :], logits, -jnp.inf)
-        if attn_mask is not None:
-            logits = jnp.where(attn_mask[:, None], logits, -jnp.inf)
-        probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(cdt)
-        out = jnp.einsum('bhqk,bkhd->bqhd', probs, value)
+        if attn_mask is None:  # fused; the valid tokens are a prefix (every token_mask here is all true)
+            out = fused_attention(query, key, value, scale, jnp.sum(token_mask, axis=-1))
+        else:
+            logits = jnp.einsum('bqhd,bkhd->bhqk', query, key) * scale
+            logits = jnp.where(token_mask[:, None, None, :] & attn_mask[:, None], logits, -jnp.inf)
+            probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(cdt)
+            out = jnp.einsum('bhqk,bkhd->bqhd', probs, value)
         out = out.reshape(B, L, H)
 
         out = nn.Dense(
