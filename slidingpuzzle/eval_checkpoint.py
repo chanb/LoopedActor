@@ -7,8 +7,8 @@ realized think iterations, KL-convergence rate and mean episode length per scram
 already solved at reset (possible for short random walks) are excluded and counted separately.
 
 Examples (repo root)
-  python slidingpuzzle/eval_checkpoint.py --ckpt exp/slidingpuzzle/looped_s1/checkpoints/<run>/params_101.pkl
-  python slidingpuzzle/eval_checkpoint.py --ckpt <run>/params_101.pkl --max_iters 48   # test-time cap raise
+  python slidingpuzzle/eval_checkpoint.py --ckpt exp/slidingpuzzle/iso_mem_s1/checkpoints/<run>/params_101.pkl
+  python slidingpuzzle/eval_checkpoint.py --ckpt <run>/params_101.pkl --act_iters 48:u   # test-time cap raise
   python slidingpuzzle/eval_checkpoint.py --ckpt <run>/params_101.pkl --arch multi_block --num_blocks 16 --scramble_moves 100 200 400
 """
 import argparse
@@ -25,8 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
-from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
+from utils.eval_model import add_model_args, build_mem, cap_tag, think_cap  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
@@ -35,12 +34,8 @@ def build_module(args, N):
                       mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=N, n=N, config=cfg, output_dim_1=4, obs_channels=N * N, action_head=args.action_head,
               tokenizer=args.tokenizer, tokenizer_conv_features=args.tokenizer_conv_features)
-    if args.arch == 'fprm':
-        return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
-                                     halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_mem':
-        return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
-                                 thought_norm=args.thought_norm, cell_geometry=not args.no_cell_geometry, **kw)
+        return build_mem(args, cell_geometry=not args.no_cell_geometry, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
@@ -82,11 +77,7 @@ def evaluate(env, mod, policy_vars, norm, K, n_levels, T, B, seed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_mem', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
-    ap.add_argument('--halt_kl', type=float, default=1e-3,
-                    help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
-    ap.add_argument('--thought_norm', action='store_true', help='fprm_mem: the checkpoint was trained with --cot_thought_norm')
+    add_model_args(ap)
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -123,10 +114,10 @@ def main():
               f'think {r["think"]:.2f} conv {r["converged"]:.3f} len {fmt(r["mean_len"], ".1f")}', flush=True)
 
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
-    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_mem') and args.max_iters != 16 else ''
+    tag = cap_tag(args)
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
     json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=args.episode_length,
-                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_mem') else None,
+                   act_iters=args.act_iters if think_cap(args) else None,
                    results={str(K): r for K, r in results.items()}), open(out, 'w'), indent=1)
     print('wrote', out)
 

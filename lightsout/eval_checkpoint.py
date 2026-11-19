@@ -8,8 +8,8 @@ Reports per-distance success rate, mean realized think iterations, KL-convergenc
 plus aggregates over the training distances [1, threshold) and the evaluation distances [threshold, M*N).
 
 Examples (repo root)
-  python lightsout/eval_checkpoint.py --ckpt exp/lightsout/looped_s1/checkpoints/<run>/params_101.pkl
-  python lightsout/eval_checkpoint.py --ckpt exp/lightsout/looped_s1/checkpoints/<run>/params_101.pkl --max_iters 48   # test-time cap raise
+  python lightsout/eval_checkpoint.py --ckpt exp/lightsout/iso_mem_s1/checkpoints/<run>/params_101.pkl
+  python lightsout/eval_checkpoint.py --ckpt exp/lightsout/iso_mem_s1/checkpoints/<run>/params_101.pkl --act_iters 48:u   # test-time cap raise
   python lightsout/eval_checkpoint.py --ckpt <run>/params_101.pkl --arch multi_block --num_blocks 16 --grid 3x3
 """
 import argparse
@@ -26,8 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.lightsout_env import LightsOutEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
-from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
+from utils.eval_model import add_model_args, build_mem, cap_tag, think_cap  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
@@ -35,16 +34,8 @@ def build_module(args, m, n):
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
                       mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=m, n=n, config=cfg, output_dim_1=m * n, obs_channels=0, action_head='per_cell')
-    if args.arch == 'fprm':
-        return FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
-                                     halt_kl=args.halt_kl, **kw)
     if args.arch == 'fprm_mem':
-        return FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
-                                 thought_norm=args.thought_norm, **kw)
-    if args.arch == 'fprm_mem_halt':
-        return FPRMMemHaltActorValue(max_think_iters=args.max_iters, min_think_iters=args.min_think_iters,
-                                     halt_kl_reverse=args.halt_kl_reverse,
-                                     thought_norm=args.thought_norm, **kw)
+        return build_mem(args, **kw)
     return TransformerActorValue(num_blocks=1 if args.arch == 'single_block' else args.num_blocks, **kw)
 
 
@@ -52,12 +43,12 @@ def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed, halt_mode=
     @jax.jit
     def act(obs, goal, key):
         x = jnp.concatenate([obs, goal], axis=-1)
-        # fprm_mem_halt: the most likely halting path (mode), a sampled one (sample) or a fixed c for every state (fixed).
+        # fprm_mem C:v, sigmoid: the most likely c (mode), a sampled one (sample) or a fixed c for every state (fixed).
         kw = {}
         if halt_mode == 'sample':
             kw = {'halt_key': key}
         elif halt_mode == 'fixed':
-            kw = {'halt_steps': jnp.full((obs.shape[0],), halt_fixed, jnp.int32), 'halt_path': jnp.zeros((obs.shape[0],), jnp.int32)}
+            kw = {'halt_steps': jnp.full((obs.shape[0],), halt_fixed, jnp.int32)}
         (pi, _), inter = mod.apply(policy_vars, x, norm, mutable=['intermediates'], **kw)
         I = inter['intermediates']
         conv = I['fp_converged'][0] if 'fp_converged' in I else jnp.zeros(obs.shape[0], bool)
@@ -98,16 +89,11 @@ def aggregate(per_dist, dists):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_mem', 'fprm_mem_halt', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
-    ap.add_argument('--halt_kl', type=float, default=1e-3,
-                    help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
-    ap.add_argument('--halt_kl_reverse', action='store_true', help='fprm_mem_halt: the checkpoint was trained with --halt_kl_reverse')
-    ap.add_argument('--min_think_iters', type=int, default=1, help='fprm_mem_halt: the checkpoint\'s --min_think_iters')
+    add_model_args(ap)
     ap.add_argument('--halt_mode', default='mode', choices=['mode', 'sample', 'fixed'],
-                    help='fprm_mem_halt: think time c of the most likely halting path (the training eval), of a sampled path, or --halt_fixed for every state')
-    ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem_halt, --halt_mode fixed: the think time c (1 .. max_iters)')
-    ap.add_argument('--thought_norm', action='store_true', help='fprm_mem / fprm_mem_halt: the checkpoint was trained with --cot_thought_norm')
+                    help='fprm_mem C:v: think time c of the most likely halting path (the training eval), of a sampled path '
+                         '(sigmoid only), or --halt_fixed for every state')
+    ap.add_argument('--halt_fixed', type=int, default=0, help='fprm_mem C:v, --halt_mode fixed: the think time c (1 .. C)')
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -155,12 +141,12 @@ def main():
             print(f'{name:11s} success {s["success"]:.3f} think {s["think"]:.2f} conv {s["converged"]:.3f} len {s["mean_len"]:.1f}')
 
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
-    tag = f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_mem', 'fprm_mem_halt') and args.max_iters != 16 else ''
-    if args.arch == 'fprm_mem_halt' and args.halt_mode != 'mode':
+    tag = cap_tag(args)
+    if args.act_iters.endswith(':v') and args.halt_mode != 'mode':
         tag += f'_{args.halt_mode}' + (str(args.halt_fixed) if args.halt_mode == 'fixed' else '')
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{stem}{tag}.json')
     json.dump(dict(ckpt=args.ckpt, arch=args.arch, grid=args.grid, episode_length=T_train, eval_episode_length=T_eval,
-                   max_iters=args.max_iters if args.arch in ('fprm', 'fprm_mem', 'fprm_mem_halt') else None,
+                   act_iters=args.act_iters if think_cap(args) else None,
                    threshold=env.threshold, results={str(d): r for d, r in per_dist.items()}, summary=summary),
               open(out, 'w'), indent=1)
     print('wrote', out)

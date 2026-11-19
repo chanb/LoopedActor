@@ -1,15 +1,13 @@
-"""PPO training for a Fixed-Point Reasoning Model (FPRM) actor-critic on
-grid puzzles (Boxoban, Rush Hour), with adaptive per-state thinking via a policy-KL halting criterion.
+"""PPO training for a looped Fixed-Point Reasoning Model (FPRM) actor on grid puzzles, with a uniform or variable
+per-state think budget (`--act_iters=C:u|v`) and a separate fixed-budget FPRM critic (`--value_iters`).
 
-The actor-critic is a weight-tied looped Transformer iterated by a
-fixed-point solver ("thinking"). At every state, the network stops iterating
-once the KL divergence between consecutive policy readouts drops below
-`--halt_kl` — it thinks only as long as thinking still changes its mind. The
-PPO loss is applied to the final actor/value readout, with full
-backpropagation through every executed think iteration.
+The actor is a weight-tied looped Transformer with a thought memory (models/fprm_mem_halt.py). With C:u it always acts
+with pass C; with C:v it halts by `--halt_criterion`: 'kl' / 'l2' stop once the next pass's policy / readout latent is
+within `--halt_threshold` of the current one, 'sigmoid' samples a learned yes/no halt at every pass. The PPO loss is
+applied to the acting readout, with full backpropagation through every executed think iteration.
 
 Run:
-    python ppo.py --env_id=sokoban-unfiltered_train-unfiltered_valid --architecture=fprm --seed=1
+    python ppo.py --env_id=sokoban-unfiltered_train-unfiltered_valid --act_iters=16:v --halt_criterion=kl --seed=1
 """
 
 import os
@@ -37,8 +35,7 @@ from utils.wrapper import wrap_env
 from utils.evaluation import Evaluator
 from envs.utils import make_env
 from models.fprm import FPRMConfig
-from models.fprm_thinker import FPRMThinkerActorValue
-from models.fprm_mem_halt import FPRMMemHaltActorValue, natural_grad_fisher
+from models.fprm_mem_halt import FPRMMemHaltActorValue
 from models.transformer_baseline import TransformerActorValue
 
 
@@ -112,30 +109,25 @@ class Args:
     anneal_lr: bool = False               # linearly decay lr to 0 over training
 
     # model
-    # 'fprm'         — looped FPRM with policy-KL adaptive halting
-    # 'fprm_mem'       — fprm's looped board plus a SEP token and a memory of thought tokens; always runs max_think_iters passes
-    #                    and acts with the last (models/fprm_mem_halt.py with halting=False)
-    # 'fprm_mem_halt'  — the same trunk with learned stochastic halting: a yes/no halt at every pass,
-    #                    h_n = sigmoid(beta - alpha log S_(n+1)); the PPO ratio uses the joint log p(c|s) + log pi_c(a|s)
-    # 'single_block' — FPRM core applied once (same params as fprm, no looping)
+    # 'fprm_mem'     — looped FPRM board plus a SEP token and a memory of thought tokens (models/fprm_mem_halt.py); the
+    #                  think budget is act_iters, the critic a separate FPRM run for value_iters core calls
+    # 'single_block' — FPRM core applied once (no looping)
     # 'multi_block'  — num_blocks FPRM cores without weight tying (~num_blocks x params)
-    architecture: str = 'fprm'
+    architecture: str = 'fprm_mem'
     num_blocks: int = 8                   # blocks of the multi_block baseline
     # observation tokenization (all architectures): 'cell' = one token per grid cell from its channels +
     # geometry; 'flat' = one token per observation dimension; 'conv' = 3x3 conv, one token per output channel
     tokenizer: str = 'cell'
     tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
-    action_head: str = ''                 # '' = the env's own ('per_cell' / 'readout'); 'neighbour' (fprm_mem / fprm_mem_halt,
+    action_head: str = ''                 # '' = the env's own ('per_cell' / 'readout'); 'neighbour' (fprm_mem,
                                           # slidingpuzzle-*): the blank's 4 moves read from its neighbours' cell latents;
                                           # 'blank' (same archs and envs): Dense(4) on the blank's own cell latent, unmasked
                                           # 'action_tokens' (any env / arch): |A| learned action tokens in the input, logit a
                                           # read off action token a's latent
-    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem / fprm_mem_halt, slidingpuzzle-*): cell tokens
+    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-*): cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
-    mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu' | 'sem' (GELU -> simplicial, option C)
-    mlp_sem_size: int = 8                 # mlp_type='sem': hidden units per softmax group
-    mlp_sem_tau: float = 1.0              # mlp_type='sem': softmax temperature
+    mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
                                           # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
@@ -149,40 +141,24 @@ class Args:
     fprm_expansion: float = 4.0           # MLP hidden = expansion * d_model (* 2/3 for swiglu), rounded up to mlp_round_to
     fprm_num_heads: int = 4
     fprm_num_layers: int = 1
-    max_think_iters: int = 8              # cap on core calls ("think iterations") per decision
-    min_think_iters: int = 2              # halting is checked only after this many iterations
-    halt_criterion: str = 'kl'            # 'kl' (policy-KL halting) | 'latent_residual' (original FPRM-paper rule: latent max-token residual)
-    halt_kl: float = 1e-3                 # stop thinking once KL(pi_i || pi_{i-1}) between consecutive policy readouts <= this
-                                          # (0 = only at a fixed point, < 0 = never: the iso_* arms pass -1)
-    halt_residual_thresh: float = 0.1     # halt_criterion='latent_residual': stop once the latent residual < this (paper fp_thresh)
-    halt_head_grad: bool = False          # fprm_mem_halt: let the halting loss backpropagate into the trunk through the halting head
-    halt_kl_reverse: bool = False         # fprm_mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), the expectation under the acting policy
-    stable_kl: bool = False               # fprm_mem_halt: halting KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
-    stable_softmax: bool = False          # fprm_mem / fprm_mem_halt: collapse-free log-softmax for the action policy
-                                           # (and, fprm_mem_halt only, the halting head)
-    halt_signal: str = 'kl'               # fprm_mem_halt: the distance S the halting head reads: 'kl' (the policies) | 'tv' (the policies, total variation) | 'latent' (the readout latents, L2)
-    readout_token: str = 'thought'        # fprm_mem / fprm_mem_halt: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
-    value_token: str = ''                 # fprm_mem / fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': where the value is read from
-    halt_token: str = ''                  # fprm_mem_halt: '' (= readout_token) | 'thought' | 'sep': the halting head's h_n (halt_beta_head or halt_signal=latent)
-    value_pass: str = 'last'              # fprm_mem_halt: 'last' (value from pass T) | 'halt' (from the acting pass c)
-    act_iters: Optional[int] = None       # fprm_mem: act with this pass c <= max_think_iters (None = max_think_iters); with
-                                          # value_pass=last the value still reads pass T (a fixed-c actor with the T-pass critic).
-                                          # Logged as c for fprm_mem and None for every other architecture (wandb group-by)
-    value_deep_supervision: bool = False  # fprm_mem / fprm_mem_halt: regress the value of every pass up to the value's
-                                          # readout pass (T, or c with value_pass=halt) on the same target: V(s) at every depth
-    halt_alpha_min: float = 0.0           # fprm_mem_halt: floor on the slope alpha (alpha = this + softplus(.), 1 at init)
-    halt_beta_head: bool = False          # fprm_mem_halt: state-dependent beta (Dense on h_(n+1)) instead of a scalar
-    halt_threshold_fixed: bool = False    # fprm_mem_halt: p(halt) = 1/2 at S = halt_kl throughout (beta = alpha log halt_kl)
-    halt_natural_grad: bool = False       # fprm_mem_halt (scalar beta): update (beta, alpha_raw) by SGD (halt_lr) on Sigma^-1 g,
-                                          # Sigma the Fisher of the decisions
-    halt_lr: float = 1e-2                 # halt_natural_grad: learning rate of (beta, alpha_raw)
-    halt_damping: float = 1e-3            # halt_natural_grad: damping added to the Fisher Sigma
-    halt_fisher_ema: float = 0.0          # halt_natural_grad: precondition with an EMA of Sigma over minibatch
-                                          # updates (decay beta, bias-corrected); 0: each minibatch's own Sigma
-    halt_trust_region: float = 0.0        # halt_natural_grad: cap the step's predicted KL of the decisions,
-                                          # 1/2 dtheta^T Sigma dtheta, at delta: step min(halt_lr, sqrt(2 delta / g^T Sigma^-1 g)) Sigma^-1 g; 0: off
-    halt_entropy_cost: float = 0.0        # fprm_mem_halt: entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
-    halt_objective: str = 'pg'            # fprm_mem_halt: 'pg' = log p(c|s) inside PPO's ratio; 'next' = the softmax over k
+    act_iters: str = '8:u'                # fprm_mem: '<C>:<V>', C = the think cap (max core calls per decision), V = 'u' (uniform:
+                                          # always act with pass C) | 'v' (variable: halt by halt_criterion, at most C passes)
+    value_iters: int = 8                  # fprm_mem: core calls of the critic (a separate FPRM, fixed budget)
+    min_think_iters: int = 2              # act_iters=C:v: earliest pass that may halt
+    halt_criterion: str = 'sigmoid'       # act_iters=C:v: 'kl' (halt at n once KL(pi_(n+1) || pi_n) < halt_threshold) | 'l2' (once
+                                          # ||rms_norm(h_(n+1)) - rms_norm(h_n)|| < halt_threshold, h the readout latent) | 'sigmoid'
+                                          # (learned stochastic yes/no halt h_n = sigmoid(w . rms_norm(h_n) + b); the halting objectives below)
+    halt_threshold: float = 1e-3          # halt_criterion='kl' / 'l2': the threshold
+    halt_head_grad: bool = False          # 'sigmoid': let the halting loss backpropagate into the trunk through the halting head
+    halt_sg_survival: bool = False        # 'sigmoid': log p(c|s) passes no gradient through the continue terms log(1 - h_c'), c' < c
+    halt_kl_reverse: bool = False         # KL_n = KL(pi_(n-1) || pi_n), the expectation under the acting policy
+    stable_kl: bool = False               # KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
+    stable_softmax: bool = False          # fprm_mem: collapse-free log-softmax for the action policy (and the halting head)
+    policy_param: str = 'last'            # fprm_mem: 'last' = pi_n from pass n's logits l_n | 'sum' = PonderNet style, pi_n from sum_(k<=n) l_k
+    logit_sum_stop_grad: bool = False     # policy_param='sum': no gradient through l_k for k < c (only the halting pass's l_c)
+    readout_token: str = 'thought'        # fprm_mem: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
+    halt_entropy_cost: float = 0.0        # 'sigmoid': entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
+    halt_objective: str = 'pg'            # 'sigmoid' halting: 'pg' = log p(c|s) inside PPO's ratio; 'next' = the softmax over k
                                           # at the sampled c against the passes it leads to, J_(c+k) - J_c (see the loss);
                                           # 'sac' = discrete soft actor-critic over the passes on the same J_n (halt_soft_tau);
                                           # 'score' = REINFORCE on log p(c|s) with weight pi_c(a|s) G - discount_compute pi_(c+1)(a|s) G
@@ -192,28 +168,23 @@ class Args:
     halt_clip: str = 'joint'              # halt_objective='pg': PPO clip of one ratio over log p(path) + log pi_c(a|s) ('joint'),
                                           # or of pi_c(a|s) apart from p(path) as a whole ('path') or from each decision ('each')
     halt_rho_max: float = 2.0             # halt_objective='next': clip of the ratio pi_n(a|s) / mu(a|s) on G - V in J_n
-    halt_prior_coef: float = 0.0          # fprm_mem_halt: weight of KL(p_n || q) at every decision pass, decayed linearly
+    halt_prior_coef: float = 0.0          # 'sigmoid' halting: weight of KL(p_n || q) at every decision pass, decayed linearly
                                           # to 0 over training; q favours continuing (0 = off)
     halt_prior_halt: float = 0.1          # q(halt); q(continue) = 1 - q(halt)
     cot_thought_norm: bool = False        # fprm_mem: RMS-normalize each thought before feeding it back
-    sem_readout: bool = False             # fprm_mem*: simplicial embedding before the actor/value heads
-    sem_thought: bool = False             # fprm_mem*: simplicial embedding on each fed-back thought
-    sem_latent: bool = False              # fprm_mem*: carried latents = sqrt(V) * simplicial(rms_norm(h)) (option B)
-    sem_groups: int = 16                  # SEM: softmax groups (d_model / sem_groups values each)
-    sem_tau: float = 1.0                  # SEM: softmax temperature
     init_checkpoint: str = ""             # if set, initializes every param group the checkpoint has (e.g. an iso_mem
                                            # checkpoint's core/actor_head/value_head) instead of a fresh random init;
-                                           # groups the checkpoint lacks (e.g. fprm_mem_halt's halt_alpha_raw/halt_beta
+                                           # groups the checkpoint lacks (e.g. the sigmoid halting head's halt_linear
                                            # on an iso_mem checkpoint) stay freshly initialized. Also loads its
                                            # normalizer_params. Expects the (params, normalizer_params) tuple format
                                            # save_params()/load_params() use.
-    halt_adam_b1: float = 0.9             # fprm_mem_halt: Adam beta_1 / beta_2 of the halting head (halt_alpha_raw/halt_beta) only;
+    halt_adam_b1: float = 0.9             # 'sigmoid' halting: Adam beta_1 / beta_2 of the halting head (halt_linear) only;
     halt_adam_b2: float = 0.999           # the rest keeps optax's 0.9 / 0.999 (arXiv 2601.21739 suggests 0.99 / 0.99)
-    freeze_except_halt: bool = False      # fprm_mem_halt: zero the optimizer update for every param group except
-                                           # halt_alpha_raw/halt_beta - trains only the halting head, typically paired
+    freeze_except_halt: bool = False      # 'sigmoid' halting: zero the optimizer update for every param group except
+                                           # halt_linear - trains only the halting head, typically paired
                                            # with init_checkpoint pointed at a halting=False checkpoint
-    halt_update_period: int = 1           # fprm_mem_halt: the trunk updates at every grad step, the halting head
-                                           # (halt_alpha_raw/halt_beta) only at every p-th; its Adam state pauses in between
+    halt_update_period: int = 1           # 'sigmoid' halting: the trunk updates at every grad step, the halting head
+                                           # (halt_linear) only at every p-th; its Adam state pauses in between
 
 
 @flax.struct.dataclass
@@ -223,7 +194,6 @@ class PPOTrainingState(TrainState):
     env_steps: float
     loss_scale: Any  # () float32, dynamic fp16 loss scale (unused unless compute_dtype=float16 and dynamic_loss_scale)
     loss_scale_good_steps: Any  # () int32, consecutive finite-gradient steps since the last scale change
-    halt_fisher: Any  # (2, 2) float32, halt_natural_grad: the EMA of the (damped) Fisher Sigma, before bias correction
 
 
 class Transition(NamedTuple):
@@ -314,7 +284,7 @@ def load_params(path):
 def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     """Creates params and inference function for the PPO agent.
 
-    stochastic_halt: the network samples its think time c (fprm_mem_halt); the stored log_prob is the joint
+    stochastic_halt: the network samples its think time c (act_iters=C:v, halt_criterion=sigmoid); the stored log_prob is the joint
     log p(c|s) + log pi_c(a|s), and compute_time = c is replayed in the loss. Deterministic: c = argmax p(c|s).
     """
     def make_policy(params, deterministic: bool = False):
@@ -349,7 +319,7 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
                 'value': value,
                 'compute_time': compute_time,
             }
-            if 'halt_path' in inter['intermediates']:  # fprm_mem_halt: the loss replays the decision passes too
+            if 'halt_path' in inter['intermediates']:  # 'sigmoid' halting: the loss replays the decision passes too
                 extras['halt_path'] = inter['intermediates']['halt_path'][0]
                 extras['halt_decision_log_probs'] = inter['intermediates']['halt_decision_log_probs'][0]
             return actions, extras
@@ -358,7 +328,7 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
     return make_policy
 
 
-HALT_PARAMS = ('halt_alpha_raw', 'halt_beta')  # the halting head's param groups
+HALT_PARAMS = ('halt_linear',)  # the halting head's param groups
 
 
 def gated(tx, active):
@@ -405,10 +375,6 @@ def make_optimizer(args, init_params=None):
         p = args.halt_update_period
         return optax.multi_transform({'train': gated(clip(halt_tx), lambda c: c % p == p - 1),
                                       'rest': clip(trunk_tx)}, labels('rest'))
-    if args.halt_natural_grad and not args.freeze_except_halt:
-        # (beta, alpha_raw): SGD on the preconditioned gradient Sigma^-1 g (set in learn_step); clipping covers the rest
-        # only, so the preconditioned head gradient does not scale the trunk's update.
-        return optax.multi_transform({'train': optax.sgd(args.halt_lr), 'rest': clip(trunk_tx)}, labels('rest'))
 
     if args.freeze_except_halt:
         assert init_params is not None, "freeze_except_halt needs init_params to build the freeze mask"
@@ -433,10 +399,9 @@ def main(args: Args):
     print(f"Total number of gradient steps per training step = {args.num_minibatches_per_rollout * args.num_epochs_per_rollout}")
     print(f"Total number of env steps per training step = {args.num_envs * args.rollout_length}")
 
-    if args.architecture == 'fprm_mem':
-        args.act_iters = args.act_iters or args.max_think_iters
-    else:
-        assert args.act_iters is None, 'act_iters is only for fprm_mem'
+    cap, mode = args.act_iters.split(':')
+    assert mode in ('u', 'v') and int(cap) >= 1, f"act_iters must be '<C>:u' or '<C>:v', got {args.act_iters!r}"
+    args.think_cap, args.variable_budget = int(cap), args.architecture == 'fprm_mem' and mode == 'v'
 
     args.exp_name = f"{args.wandb_name_tag + '__' if args.wandb_name_tag != '' else ''}{args.env_id}__{args.architecture}__{args.seed}__{os.path.basename(__file__)[: -len('.py')]}__{int(time.time())}"
 
@@ -482,17 +447,15 @@ def main(args: Args):
     action_head = getattr(env, 'action_head', 'readout' if obs_channels > 0 else 'per_cell')  # plane-tokenized envs use the readout head by default
     if args.action_head:
         assert args.action_head not in ('neighbour', 'blank') or (args.env_id.startswith('slidingpuzzle-')
-                                                   and args.architecture in ('fprm_mem', 'fprm_mem_halt')), \
-            f"action_head={args.action_head!r} needs a slidingpuzzle-* env and architecture fprm_mem / fprm_mem_halt"
+                                                   and args.architecture == 'fprm_mem'), \
+            f"action_head={args.action_head!r} needs a slidingpuzzle-* env and architecture fprm_mem"
         action_head = args.action_head
     assert args.cell_geometry or (args.env_id.startswith('slidingpuzzle-') and args.tokenizer == 'cell'
-                                  and args.architecture in ('fprm_mem', 'fprm_mem_halt')), \
-        '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem / fprm_mem_halt'
-    assert not args.halt_natural_grad or (not args.halt_beta_head and not args.halt_threshold_fixed
-                                          and not args.freeze_except_halt), 'halt_natural_grad needs a scalar learned beta'
-    assert args.halt_update_period == 1 or (args.architecture == 'fprm_mem_halt' and not args.halt_natural_grad
-                                            and not args.freeze_except_halt), \
-        'halt_update_period needs fprm_mem_halt, no halt_natural_grad / freeze_except_halt'
+                                  and args.architecture == 'fprm_mem'), \
+        '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem'
+    stochastic_halt = args.variable_budget and args.halt_criterion == 'sigmoid'
+    assert args.halt_update_period == 1 or (stochastic_halt and not args.freeze_except_halt), \
+        'halt_update_period needs act_iters=C:v with halt_criterion=sigmoid, no freeze_except_halt'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
 
@@ -504,51 +467,29 @@ def main(args: Args):
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
-        mlp_sem_size=args.mlp_sem_size,
-        mlp_sem_tau=args.mlp_sem_tau,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
     )
-    if args.architecture == 'fprm':
-        actor_critic_network = FPRMThinkerActorValue(
-            m=env.m,
-            n=env.n,
-            config=fprm_config,
-            max_think_iters=args.max_think_iters,
-            min_think_iters=args.min_think_iters,
-            halt_criterion=args.halt_criterion,
-            halt_kl=args.halt_kl,
-            halt_residual_thresh=args.halt_residual_thresh,
-            output_dim_1=action_size,
-            obs_channels=obs_channels,
-            action_head=action_head,
-            tokenizer=args.tokenizer,
-            tokenizer_conv_features=args.tokenizer_conv_features,
-        )
-    elif args.architecture in ('fprm_mem', 'fprm_mem_halt'):
-        assert args.halt_criterion == 'kl', "fprm_mem / fprm_mem_halt support only halt_criterion='kl'"
+    if args.architecture == 'fprm_mem':
         assert args.halt_clip in ('joint', 'path', 'each'), f"halt_clip must be joint, path or each, got {args.halt_clip}"
         actor_critic_network = FPRMMemHaltActorValue(
-            halting=args.architecture == 'fprm_mem_halt',
+            halting=args.variable_budget,
             m=env.m,
             n=env.n,
             config=fprm_config,
-            max_think_iters=args.max_think_iters,
+            max_think_iters=args.think_cap,
             min_think_iters=args.min_think_iters,
+            halt_criterion=args.halt_criterion,
+            halt_threshold=args.halt_threshold,
             halt_head_grad=args.halt_head_grad,
+            halt_sg_survival=args.halt_sg_survival,
             halt_kl_reverse=args.halt_kl_reverse,
             stable_kl=args.stable_kl,
             stable_softmax=args.stable_softmax,
-            halt_signal=args.halt_signal,
-            halt_kl=args.halt_kl,
-            halt_alpha_min=args.halt_alpha_min,
-            halt_beta_head=args.halt_beta_head,
-            halt_threshold_fixed=args.halt_threshold_fixed,
+            policy_param=args.policy_param,
+            logit_sum_stop_grad=args.logit_sum_stop_grad,
+            value_iters=args.value_iters,
             readout_token=args.readout_token,
-            value_token=args.value_token,
-            halt_token=args.halt_token,
-            value_pass=args.value_pass,
-            act_iters=args.act_iters or 0,
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
@@ -556,11 +497,6 @@ def main(args: Args):
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
-            sem_readout=args.sem_readout,
-            sem_thought=args.sem_thought,
-            sem_latent=args.sem_latent,
-            sem_groups=args.sem_groups,
-            sem_tau=args.sem_tau,
         )
     elif args.architecture in ('single_block', 'multi_block'):
         actor_critic_network = TransformerActorValue(
@@ -581,8 +517,8 @@ def main(args: Args):
     init_normalizer = running_statistics.init_state((obs_size + goal_size,))
     if args.init_checkpoint:
         ckpt_params, ckpt_normalizer = load_params(args.init_checkpoint)
-        # Overwrite every param group the checkpoint has; a group it lacks (e.g. fprm_mem_halt's halt_alpha_raw/
-        # halt_beta on a halting=False checkpoint) stays at its fresh init above.
+        # Overwrite every param group the checkpoint has; a group it lacks (e.g. the sigmoid halting head's halt_linear on a
+        # halting=False checkpoint) stays at its fresh init above.
         merged = dict(init_params['params'])
         merged.update(ckpt_params['params'])
         init_params = {'params': merged}
@@ -596,9 +532,7 @@ def main(args: Args):
         env_steps=np.zeros((), dtype=np.float64),
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
-        halt_fisher=jnp.zeros((2, 2), jnp.float32),
     )
-    stochastic_halt = args.architecture == 'fprm_mem_halt'
     make_policy = make_inference_fn(actor_critic_network, stochastic_halt)
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
@@ -767,7 +701,7 @@ def main(args: Args):
         # PPO loss on the final actor / value readout. Halted examples freeze
         # inside the network, so their readout is the one they halted at.
         # Stochastic halting: replay the rollout's think time c.
-        halt_kw = {'halt_steps': data.extras['policy_extras']['compute_time']} if stochastic_halt else {}
+        halt_kw = {'halt_steps': data.extras['policy_extras']['compute_time']} if args.variable_budget else {}  # replay c
         _, inter = actor_critic_network.apply(
             params, data.observation, normalizer_params,
             mutable=['intermediates'],
@@ -797,13 +731,8 @@ def main(args: Args):
             res_c = jnp.take_along_axis(inter['intermediates']['latent_residual_t'][0], c_idx[None], axis=0)
             halt_metrics['latent_res_at_c'] = jnp.mean(res_c)
             hp = params['params']
-            halt_metrics['halt_alpha'] = args.halt_alpha_min + jax.nn.softplus(hp['halt_alpha_raw'])
-            halt_metrics['halt_beta'] = hp['halt_beta']['bias'][0]
-            if args.halt_natural_grad:  # d logit = d beta + f d alpha_raw, f = -softplus'(alpha_raw) log S
-                f = -jax.nn.sigmoid(hp['halt_alpha_raw']) * inter['intermediates']['halt_log_sig_t'][0][:-1]
-                p = jnp.exp(inter['intermediates']['halt_step_log_probs'][0][:-1, :, 0])
-                dec = ((path[None] >> jnp.arange(f.shape[0])[:, None]) & 1) == 1
-                halt_metrics['halt_fisher'] = jax.lax.stop_gradient(natural_grad_fisher(f, p, dec, args.halt_damping))
+            halt_metrics['halt_bias'] = hp['halt_linear']['bias'][0]
+            halt_metrics['halt_kernel_norm'] = jnp.linalg.norm(hp['halt_linear']['kernel'])
         else:
             halt_log_prob, halt_entropy = 0.0, 0.0
         halt_loss = 0.0
@@ -888,7 +817,7 @@ def main(args: Args):
             prior_coef = args.halt_prior_coef * jnp.maximum(1.0 - progress, 0.0)
             halt_loss = halt_loss + prior_coef * prior_kl
             halt_metrics.update({'halt_prior_kl': prior_kl, 'halt_prior_coef': prior_coef})
-        if 'policy_kl_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
+        if 'policy_kl_t' in inter['intermediates']:  # fprm_mem
             # Per-pass means, each in its own wandb section: log10 of the policy KL_i between passes i and i-1 (KL spans
             # decades, so the mean of the log) and the latent residual.
             log_kl = jnp.mean(jnp.log10(jnp.maximum(inter['intermediates']['policy_kl_t'][0], 0.0) + 1e-10), axis=-1)
@@ -900,14 +829,6 @@ def main(args: Args):
             inter['intermediates']['halt_decision_log_probs'][0] if halt_clip == 'each' else None,
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
-        if 'value_t' in inter['intermediates']:  # fprm_mem / fprm_mem_halt
-            value_t = inter['intermediates']['value_t'][0]  # [T, B]
-            if args.value_deep_supervision:  # passes 1..n_max all regress on the same target
-                n_max = inter['intermediates']['fp_iterations'][0] if args.value_pass == 'halt' else value_t.shape[0]
-                v_loss = value_loss(value_t, value_targets, args.value_expectile, jnp.arange(1, value_t.shape[0] + 1)[:, None] <= n_max)
-            # Per-pass value loss over every state (supervised or not), each in its own wandb section.
-            v_loss_t = jax.lax.stop_gradient(jax.vmap(lambda v: value_loss(v, value_targets, args.value_expectile))(value_t))
-            halt_metrics.update({f'v_loss/pass_{i + 1:02d}': v_loss_t[i] for i in range(v_loss_t.shape[0])})
 
         think_iters = inter['intermediates']['fp_iterations'][0]
 
@@ -958,28 +879,7 @@ def main(args: Args):
             metrics['grad_norm'] = grad_norm
             if args.max_grad_norm > 0.0:
                 metrics['grad_clip_frac'] = (grad_norm > args.max_grad_norm).astype(jnp.float32)
-            fisher = metrics.pop('halt_fisher', None)
-            fisher_ema = training_state.halt_fisher
-            if fisher is not None and args.halt_fisher_ema > 0.0:  # Sigma <- the bias-corrected EMA over minibatch updates
-                beta = args.halt_fisher_ema
-                fisher_ema = beta * fisher_ema + (1.0 - beta) * fisher
-                fisher = fisher_ema / (1.0 - beta ** (training_state.step + 1).astype(jnp.float32))
-            if fisher is not None:
-                metrics.update({f'halt_fisher_{i}{j}': fisher[i, j] for i in range(len(fisher)) for j in range(i, len(fisher))})
-            if fisher is not None:  # halt_natural_grad: head gradient g -> Sigma^-1 g (SGD in the optimizer)
-                p = grads['params']
-                g_raw = jnp.stack([p['halt_beta']['bias'][0], p['halt_alpha_raw']])  # (beta, alpha_raw): the Fisher's [1, f]
-                g = jnp.linalg.solve(fisher, g_raw)
-                g_nat = jnp.dot(g_raw, g)  # g^T Sigma^-1 g: the predicted KL of an SGD step is halt_lr^2 g_nat / 2
-                metrics['halt_step_kl'] = 0.5 * args.halt_lr ** 2 * g_nat
-                if args.halt_trust_region > 0.0:  # shrink so the step's predicted KL is at most delta
-                    shrink = jnp.minimum(1.0, jnp.sqrt(2.0 * args.halt_trust_region / jnp.maximum(g_nat, 1e-30)) / args.halt_lr)
-                    g = g * shrink
-                    metrics['halt_trust_shrink'] = shrink
-                    metrics['halt_trust_active'] = (shrink < 1.0).astype(jnp.float32)
-                new = {'halt_beta': {**p['halt_beta'], 'bias': g[:1]}, 'halt_alpha_raw': g[1]}
-                grads = {**grads, 'params': {**p, **new}}
-            new_training_state = training_state.apply_gradients(grads=grads).replace(halt_fisher=fisher_ema)
+            new_training_state = training_state.apply_gradients(grads=grads)
             if use_loss_scale:
                 # Skip the update on a nonfinite gradient and halve the scale; double it after loss_scale_period
                 # consecutive finite steps.

@@ -22,23 +22,22 @@ def _net(**kw):
 
 def _intermediates(net, params, x, **kw):
     _, inter = net.apply({'params': params}, x, mutable=['intermediates'], **kw)
-    return {k: v[0] for k, v in inter['intermediates'].items()}
+    return {k: v[0] for k, v in inter['intermediates'].items() if isinstance(v, tuple)}
 
 
 def _with(params, name, **leaves):
     return {**params, name: {**params[name], **leaves}}
 
 
-def _random_head(params, key=2, scale=1.0):
-    """The halting head moved off its init: a random state-dependent beta (read with halt_beta_head) and alpha != 1."""
-    w = params['halt_beta']['kernel']
-    params = _with(params, 'halt_beta', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape), bias=jnp.array([-3.0]))
-    return {**params, 'halt_alpha_raw': jnp.float32(0.3)}
+def _random_head(params, key=2, scale=0.25):
+    """The halting head moved off its init: a random linear head on rms_norm(h_n)."""
+    w = params['halt_linear']['kernel']
+    return _with(params, 'halt_linear', kernel=scale * jax.random.normal(jax.random.PRNGKey(key), w.shape), bias=jnp.array([-1.0]))
 
 
 def _eager(params):
     """A halting head that halts at its first decision."""
-    return _with(params, 'halt_beta', bias=jnp.array([50.0]))
+    return _with(params, 'halt_linear', bias=jnp.array([50.0]))
 
 
 def _k1_path(c, min_iters, T):
@@ -108,7 +107,7 @@ def test_c_distribution_by_hand(min_iters):
 
 @pytest.mark.parametrize('head_grad', [False, True])
 def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
-    net = _net(halt_beta_head=True, halt_head_grad=head_grad)  # beta reads h_(n+1), so the trunk is reachable
+    net = _net(halt_head_grad=head_grad)  # the head reads h_n, so the trunk is reachable
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'], scale=0.3)
 
@@ -118,80 +117,51 @@ def test_halting_gradient_reaches_trunk_only_with_head_grad(head_grad):
     g = jax.grad(halt_loss)(params)
     trunk = sum(float(jnp.sum(jnp.abs(v))) for v in jax.tree_util.tree_leaves(g['core']))
     assert (trunk > 0) == head_grad
-    assert float(jnp.sum(jnp.abs(g['halt_beta']['kernel']))) > 0 and float(jnp.abs(g['halt_alpha_raw'])) > 0
+    assert float(jnp.sum(jnp.abs(g['halt_linear']['kernel']))) > 0 and float(jnp.sum(jnp.abs(g['halt_linear']['bias']))) > 0
 
 
-@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
-def test_lookahead_halts_with_previous_pass(signal):
-    # Lookahead: c = 1 is decided on pass 2 and acts with pi_1 (= the output of a 1-pass net); fp_residual is the
-    # signal of pass 2.
-    net = _net(min_think_iters=1, halt_signal=signal)
+def test_halt_at_pass_1_acts_with_pass_1():
+    # c = 1 acts with pi_1 (= the output of a 1-pass net); fp_residual logs the signal of pass 2.
+    net = _net(min_think_iters=1)
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
     eager = _eager(net.init(jax.random.PRNGKey(0), x)['params'])
     inter = _intermediates(net, eager, x)
     assert bool(jnp.all(inter['fp_iterations'] == 1))
-    one_pass = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=1, halt_signal=signal), eager, x)
+    one_pass = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=1), eager, x)
     assert jnp.allclose(inter['logits'], one_pass['logits'], atol=1e-5)
     assert jnp.allclose(inter['fp_residual'], inter['halt_signal_t'][1], atol=1e-6)
 
 
-@pytest.mark.parametrize('signal', ['kl', 'latent', 'tv'])
-def test_head_reads_the_next_signal(signal):
-    # The decision at pass n is sigmoid(beta - alpha log S_(n+1)).
-    net = _net(min_think_iters=1, halt_signal=signal)
+def test_l2_signal_is_l2_of_readout_latents():
+    # halt_criterion='l2': S_i = ||rms_norm(h_i) - rms_norm(h_{i-1})|| with h the readout token's latent: finite and
+    # positive (the passes differ); the criterion changes only S, not the passes (the same KLs).
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
-    inter = _intermediates(net, params, x)
-    if signal == 'kl':
-        assert jnp.allclose(inter['halt_signal_t'], inter['policy_kl_t'])
-    logit = -3.0 - jax.nn.softplus(0.3) * jnp.log(jnp.maximum(inter['halt_signal_t'][1:], 0.0) + 1e-10)
-    assert jnp.allclose(inter['halt_prob'][:-1], jax.nn.sigmoid(logit), atol=1e-5)
-
-
-def test_latent_signal_is_l2_of_readout_latents():
-    # S_i = ||rms_norm(h_i) - rms_norm(h_{i-1})|| with h the readout token's latent: finite and positive (the passes differ);
-    # the signal changes only S, not the passes (the same KLs).
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    net = _net(halt_signal='latent')
+    net = _net(halt_criterion='l2')
     params = net.init(jax.random.PRNGKey(0), x)['params']
     sig = _intermediates(net, params, x)['halt_signal_t']
     assert bool(jnp.all(jnp.isfinite(sig))) and bool(jnp.all(sig > 0))
     # pass 1 compares against the zero initial thought (rms_norm(0) = 0), so S_1 = ||rms_norm(h_1)|| = sqrt(d_model)
     assert jnp.allclose(sig[0], CFG.d_model ** 0.5, rtol=1e-3)
     # kl and latent see the same passes; only S differs
-    kl_net = _net(halt_signal='kl')
+    kl_net = _net(halt_criterion='kl')
     assert jnp.allclose(_intermediates(kl_net, params, x)['policy_kl_t'], _intermediates(net, params, x)['policy_kl_t'])
 
 
 def test_sep_token_in_every_pass():
     # Every pass runs [cells, SEP, thought]; readout_token only picks where the readouts come from. The passes (here the
-    # cell latents' residuals) are the same for both, the value differs, and SEP reaches the readout either way.
+    # cell latents' residuals) are the same for both, the logits differ, and SEP reaches the readout either way.
     x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
-    params = _net().init(jax.random.PRNGKey(0), x)['params']
+    kw = dict(action_head='readout', output_dim_1=4)  # logits read off the readout token
+    params = _net(**kw).init(jax.random.PRNGKey(0), x)['params']
     assert 'sep' in params
-    out = {r: _intermediates(_net(readout_token=r), params, x) for r in ('thought', 'sep')}
-    assert jnp.allclose(out['thought']['latent_residual_t'], out['sep']['latent_residual_t'])
-    assert not jnp.allclose(out['thought']['value'], out['sep']['value'], atol=1e-4)
-    for r in ('thought', 'sep'):
-        def value_sum(sep):
-            return jnp.sum(_intermediates(_net(readout_token=r), {**params, 'sep': sep}, x)['value'] ** 2)
-
-        assert float(jnp.abs(jax.grad(value_sum)(params['sep'])).sum()) > 0
-
-
-def test_value_and_halt_tokens():
-    # (halt_signal='latent': with 'kl' S comes from the acting policy, which halt_token does not move.)
-    # value_token / halt_token move one readout to the other token: the action stays with readout_token's, the value
-    # and the halting head match readout_token='sep'.
-    kw = dict(action_head='readout', output_dim_1=4, min_think_iters=1, halt_signal='latent', halt_beta_head=True)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _random_head(_net(**kw).init(jax.random.PRNGKey(0), x)['params'])
     out = {r: _intermediates(_net(readout_token=r, **kw), params, x) for r in ('thought', 'sep')}
-    split = _intermediates(_net(readout_token='thought', value_token='sep', halt_token='sep', **kw), params, x)
-    assert jnp.allclose(split['policy_log_probs_t'], out['thought']['policy_log_probs_t'], atol=1e-6)
-    assert jnp.allclose(split['value'], out['sep']['value'], atol=1e-6)
-    assert jnp.allclose(split['halt_step_probs'], out['sep']['halt_step_probs'], atol=1e-6)
-    assert not jnp.allclose(split['halt_step_probs'], out['thought']['halt_step_probs'], atol=1e-4)
+    assert jnp.allclose(out['thought']['latent_residual_t'], out['sep']['latent_residual_t'])
+    assert not jnp.allclose(out['thought']['logits'], out['sep']['logits'], atol=1e-4)
+    for r in ('thought', 'sep'):
+        def logit_sum(sep):
+            return jnp.sum(_intermediates(_net(readout_token=r, **kw), {**params, 'sep': sep}, x)['logits'] ** 2)
+
+        assert float(jnp.abs(jax.grad(logit_sum)(params['sep'])).sum()) > 0
 
 
 def test_replay_matches_rollout():
@@ -243,40 +213,11 @@ def test_no_halting_acts_with_the_last_pass():
     assert jnp.allclose(iso['logits'], forced['logits'], atol=1e-6) and jnp.allclose(iso['value'], forced['value'], atol=1e-6)
 
 
-def test_value_pass_halt_reads_the_value_at_c():
-    # value_pass='halt': the value comes from the acting pass c (the default 'last' reads pass T for every c).
-    net = _net(min_think_iters=1)
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = net.init(jax.random.PRNGKey(0), x)['params']
-    c = jnp.array([1, 2, 4])
-    kw = dict(halt_steps=c)
-    by_c = [_intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=int(n), min_think_iters=1), params, x)
-            ['value'] for n in c]  # pass n = the last pass of a T = n model
-    last = _intermediates(net, params, x, **kw)['value']
-    inter = _intermediates(_net(min_think_iters=1, value_pass='halt'), params, x, **kw)
-    halt = inter['value']
-    assert jnp.allclose(halt, inter['value_t'][c - 1, jnp.arange(3)], atol=1e-6)  # value_t [T, B]: every pass's value
-    assert jnp.allclose(halt, jnp.array([v[i] for i, v in enumerate(by_c)]), atol=1e-5)
-    assert jnp.allclose(last[2], halt[2], atol=1e-6) and not jnp.allclose(last[:2], halt[:2], atol=1e-3)
-
-
-def test_act_iters_acts_at_c_and_values_at_T():
-    # halting=False, act_iters=c < T: the fixed-c actor of a T = c model with the critic of the T model.
-    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    params = _net(halting=False).init(jax.random.PRNGKey(0), x)['params']
-    fixed_c = _intermediates(FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=2, halting=False), params, x)
-    full_T = _intermediates(_net(halting=False), params, x)
-    mixed = _intermediates(_net(halting=False, act_iters=2), params, x)
-    assert bool(jnp.all(mixed['fp_iterations'] == 2))
-    assert jnp.allclose(mixed['logits'], fixed_c['logits'], atol=1e-5)
-    assert jnp.allclose(mixed['value'], full_T['value'], atol=1e-6)
-
-
 @pytest.mark.parametrize('readout', ['thought', 'sep'])
 def test_readout_latent_sown(readout):
-    # readout_latent_t [T, B, H]: the latent pi_n is decoded from; its rms_norm differences are the latent halt signal
+    # readout_latent_t [T, B, H]: the latent pi_n is decoded from; its rms_norm differences are the l2 halt signal
     x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
-    net = _net(halt_signal='latent', readout_token=readout)
+    net = _net(halt_criterion='l2', readout_token=readout)
     params = net.init(jax.random.PRNGKey(0), x)['params']
     inter = _intermediates(net, params, x)
     h = inter['readout_latent_t']
@@ -372,3 +313,74 @@ def test_no_cell_geometry_drops_the_geometry_features(action_head):
     got = _intermediates(nogeo, params, obs)['logits']
     want = _intermediates(geo, params_geo, obs)['logits']
     assert jnp.allclose(got, want, atol=1e-5)
+
+
+def test_critic_is_a_separate_fixed_budget_fprm():
+    # The value is the plain FPRM critic's (own 'critic' params, value_iters core calls), whatever the actor's budget.
+    from models.fprm_thinker import FPRMThinkerActorValue
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    net = _net(value_iters=3)
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    assert 'critic' in params and 'value_head' not in params
+    critic = FPRMThinkerActorValue(m=3, n=3, config=CFG, max_think_iters=3, min_think_iters=3, halt_criterion='latent_residual',
+                                   halt_residual_thresh=-1.0, output_dim_1=1, action_head='readout')
+    _, want = critic.apply({'params': params['critic']}, x)
+    for kw in (dict(), dict(halting=False), dict(halt_steps=jnp.array([1, 2, 4]))):
+        _, got = (_net(value_iters=3, **{k: v for k, v in kw.items() if k == 'halting'})
+                  .apply({'params': params}, x, **{k: v for k, v in kw.items() if k == 'halt_steps'}))
+        assert jnp.allclose(got, want, atol=1e-6)
+
+
+@pytest.mark.parametrize('criterion', ['kl', 'l2'])
+def test_deterministic_halting_is_the_first_agreeing_pass(criterion):
+    # 'kl' / 'l2': c = the first decision pass n (min_think_iters <= n < T) with S_(n+1) < halt_threshold, else T;
+    # no halting parameters, no halt log-prob.
+    x = jax.random.normal(jax.random.PRNGKey(1), (5, 18))
+    params = _net(halt_criterion=criterion).init(jax.random.PRNGKey(0), x)['params']
+    assert not any(k.startswith('halt_') for k in params)
+    sig = _intermediates(_net(halt_criterion=criterion), params, x)['halt_signal_t']  # [T, B], row i: S_(i+1)
+    thr = float(jnp.median(sig[1:]))
+    for m in (1, 2):
+        inter = _intermediates(_net(halt_criterion=criterion, halt_threshold=thr, min_think_iters=m), params, x)
+        want = [next((n for n in range(m, 4) if sig[n, b] < thr), 4) for b in range(5)]
+        assert inter['fp_iterations'].tolist() == want and 'halt_log_prob' not in inter
+    assert bool(jnp.all(_intermediates(_net(halt_criterion=criterion, halt_threshold=0.0), params, x)['fp_iterations'] == 4))
+
+
+def test_logit_sum_policy():
+    # policy_param='sum': the acting logits at pass c are sum_(n<=c) l_n, with l_n = the logits of a T = n 'last' model;
+    # logit_sum_stop_grad: the same values, and the gradient of l_c alone.
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    params = _net(halting=False).init(jax.random.PRNGKey(0), x)['params']
+    last = lambda T: FPRMMemHaltActorValue(m=3, n=3, config=CFG, max_think_iters=T, halting=False)
+    l_n = [_intermediates(last(T), params, x)['logits'] for T in range(1, 5)]
+    summed = _net(halting=False, policy_param='sum')
+    assert jnp.allclose(_intermediates(summed, params, x)['logits'], sum(l_n), atol=1e-4)
+    sg = _net(halting=False, policy_param='sum', logit_sum_stop_grad=True)
+    assert jnp.allclose(_intermediates(sg, params, x)['logits'], sum(l_n), atol=1e-4)
+    grad = lambda net: jax.grad(lambda p: jnp.sum(jnp.sin(_intermediates(net, p, x)['logits'])))(params)['core']
+    g_sg, g_last, g_sum = grad(sg), grad(last(4)), grad(summed)
+    flat = lambda g: jnp.concatenate([v.ravel() for v in jax.tree_util.tree_leaves(g)])
+    # sin' at the summed logits weights l_4's gradient: compare against a 'last' model fed the same cotangent
+    cot = jnp.cos(sum(l_n))
+    g_want = jax.grad(lambda p: jnp.sum(cot * _intermediates(last(4), p, x)['logits']))(params)['core']
+    assert jnp.allclose(flat(g_sg), flat(g_want), atol=1e-4)
+    assert not jnp.allclose(flat(g_sum), flat(g_want), atol=1e-4)
+    # without the stop-grad, the gradient flows through every l_k, k <= c
+    g_all = jax.grad(lambda p: jnp.sum(cot * sum(_intermediates(last(T), p, x)['logits'] for T in range(1, 5))))(params)['core']
+    assert jnp.allclose(flat(g_sum), flat(g_all), atol=1e-4)
+
+
+def test_halt_sg_survival():
+    # halt_sg_survival: log p(c|s) keeps its value, but its gradient is that of log h_c alone (no continue terms).
+    x = jax.random.normal(jax.random.PRNGKey(1), (3, 18))
+    net, sg = _net(min_think_iters=1), _net(min_think_iters=1, halt_sg_survival=True)
+    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
+    c = jnp.array([1, 2, 3])
+    lp = lambda n, p: _intermediates(n, p, x, halt_steps=c)['halt_log_prob']
+    assert jnp.allclose(lp(net, params), lp(sg, params), atol=1e-6)
+    g = lambda f: jax.grad(f)(params)['halt_linear']['kernel']
+    g_sg = g(lambda p: jnp.sum(lp(sg, p)))
+    g_hc = g(lambda p: jnp.sum(_intermediates(net, p, x)['halt_step_log_probs'][c - 1, jnp.arange(3), 0]))
+    assert jnp.allclose(g_sg, g_hc, atol=1e-5)
+    assert not jnp.allclose(g(lambda p: jnp.sum(lp(net, p))), g_sg, atol=1e-5)

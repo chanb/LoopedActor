@@ -5,9 +5,9 @@ mean realized think iterations (looped arm), KL-convergence rate and mean episod
 the level's minimum move count (Fogleman moves = slides of any length).
 
 Examples (repo root)
-  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl
+  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/iso_mem_s1/checkpoints/<run>/params_101.pkl
   python rushhour/eval_checkpoint.py --ckpt exp/rushhour/iso_flops_s1/checkpoints/<run>/params_101.pkl --arch multi_block --num_blocks 16
-  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/looped_s1/checkpoints/<run>/params_101.pkl --max_iters 8   # test-time cap
+  python rushhour/eval_checkpoint.py --ckpt exp/rushhour/iso_mem_s1/checkpoints/<run>/params_101.pkl --act_iters 48:u   # test-time cap raise
 """
 import argparse
 import json
@@ -23,19 +23,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.rushhour_env import RushHourEnv, default_config  # noqa: E402
 from models.fprm import FPRMConfig  # noqa: E402
 from utils import running_statistics  # noqa: E402
-from models.fprm_thinker import FPRMThinkerActorValue  # noqa: E402
-from models.fprm_mem_halt import FPRMMemHaltActorValue  # noqa: E402
+from utils.eval_model import add_model_args, build_mem, cap_tag, think_cap  # noqa: E402
 from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', required=True, help='params_<k>.pkl written by ppo.py: (policy params, normalizer params)')
-    ap.add_argument('--arch', default='fprm', choices=['fprm', 'fprm_mem', 'multi_block', 'single_block'])
-    ap.add_argument('--max_iters', type=int, default=16, help='fprm: think-iteration cap at evaluation (training cap 16)')
-    ap.add_argument('--halt_kl', type=float, default=1e-3,
-                    help='halt once KL between consecutive policies <= this (0 = only at a fixed point, < 0 = never, e.g. -1 for iso_* checkpoints)')
-    ap.add_argument('--thought_norm', action='store_true', help='fprm_mem: the checkpoint was trained with --cot_thought_norm')
+    add_model_args(ap)
     ap.add_argument('--num_blocks', type=int, default=16, help='multi_block: number of untied cores')
     ap.add_argument('--d_model', type=int, default=128)
     ap.add_argument('--num_layers', type=int, default=2)
@@ -52,12 +47,8 @@ def main():
     cfg = FPRMConfig(d_model=args.d_model, num_heads=4, num_layers=args.num_layers,
                       mlp_type=args.mlp_type, mlp_round_to=args.mlp_round_to, compute_dtype=args.compute_dtype)
     kw = dict(m=6, n=6, config=cfg, output_dim_1=72, obs_channels=7, action_head='per_cell')
-    if args.arch == 'fprm':
-        mod = FPRMThinkerActorValue(max_think_iters=args.max_iters, min_think_iters=2, halt_criterion='kl',
-                                    halt_kl=args.halt_kl, **kw)
-    elif args.arch == 'fprm_mem':
-        mod = FPRMMemHaltActorValue(halting=False, max_think_iters=args.max_iters,
-                                thought_norm=args.thought_norm, **kw)
+    if args.arch == 'fprm_mem':
+        mod = build_mem(args, **kw)
     else:
         mod = TransformerActorValue(num_blocks=args.num_blocks if args.arch == 'multi_block' else 1,
                                     **kw)
@@ -105,8 +96,8 @@ def main():
         print(f'{args.ckpt} {split:10s} n={n_lv:5d} success {succ.mean():.3f} think {results[split]["think"]:.2f} '
               f'conv {results[split]["converged"]:.3f} len {length.mean():.1f}', flush=True)
     out = args.out or os.path.join(os.path.dirname(args.ckpt), f'eval_{os.path.splitext(os.path.basename(args.ckpt))[0]}'
-                                   + (f'_cap{args.max_iters}' if args.arch in ('fprm', 'fprm_mem') and args.max_iters != 16 else '') + '.json')
-    json.dump(dict(ckpt=args.ckpt, arch=args.arch, max_iters=args.max_iters if args.arch in ('fprm', 'fprm_mem') else None, results=results),
+                                   + cap_tag(args) + '.json')
+    json.dump(dict(ckpt=args.ckpt, arch=args.arch, act_iters=args.act_iters if think_cap(args) else None, results=results),
               open(out, 'w'), indent=1)
     print('wrote', out)
 

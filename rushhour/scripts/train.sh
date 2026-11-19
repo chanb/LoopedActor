@@ -1,19 +1,23 @@
 #!/bin/bash
 # Train one arm of the Rush Hour study.
 #   rushhour/scripts/train.sh <arm> <seed> [out_dir] [device]
-#   arm: looped | iso_flops | iso_param | iso_loop | iso_mem | mem_halt
+#   arm: iso_flops | iso_param | iso_mem | mem_halt
 # Optional environment variables:
-#   MAX_THINK_ITERS=N   think-iteration cap for looped / iso_loop / iso_mem / mem_halt (default 16)
+#   MAX_THINK_ITERS=C   iso_mem / mem_halt: the think cap C of --act_iters=C:u (iso_mem) / C:v (mem_halt) (default 16)
+#   VALUE_ITERS=n       iso_mem / mem_halt: core calls of the separate FPRM critic (default MAX_THINK_ITERS; _vi<n> otherwise)
+#   POLICY_PARAM=last|sum  iso_mem / mem_halt: pi_n from pass n's logits (last, default) or from their running sum (_psum)
+#   LOGIT_SUM_STOP_GRAD=1  POLICY_PARAM=sum: no gradient through the logits of passes before c (_lsg)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
-#   HALT_KL=k           looped: halt once the policy KL between passes < k (default 1e-3)
-#   HALT_ENTROPY_COST=c  mem_halt: entropy bonus on the think-time distribution p(c|s) (default 0)
-#   HALT_KL=k           mem_halt: initial halting threshold, h_n = 1/2 at KL_(n+1) = k (run names get _hk1_hhsig_kl<k>)
-#   HALT_HEAD_GRAD=0|1  mem_halt: let the halting loss backpropagate into the trunk through the halting head (default 0)
+#   HALT_CRITERION=sigmoid|kl|l2  mem_halt: learned stochastic halting head (sigmoid, default), or halt at pass n once
+#                       KL(pi_(n+1) || pi_n) (kl) / ||rms_norm(h_(n+1)) - rms_norm(h_n)|| (l2) < HALT_THRESHOLD (_hkl / _hl2)
+#   HALT_THRESHOLD=t    mem_halt, HALT_CRITERION=kl|l2: the threshold (default 1e-3; _ht<t>)
+#   HALT_SG_SURVIVAL=1  mem_halt, sigmoid: log p(c|s) without gradient through the continue terms before c (_hsgs)
+#   HALT_ENTROPY_COST=c  mem_halt, sigmoid: entropy bonus on the think-time distribution p(c|s) (default 0)
+#   mem_halt's halting head is linear: h_n = sigmoid(w . rms_norm(h_n) + b), zero init (run names get _hlin)
+#   HALT_HEAD_GRAD=0|1  mem_halt, sigmoid: let the halting loss backpropagate into the trunk through the halting head (default 0)
 #   HALT_KL_REVERSE=0|1  mem_halt: halting KL_i = KL(pi_{i-1} || pi_i), under the acting policy (default 0)
-#                       (mem_halt always halts with lookahead: on KL(pi_{c+1} || pi_c), acting with pi_c; run names get _look)
-#   MIN_THINK_ITERS=n   halting arms: earliest pass that may halt, >= 1 (default 2; mem_halt: 1 lets pass 1 halt on
-#                       KL(pi_1 || uniform))
+#   MIN_THINK_ITERS=n   mem_halt: earliest pass that may halt, >= 1 (default 2)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
@@ -35,51 +39,53 @@
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
 # WANDB_PROJECT=name sets the wandb project (default looped_actor; not part of the run directory name).
-# Non-default values are appended to the run directory name (e.g. looped_it8_gc0.99_s0).
+# Non-default values are appended to the run directory name (e.g. iso_mem_it8_gc0.99_s0).
 # All arms: PPO on the easy_train bank (Fogleman puzzles with <= 15 moves), in-training evaluation on easy_valid
 # (eval/test_* metrics), 1024 envs x 64 steps per rollout, 64 minibatches x 4 epochs, 100M env steps, 2-layer d=128
 # core, plane tokenizer (7 planes per cell), per-cell action head (2 logits per cell = 72 actions), global grad-norm
 # clip 1.0, potential-based reward shaping (weight 1.0), loss on the final readout for every arm.
-#   looped    : weight-tied core, cap 16 think iterations, policy-KL halting (1e-3)
 #   iso_flops : 16 untied cores stacked (16x the parameters)
 #   iso_param : one core applied once
-#   iso_loop  : weight-tied core, always runs the full 16 think iterations (no halting)
-#   iso_mem   : fprm's looped board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
-#               attend to each other and to earlier thoughts' K/V), always runs the full 16 passes (no halting)
-#   mem_halt  : iso_mem with stochastic learned halting: a yes/no halt at every pass,
-#               h_n = sigmoid(beta - alpha log KL_(n+1)); the PPO ratio uses log p(c|s) + log pi_c(a|s); value from the last pass
-#               (models/fprm_mem_halt.py)
+#   iso_mem   : looped FPRM board plus a SEP token and a memory of thought tokens (cells, SEP and the newest thought
+#               attend to each other and to earlier thoughts' K/V), always acts with pass 16 (--act_iters=16:u); the
+#               critic is a separate FPRM run for VALUE_ITERS core calls (models/fprm_mem_halt.py)
+#   mem_halt  : iso_mem with a variable budget (--act_iters=16:v), halting by HALT_CRITERION
 # Requires data/rushhour/{easy_train,easy_valid,easy_test}.npz (python data_scripts/build_rushhour_banks.py --src rush.txt).
 # Usage:
-# MAX_THINK_ITERS=4 rushhour/scripts/train.sh looped 1 exp/rushhour 2 &
-# MAX_THINK_ITERS=4 DISCOUNT_COMPUTE=0.99 rushhour/scripts/train.sh looped 1 exp/rushhour 3 &
+# MAX_THINK_ITERS=4 rushhour/scripts/train.sh iso_mem 1 exp/rushhour 2 &
+# MAX_THINK_ITERS=4 DISCOUNT_COMPUTE=0.99 rushhour/scripts/train.sh iso_mem 1 exp/rushhour 3 &
 #
 set -euo pipefail
 ARM="${1:?arm}"; SEED="${2:?seed}"; OUT="${3:-exp/rushhour}"; DEVICE="${4:-0}";
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
-MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
+MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
-HALT_KL="${HALT_KL:-1e-3}"
+HALT_CRITERION="${HALT_CRITERION:-sigmoid}"; HALT_THRESHOLD="${HALT_THRESHOLD:-1e-3}"; HALT_SG_SURVIVAL="${HALT_SG_SURVIVAL:-0}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 RUN="$ARM"
 case "$ARM" in
-  looped)    ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl="$HALT_KL")
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
   iso_flops) ARM_FLAGS=(--architecture=multi_block --num_blocks="$NUM_BLOCKS")
              [[ "$NUM_BLOCKS" != 16 ]] && RUN+="_b${NUM_BLOCKS}" ;;
   iso_param) ARM_FLAGS=(--architecture=single_block) ;;
-  iso_loop)  ARM_FLAGS=(--architecture=fprm --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
+  iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --act_iters="${MAX_THINK_ITERS}:u")
              [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
-  iso_mem)   ARM_FLAGS=(--architecture=fprm_mem --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl --halt_kl=-1.0)
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
-  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem_halt --max_think_iters="$MAX_THINK_ITERS" --halt_criterion=kl)
-             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}" ;;
+  mem_halt)  ARM_FLAGS=(--architecture=fprm_mem --act_iters="${MAX_THINK_ITERS}:v" --halt_criterion="$HALT_CRITERION")
+             [[ "$MAX_THINK_ITERS" != 16 ]] && RUN+="_it${MAX_THINK_ITERS}"
+             case "$HALT_CRITERION" in
+               sigmoid) ;;
+               kl|l2) ARM_FLAGS+=(--halt_threshold="$HALT_THRESHOLD"); RUN+="_h${HALT_CRITERION}_ht${HALT_THRESHOLD}" ;;
+               *) echo "HALT_CRITERION must be sigmoid, kl or l2, got $HALT_CRITERION"; exit 1 ;;
+             esac ;;
   *) echo "unknown arm $ARM"; exit 1 ;;
 esac
-[[ "$ARM" == looped && "$HALT_KL" != 1e-3 ]] && RUN+="_hkl${HALT_KL}"
 [[ "$MIN_THINK_ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "MIN_THINK_ITERS must be an integer >= 1, got $MIN_THINK_ITERS"; exit 1; }
 [[ "$MIN_THINK_ITERS" != 2 ]] && { ARM_FLAGS+=(--min_think_iters="$MIN_THINK_ITERS"); RUN+="_minit${MIN_THINK_ITERS}"; }
-if [[ "$ARM" == mem_halt ]]; then
+if [[ "$ARM" == mem_halt && "$HALT_CRITERION" == sigmoid ]]; then
+  case "$HALT_SG_SURVIVAL" in
+    0) ;;
+    1) ARM_FLAGS+=(--halt_sg_survival); RUN+="_hsgs" ;;
+    *) echo "HALT_SG_SURVIVAL must be 0 or 1, got $HALT_SG_SURVIVAL"; exit 1 ;;
+  esac
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c + 0 == c && c >= 0) }' || { echo "HALT_ENTROPY_COST must be >= 0, got $HALT_ENTROPY_COST"; exit 1; }
   awk -v c="$HALT_ENTROPY_COST" 'BEGIN { exit !(c > 0) }' && { ARM_FLAGS+=(--halt_entropy_cost="$HALT_ENTROPY_COST"); RUN+="_hent${HALT_ENTROPY_COST}"; }
   case "$HALT_HEAD_GRAD" in
@@ -87,14 +93,30 @@ if [[ "$ARM" == mem_halt ]]; then
     1) ARM_FLAGS+=(--halt_head_grad); RUN+="_hgrad" ;;
     *) echo "HALT_HEAD_GRAD must be 0 or 1, got $HALT_HEAD_GRAD"; exit 1 ;;
   esac
-  ARM_FLAGS+=(--halt_kl="$HALT_KL"); RUN+="_hk1_hhsig_kl${HALT_KL}"  # sigmoid(beta - alpha log KL), lookahead
+  RUN+="_hlin"  # linear halting head
+fi
+if [[ "$ARM" == mem_halt ]]; then
   case "$HALT_KL_REVERSE" in
     0) ;;
     1) ARM_FLAGS+=(--halt_kl_reverse); RUN+="_rkl" ;;
     *) echo "HALT_KL_REVERSE must be 0 or 1, got $HALT_KL_REVERSE"; exit 1 ;;
   esac
 fi  # other arms ignore HALT_ENTROPY_COST / HALT_HEAD_GRAD / HALT_KL_REVERSE (shared study settings)
-[[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] && { ARM_FLAGS+=(--readout_token=thought); RUN+="_rthought"; }  # SEP token in every pass since 25 Oct
+if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then
+  ARM_FLAGS+=(--readout_token=thought); RUN+="_rthought"  # SEP token in every pass since 25 Oct
+  [[ "$VALUE_ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "VALUE_ITERS must be an integer >= 1, got $VALUE_ITERS"; exit 1; }
+  ARM_FLAGS+=(--value_iters="$VALUE_ITERS"); [[ "$VALUE_ITERS" != "$MAX_THINK_ITERS" ]] && RUN+="_vi${VALUE_ITERS}"
+  case "$POLICY_PARAM" in
+    last) ;;
+    sum) ARM_FLAGS+=(--policy_param=sum); RUN+="_psum"
+         case "$LOGIT_SUM_STOP_GRAD" in
+           0) ;;
+           1) ARM_FLAGS+=(--logit_sum_stop_grad); RUN+="_lsg" ;;
+           *) echo "LOGIT_SUM_STOP_GRAD must be 0 or 1, got $LOGIT_SUM_STOP_GRAD"; exit 1 ;;
+         esac ;;
+    *) echo "POLICY_PARAM must be last or sum, got $POLICY_PARAM"; exit 1 ;;
+  esac
+fi
 case "$THOUGHT_NORM" in
   0) ;;
   1) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] \
