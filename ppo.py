@@ -32,6 +32,7 @@ from flax.training.train_state import TrainState
 
 import utils.running_statistics as running_statistics
 from utils.wrapper import wrap_env
+from utils.weight_stats import singular_value_stats
 from utils.evaluation import Evaluator
 from envs.utils import make_env
 from models.fprm import FPRMConfig
@@ -1020,6 +1021,7 @@ def main(args: Args):
                 'training/learning_time_fraction': learn_step_time / training_step_time,
                 'training/env_steps': training_state.env_steps,
                 **{name if '/' in name else f'training/{name}': value for name, value in metrics.items()},  # 'a/b': own section
+                **singular_value_stats(training_state.params),
             }
 
             eval_params = {'policy': training_state.params, 'normalizer': obs_normalizer(training_state)}
