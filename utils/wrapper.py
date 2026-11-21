@@ -105,13 +105,14 @@ class AutoResetWrapper(Wrapper):
         # Otherwise, keep the next_state
         return jax.lax.cond(
             next_state.done.astype(bool),
-            lambda _: self.env.reset(step_rng).replace(
-                # We preserve the terminal reward and done signal
-                # so the Learner/Logger sees the final outcome
+            lambda _: (lambda r: r.replace(
+                # We preserve the terminal reward and done signal (and the time-limit truncation flag, which GAE and
+                # steps_to_go need) so the Learner/Logger sees the final outcome
                 reward=next_state.reward,
                 done=next_state.done,
                 metrics=next_state.metrics,
-            ),
+                info={**r.info, **{k: next_state.info[k] for k in ('truncation',) if k in next_state.info}},
+            ))(self.env.reset(step_rng)),
             lambda _: next_state,
             operand=None,
         )
