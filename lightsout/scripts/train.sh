@@ -14,7 +14,9 @@
 #                       = DISCOUNT_ACT gives the RAMDP return)
 #   MAX_THINK_ITERS=C   iso_mem / mem_halt: the think cap C of --act_iters=C:u (iso_mem) / C:v (mem_halt) (default 16)
 #   VALUE_ITERS=n       iso_mem / mem_halt: core calls of the separate FPRM critic (default MAX_THINK_ITERS; _vi<n> otherwise)
-#   POLICY_PARAM=last|sum  iso_mem / mem_halt: pi_n from pass n's logits (last, default) or from their running sum (_psum)
+#   POLICY_PARAM=last|sum|mix  iso_mem / mem_halt: pi_n from pass n's logits (last, default) or from their running sum (_psum);
+#                          mix (mem_halt sigmoid only, _pmix): act with sum_(n<=c) w_n pi_n, w = the halt distribution cut at c
+#   MIX_WEIGHT_STOP_GRAD=1 POLICY_PARAM=mix: no gradient into the halting head through the mixture weights (_mwsg)
 #   LOGIT_SUM_STOP_GRAD=1  POLICY_PARAM=sum: no gradient through the logits of passes before c (_lsg)
 #   NUM_BLOCKS=N        number of untied cores for iso_flops (default 16)
 #   THOUGHT_NORM=1      iso_mem / mem_halt: RMS-normalize each thought before feeding it back (default 0)
@@ -71,7 +73,7 @@ DEFAULT_EPISODE_LENGTH=$(awk -v c="$DEFAULT_EVAL_EPISODE_LENGTH" -v t="$DIFFICUL
 EPISODE_LENGTH="${EPISODE_LENGTH:-$DEFAULT_EPISODE_LENGTH}"
 EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$DEFAULT_EVAL_EPISODE_LENGTH}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
-MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
+MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; MIX_WEIGHT_STOP_GRAD="${MIX_WEIGHT_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
 MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_CRITERION="${HALT_CRITERION:-sigmoid}"; HALT_THRESHOLD="${HALT_THRESHOLD:-1e-3}"; HALT_SG_SURVIVAL="${HALT_SG_SURVIVAL:-0}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
@@ -127,7 +129,13 @@ if [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]]; then
            1) ARM_FLAGS+=(--logit_sum_stop_grad); RUN+="_lsg" ;;
            *) echo "LOGIT_SUM_STOP_GRAD must be 0 or 1, got $LOGIT_SUM_STOP_GRAD"; exit 1 ;;
          esac ;;
-    *) echo "POLICY_PARAM must be last or sum, got $POLICY_PARAM"; exit 1 ;;
+    mix) ARM_FLAGS+=(--policy_param=mix); RUN+="_pmix"
+         case "$MIX_WEIGHT_STOP_GRAD" in
+           0) ;;
+           1) ARM_FLAGS+=(--mix_weight_stop_grad); RUN+="_mwsg" ;;
+           *) echo "MIX_WEIGHT_STOP_GRAD must be 0 or 1, got $MIX_WEIGHT_STOP_GRAD"; exit 1 ;;
+         esac ;;
+    *) echo "POLICY_PARAM must be last, sum or mix, got $POLICY_PARAM"; exit 1 ;;
   esac
 fi
 case "$THOUGHT_NORM" in

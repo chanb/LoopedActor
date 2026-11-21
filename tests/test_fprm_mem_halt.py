@@ -384,3 +384,30 @@ def test_halt_sg_survival():
     g_hc = g(lambda p: jnp.sum(_intermediates(net, p, x)['halt_step_log_probs'][c - 1, jnp.arange(3), 0]))
     assert jnp.allclose(g_sg, g_hc, atol=1e-5)
     assert not jnp.allclose(g(lambda p: jnp.sum(lp(net, p))), g_sg, atol=1e-5)
+
+
+@pytest.mark.parametrize('min_iters', [1, 2])
+def test_mixture_policy(min_iters):
+    # policy_param='mix': pi(a | s, c) = sum_(n<=c) w_n pi_n(a | s), with w_n = p(halt at n) for n < c and
+    # w_c = P(no halt before c) (the halt distribution cut at c); mix_weight_stop_grad: same values, no gradient into
+    # the halting head through w.
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, 18))
+    net = _net(min_think_iters=min_iters, policy_param='mix')
+    params = _random_head(net.init(jax.random.PRNGKey(0), x)['params'])
+    c = jnp.array([1, 2, 3, 4]) if min_iters == 1 else jnp.array([2, 3, 4, 4])
+    inter = _intermediates(net, params, x, halt_steps=c)
+    pi_n = jnp.exp(inter['policy_log_probs_t'])  # [T, B, A]: the per-pass policies
+    h = inter['halt_step_probs'][..., 0]           # [T, B]: h_n
+    want = []
+    for b in range(4):
+        cb, surv, mix = int(c[b]), 1.0, 0.0
+        for n in range(min_iters, cb):  # decision passes before c
+            mix, surv = mix + surv * h[n - 1, b] * pi_n[n - 1, b], surv * (1 - h[n - 1, b])
+        want.append(mix + surv * pi_n[cb - 1, b])
+    got = jnp.exp(jax.nn.log_softmax(inter['logits']))
+    assert jnp.allclose(got, jnp.stack(want), atol=1e-5)
+    sg = _net(min_think_iters=min_iters, policy_param='mix', mix_weight_stop_grad=True)
+    assert jnp.allclose(jnp.exp(jax.nn.log_softmax(_intermediates(sg, params, x, halt_steps=c)['logits'])), got, atol=1e-6)
+    g = lambda n: jax.grad(lambda p: jnp.sum(jnp.sin(_intermediates(n, p, x, halt_steps=c)['logits'])))(params)['halt_linear']
+    assert float(jnp.abs(g(net)['kernel']).sum()) > 0
+    assert float(jnp.abs(g(sg)['kernel']).sum()) == 0

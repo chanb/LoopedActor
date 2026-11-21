@@ -34,7 +34,10 @@ Think budget (ppo.py --act_iters=C:u|v sets max_think_iters = T = C and `halting
 
 Policy parameterization (`policy_param`): 'last' decodes pi_n from pass n's logits l_n; 'sum' (PonderNet style)
 decodes it from the accumulated logits sum_{k<=n} l_k. `logit_sum_stop_grad` stops the gradient through l_k, k < n,
-so only the acting pass's l_c is trained. The KL criterion compares these acting policies.
+so only the acting pass's l_c is trained. The KL criterion compares these acting policies. 'mix' ('sigmoid' halting
+only) acts with the mixture pi(a | s, c) = sum_{n<=c} w_n pi_n(a | s) of the 'last' policies, w_n = p(halt at n) for
+n < c and w_c = P(no halt before c): the halt distribution cut at the sampled c, never looking past it.
+`mix_weight_stop_grad` stops the actor loss's gradient into the halting head through w (log p(c) still trains it).
 
 Each pass runs [cells, SEP, thought]. SEP is a learned input embedding whose latent is carried between passes like the
 cells' (attending to the cells, the current thought and the thought memory); the thought's per-layer K/V is what the
@@ -241,6 +244,15 @@ def decision_log_probs(lp, c, min_iters, sg_survival=False):
     return jnp.where(dec & (n < c), cont, jnp.where(dec & (n == c), lp[..., 0], 0.0))
 
 
+def mix_log_weights(lp, c, min_iters):
+    """log w_n [T, B] of policy_param='mix': log p(halt at n) for n < c, log P(no halt before c) at n = c, _NEG after c."""
+    T = lp.shape[0]
+    n, dec = _decision_passes(T, min_iters)
+    lp_cont = jnp.where(dec, lp[..., 1], 0.0)
+    before = jnp.cumsum(jnp.concatenate([jnp.zeros_like(lp_cont[:1]), lp_cont[:-1]]), axis=0)  # log P(no halt before n)
+    return jnp.where(n < c, c_log_probs(lp, min_iters), jnp.where(n == c, before, _NEG))
+
+
 def decision_mask(c, T, min_iters):
     """The decision passes of the path ending at c as a bitmask [B] (bit n - 1 = a decision at pass n)."""
     n, dec = _decision_passes(T, min_iters)
@@ -273,6 +285,7 @@ class FPRMMemHaltActorValue(nn.Module):
     stable_softmax: bool = False   # collapse-free log-softmax for the policy and the steps head (see the module docstring)
     policy_param: str = 'last'     # 'last': pi_n from pass n's logits l_n | 'sum': pi_n from sum_(k<=n) l_k (PonderNet style)
     logit_sum_stop_grad: bool = False  # policy_param='sum': no gradient through l_k, k < n (only l_n of the acting pass)
+    mix_weight_stop_grad: bool = False  # policy_param='mix': no gradient into the halting head through the weights w_n
     value_iters: int = 8           # the critic's fixed number of FPRM core calls
     readout_token: str = 'thought'  # readouts from the newest thought ('thought') or the carried SEP token ('sep')
     output_dim_1: int = 9   # action logits (= m * n buttons)
@@ -294,7 +307,9 @@ class FPRMMemHaltActorValue(nn.Module):
 
         assert self.max_think_iters >= 1 and self.value_iters >= 1, (self.max_think_iters, self.value_iters)
         assert self.halt_criterion in ('kl', 'l2', 'sigmoid'), self.halt_criterion
-        assert self.policy_param in ('last', 'sum'), self.policy_param
+        assert self.policy_param in ('last', 'sum', 'mix'), self.policy_param
+        assert self.policy_param != 'mix' or (self.halting and self.halt_criterion == 'sigmoid'), \
+            "policy_param='mix' needs the sigmoid halting head (act_iters=C:v, halt_criterion='sigmoid')"
         assert self.readout_token in ('thought', 'sep'), self.readout_token
         if self.halting and self.halt_criterion == 'sigmoid':
             self.halt_linear = nn.Dense(1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)
@@ -474,13 +489,18 @@ class FPRMMemHaltActorValue(nn.Module):
         else:
             c = None
         if sigmoid_head:
-            c = self._halt(head_t, sig_next, halt_key, c, B, T, input_shape[:-1])
+            c, lp_halt_t = self._halt(head_t, sig_next, halt_key, c, B, T, input_shape[:-1])
         if self.halting:
             self.sow('intermediates', 'policy_log_probs_t',
                      (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t))
         idx = c - 1
         sig_c = jnp.take_along_axis(sig_next.T, idx[:, None], axis=-1)[:, 0]
         logits = jnp.take_along_axis(logits_t, idx[None, :, None], axis=0)[0]
+        if self.policy_param == 'mix':  # log sum_(n<=c) w_n pi_n: normalized log-probs, used as the logits
+            log_w = mix_log_weights(lp_halt_t, c, min_iters)
+            log_w = jax.lax.stop_gradient(log_w) if self.mix_weight_stop_grad else log_w
+            log_pi = (stable_softmax.log_softmax if self.stable_softmax else jax.nn.log_softmax)(logits_t.astype(jnp.float32))
+            logits = jax.nn.logsumexp(log_w[..., None] + log_pi, axis=0)
         nonfinite = jnp.take_along_axis(nonfinite_t.T, idx[:, None], axis=-1)[:, 0]
 
         logits = logits.reshape(input_shape[:-1] + (-1,))
@@ -521,4 +541,4 @@ class FPRMMemHaltActorValue(nn.Module):
         self.sow('intermediates', 'halt_expected_c', jnp.sum(p_c * jnp.arange(1, T + 1)[:, None], axis=0).reshape(batch_shape))
         self.sow('intermediates', 'halt_prob', jnp.exp(lp_t[..., 0]))
         self.sow('intermediates', 'halt_step_log_probs', lp_t)
-        return c
+        return c, lp_t

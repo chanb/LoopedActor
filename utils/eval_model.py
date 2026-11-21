@@ -12,7 +12,7 @@ def add_model_args(ap):
                     help="fprm_mem, C:v: the checkpoint's --halt_criterion")
     ap.add_argument('--halt_threshold', type=float, default=1e-3, help="fprm_mem, C:v, kl / l2: the threshold")
     ap.add_argument('--halt_kl_reverse', action='store_true', help='fprm_mem: the checkpoint was trained with --halt_kl_reverse')
-    ap.add_argument('--policy_param', default='last', choices=['last', 'sum'], help="fprm_mem: the checkpoint's --policy_param")
+    ap.add_argument('--policy_param', default='last', choices=['last', 'sum', 'mix'], help="fprm_mem: the checkpoint's --policy_param")
     ap.add_argument('--readout_token', default='thought', choices=['thought', 'sep'], help="fprm_mem: the checkpoint's --readout_token")
     ap.add_argument('--stable_softmax', action='store_true', help='fprm_mem: the checkpoint was trained with --stable_softmax')
     ap.add_argument('--thought_norm', action='store_true', help='fprm_mem: the checkpoint was trained with --cot_thought_norm')

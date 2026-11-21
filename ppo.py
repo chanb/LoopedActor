@@ -155,8 +155,9 @@ class Args:
     halt_kl_reverse: bool = False         # KL_n = KL(pi_(n-1) || pi_n), the expectation under the acting policy
     stable_kl: bool = False               # KL from the logit difference, no fp32 rounding floor (models/stable_softmax.py)
     stable_softmax: bool = False          # fprm_mem: collapse-free log-softmax for the action policy (and the halting head)
-    policy_param: str = 'last'            # fprm_mem: 'last' = pi_n from pass n's logits l_n | 'sum' = PonderNet style, pi_n from sum_(k<=n) l_k
+    policy_param: str = 'last'            # fprm_mem: 'last' = pi_n from pass n's logits l_n | 'sum' = PonderNet style, pi_n from sum_(k<=n) l_k | 'mix' (see mix_weight_stop_grad)
     logit_sum_stop_grad: bool = False     # policy_param='sum': no gradient through l_k for k < c (only the halting pass's l_c)
+    mix_weight_stop_grad: bool = False    # policy_param='mix' (sigmoid halting: act with sum_(n<=c) w_n pi_n): no gradient into the halting head through w_n
     readout_token: str = 'thought'        # fprm_mem: readouts from the newest thought | 'sep' (the carried SEP token after the cells, present either way)
     halt_entropy_cost: float = 0.0        # 'sigmoid': entropy bonus on p(c|s) (the action entropy keeps entropy_cost)
     halt_objective: str = 'pg'            # 'sigmoid' halting: 'pg' = log p(c|s) inside PPO's ratio; 'next' = the softmax over k
@@ -459,6 +460,8 @@ def main(args: Args):
         'halt_update_period needs act_iters=C:v with halt_criterion=sigmoid, no freeze_except_halt'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
+    assert args.policy_param != 'mix' or (stochastic_halt and args.halt_objective == 'pg'), \
+        "policy_param='mix' needs act_iters=C:v with halt_criterion=sigmoid and halt_objective='pg'"
 
     # Initialize the actor-critic
     fprm_config = FPRMConfig(
@@ -489,6 +492,7 @@ def main(args: Args):
             stable_softmax=args.stable_softmax,
             policy_param=args.policy_param,
             logit_sum_stop_grad=args.logit_sum_stop_grad,
+            mix_weight_stop_grad=args.mix_weight_stop_grad,
             value_iters=args.value_iters,
             readout_token=args.readout_token,
             output_dim_1=action_size,
