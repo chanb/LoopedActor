@@ -16,6 +16,8 @@ Observation: the current grid (m*n values in {0, 1}, row-major); the goal is the
 Actions (per-cell head): a = the cell to press, m*n actions.
 Reward (sparse, as in Stoix): 1 when the grid matches the goal (episode ends), 0 otherwise.
 Episode length set in make_env / the config (Stoix default 6 for 3x3).
+With `optimal_horizon`, an unsolved episode also terminates (done, reward 0) after `dist` steps, the optimal number of
+presses when the press matrix is invertible over GF(2) (3x3, 5x4, 4x5; not 4x4, 5x5): only optimal solutions are rewarded.
 """
 
 import jax
@@ -31,7 +33,8 @@ from envs.utils import State
 class LightsOutData:
     grid: jax.Array  # [m*n] float32 in {0, 1}
     goal: jax.Array  # [m*n] float32 in {0, 1}
-    dist: jax.Array  # () int32 number of presses used to generate the goal (diagnostic only)
+    dist: jax.Array  # () int32 number of presses used to generate the goal (= the optimal number, see optimal_horizon)
+    t: jax.Array     # () int32 steps taken
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -43,6 +46,7 @@ def default_config() -> config_dict.ConfigDict:
         difficulty_threshold=0.5,  # train dist in [1, threshold), eval dist in [threshold, m*n)
         step_penalty=0.0,          # 0 = sparse reward (Stoix)
         solve_reward=1.0,
+        optimal_horizon=False,     # terminate unsolved episodes after dist steps (needs an invertible press matrix)
     )
 
 
@@ -57,6 +61,20 @@ def press_matrix(m, n):
     return jnp.asarray(mat)
 
 
+def gf2_rank(mat):
+    a, r = np.array(mat, np.int64) % 2, 0
+    for c in range(a.shape[1]):
+        p = np.flatnonzero(a[r:, c])
+        if p.size == 0:
+            continue
+        a[[r, r + p[0]]] = a[[r + p[0], r]]
+        a[(a[:, c] == 1) & (np.arange(len(a)) != r)] ^= a[r]
+        r += 1
+        if r == len(a):
+            break
+    return r
+
+
 class LightsOutEnv:
     def __init__(self, config: config_dict.ConfigDict = default_config()):
         self._config = config
@@ -67,6 +85,8 @@ class LightsOutEnv:
         self.threshold = int(self.grid_size * config.difficulty_threshold)
         assert 1 < self.threshold < self.grid_size, (self.threshold, self.grid_size)
         self.press = press_matrix(self.m, self.n)
+        assert not config.get('optimal_horizon', False) or gf2_rank(self.press) == self.grid_size, \
+            f'optimal_horizon needs an invertible press matrix (dist = the optimal presses), {self.m}x{self.n} has a null space'
 
     @property
     def action_size(self): return self.grid_size
@@ -93,7 +113,7 @@ class LightsOutEnv:
         pressed = jnp.zeros(self.grid_size, jnp.int32).at[order].set(jnp.arange(self.grid_size) < dist)
         goal = (initial + pressed @ self.press) % 2
         data = LightsOutData(grid=initial.astype(jnp.float32), goal=goal.astype(jnp.float32),
-                             dist=jnp.asarray(dist, jnp.int32))
+                             dist=jnp.asarray(dist, jnp.int32), t=jnp.array(0, jnp.int32))
         return self._make_state(rng, data)
 
     def reset(self, rng: jax.Array) -> State:
@@ -110,9 +130,10 @@ class LightsOutEnv:
         success = jnp.all(new_grid == d.goal).astype(jnp.float32)
         cfg = self._config
         reward = cfg.solve_reward * success - cfg.step_penalty
-        new_data = LightsOutData(grid=new_grid, goal=d.goal, dist=d.dist)
+        new_data = LightsOutData(grid=new_grid, goal=d.goal, dist=d.dist, t=d.t + 1)
+        done = jnp.maximum(success, (new_data.t >= d.dist).astype(jnp.float32)) if cfg.get('optimal_horizon', False) else success
         return State(
-            data=new_data, obs=new_grid, reward=reward, done=success,
+            data=new_data, obs=new_grid, reward=reward, done=done,
             metrics={**state.metrics, 'success': success, 'reward': reward},
             info={**state.info, 'target_goal': d.goal},
         )

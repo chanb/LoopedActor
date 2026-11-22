@@ -72,6 +72,7 @@ class Args:
     rushhour_shaping_weight: float = 1.0  # rushhour-*: potential-based shaping weight (0 = sparse solve reward only)
     lightsout_episode_length: int = 6     # lightsout-*: steps per episode (training resets and eval/train_* episodes)
     lightsout_eval_episode_length: int = 0  # lightsout-*: steps per held-out (eval/test_*) episode; 0 = lightsout_episode_length
+    lightsout_optimal_horizon: bool = False  # lightsout-*: an unsolved episode terminates (reward 0) after the optimal number of presses
     lightsout_difficulty_threshold: float = 0.5  # lightsout-*: train goals need < int(m*n*this) presses, eval goals >= it
     minatar_episode_length: int = 1000    # minatar-*: steps per episode (time-out = truncation)
     slidingpuzzle_episode_length: int = 40        # slidingpuzzle-*: steps per episode (training resets and eval/train_* episodes)
@@ -79,6 +80,7 @@ class Args:
     slidingpuzzle_num_random_moves: int = 10      # slidingpuzzle-*: training scramble length (random walk of the blank)
     slidingpuzzle_min_random_moves: int = 0       # slidingpuzzle-*: > 0 draws each training scramble length uniformly from
                                                   # [this, num_random_moves] (eval_reset stays fixed; 0 = fixed length)
+    slidingpuzzle_optimal_horizon: bool = False  # slidingpuzzle-*-<train>-<eval>: an unsolved episode terminates (reward 0) after the board's optimal length
     slidingpuzzle_random_moves_zipf: float = 0.0  # slidingpuzzle-*, min_random_moves > 0: p(length k) ∝ k^-this (0 = uniform, < 0 favours long)
     slidingpuzzle_eval_num_random_moves: int = 0  # slidingpuzzle-*: evaluation scramble length (0 = same as training)
 

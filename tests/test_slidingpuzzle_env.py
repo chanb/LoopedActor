@@ -81,7 +81,7 @@ def test_bank_resets_3x3():
     from envs.slidingpuzzle_env import load_bank
     cls, cfg = make_env(SimpleNamespace(env_id='slidingpuzzle-3x3-train-test'))
     env = cls(cfg)
-    assert env.train_bank['puzzle'].shape[0] == 180457 and env.eval_bank['puzzle'].shape[0] == 983
+    assert env.train_bank['puzzle'].shape[0] == 180456 and env.eval_bank['puzzle'].shape[0] == 983  # 180457 boards less the solved one
     for reset, bank in (('reset', env.train_bank), ('eval_reset', env.eval_bank)):
         st = jax.vmap(getattr(env, reset))(jax.random.split(jax.random.PRNGKey(0), 256))
         boards = {tuple(b) for b in np.asarray(bank['puzzle']).reshape(len(bank['puzzle']), -1)}
@@ -92,12 +92,12 @@ def test_bank_resets_3x3():
 
 
 def test_bank_train_resets_uniform_in_length():
-    # Training resets draw the optimal length d uniformly, then a board of that length; eval resets stay uniform over boards.
+    # Training resets draw the optimal length d uniformly from 1..28 (the solved board is dropped), then a board of that length.
     from types import SimpleNamespace
     from envs.utils import make_env
     cls, cfg = make_env(SimpleNamespace(env_id='slidingpuzzle-3x3-train-test'))
     env = cls(cfg)
     moves = {p.tobytes(): int(m) for p, m in zip(np.asarray(env.train_bank['puzzle'], np.int8), np.asarray(env.train_bank['moves']))}
-    p = np.asarray(jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(0), 29 * 400)).data.puzzle, np.int8)
-    freq = np.bincount([moves[b.tobytes()] for b in p], minlength=29) / len(p)
-    assert np.all(np.abs(freq - 1 / 29) < 0.01), freq  # d = 0..28 each ~3.4% (binomial sd ~0.17%)
+    p = np.asarray(jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(0), 28 * 400)).data.puzzle, np.int8)
+    freq = np.bincount([moves[b.tobytes()] for b in p], minlength=29)[1:] / len(p)
+    assert np.all(np.abs(freq - 1 / 28) < 0.01), freq  # d = 1..28 each ~3.6% (binomial sd ~0.18%)

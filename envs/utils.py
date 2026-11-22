@@ -44,6 +44,7 @@ def make_env(args):
         config.m, config.n = int(lo.group(1)), int(lo.group(2))
         config.episode_length = getattr(args, 'lightsout_episode_length', 6)
         config.difficulty_threshold = getattr(args, 'lightsout_difficulty_threshold', 0.5)
+        config.optimal_horizon = getattr(args, 'lightsout_optimal_horizon', False)
         # Held-out (eval_reset) episodes: 0 = the training episode length.
         config.eval_episode_length = getattr(args, 'lightsout_eval_episode_length', 0) or config.episode_length
         return LightsOutEnv, config
@@ -67,6 +68,7 @@ def make_env(args):
         config.num_random_moves = getattr(args, 'slidingpuzzle_num_random_moves', 10)
         config.min_random_moves = getattr(args, 'slidingpuzzle_min_random_moves', 0)
         config.random_moves_zipf = getattr(args, 'slidingpuzzle_random_moves_zipf', 0.0)
+        config.optimal_horizon = getattr(args, 'slidingpuzzle_optimal_horizon', False)
         assert config.min_random_moves <= config.num_random_moves, (config.min_random_moves, config.num_random_moves)
         eval_moves = getattr(args, 'slidingpuzzle_eval_num_random_moves', 0)
         config.eval_num_random_moves = eval_moves if eval_moves > 0 else config.num_random_moves
