@@ -105,6 +105,7 @@ class Args:
     # stabilization (all off by default)
     max_grad_norm: float = 0.0            # 0 = no gradient clipping
     weight_decay: float = 0.0             # decoupled weight decay (AdamW) on every param except the halting head's; 0 = Adam
+    optimizer: str = 'adam'               # 'adam' | 'muon': Muon on the 2-D kernels under core/ (actor and critic), Adam(W) on the rest
     target_kl: float = 0.0                # 0 = no KL early stop; else skip remaining minibatch updates in a rollout once approx_kl_action
                                           # (KL of the action policy pi_c(a|s) only, not the think time c) exceeds this
     anneal_lr: bool = False               # linearly decay lr to 0 over training
@@ -348,6 +349,14 @@ def gated(tx, active):
     return optax.GradientTransformation(init, update)
 
 
+def muon_labels(params):
+    """'muon' for the 2-D kernels under a 'core' (the looped blocks of the actor and the critic), 'adam' elsewhere."""
+    def label(path, x):
+        keys = [getattr(k, 'key', None) for k in path]
+        return 'muon' if 'core' in keys and keys[-1] == 'kernel' and x.ndim == 2 else 'adam'
+    return jax.tree_util.tree_map_with_path(label, params)
+
+
 def make_optimizer(args, init_params=None):
     """init_params is only needed (and required) when args.freeze_except_halt, weight_decay or the halting head's Adam
     betas are not the defaults - its pytree structure labels the halting head apart from every other param group."""
@@ -365,8 +374,15 @@ def make_optimizer(args, init_params=None):
     clip = lambda tx: optax.chain(optax.clip_by_global_norm(args.max_grad_norm), tx) if args.max_grad_norm > 0.0 else tx
     halt_tx = optax.adam(learning_rate=learning_rate, b1=args.halt_adam_b1, b2=args.halt_adam_b2)
     halt_betas = (args.halt_adam_b1, args.halt_adam_b2) != (0.9, 0.999)
-    # The trunk (every param but the halting head's): AdamW with weight_decay, else Adam; the head is never decayed
+    # The trunk (every param but the halting head's): AdamW with weight_decay, else Adam; the head is never decayed.
+    # optimizer='muon': Muon (Nesterov, consistent RMS 0.2: update RMS ~ AdamW's, so the same learning rate; arXiv
+    # 2502.16982) on the core's hidden matrices only; every other trunk param keeps exactly the Adam(W) above (optax's
+    # muon would give them NAdam: its nesterov flag is shared).
+    assert args.optimizer in ('adam', 'muon'), args.optimizer
     trunk_tx = optax.adamw(learning_rate, weight_decay=args.weight_decay) if args.weight_decay > 0.0 else optax.adam(learning_rate)
+    if args.optimizer == 'muon':
+        muon_tx = optax.contrib.muon(learning_rate, weight_decay=args.weight_decay, consistent_rms=0.2)
+        trunk_tx = optax.multi_transform({'muon': muon_tx, 'adam': trunk_tx}, muon_labels)
 
     def labels(other):  # 'train' for the halting head's param groups, `other` for the rest
         return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in HALT_PARAMS else other, v)
@@ -386,7 +402,7 @@ def make_optimizer(args, init_params=None):
     if halt_betas or args.weight_decay > 0.0:  # the halting head gets its own Adam; clipping stays global over all params
         assert init_params is not None, "halt_adam_b1 / halt_adam_b2 / weight_decay need init_params to label the halting head"
         return clip(optax.multi_transform({'train': halt_tx, 'rest': trunk_tx}, labels('rest')))
-    return clip(optax.adam(learning_rate=learning_rate))
+    return clip(trunk_tx)  # Adam (with optimizer=muon: Muon on the core matrices, this Adam on the rest incl. the halting head)
 
 
 def main(args: Args):

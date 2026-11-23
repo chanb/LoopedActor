@@ -41,6 +41,7 @@
 #   TARGET_KL=k         stop a rollout's remaining minibatch updates once approx_kl_action > k (the action policy's KL only, not the
 #                       think time's; default 0 = off; skipped updates
 #                       are not computed, so this also saves time; training/kl_stop_frac = fraction skipped)
+#   OPTIMIZER=adam|muon  muon: Muon on the 2-D kernels of the looped core (actor and critic), Adam on the rest (_muon; default adam)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
 #   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
 #   VALUE_EXPECTILE=tau  value loss expectile in (0, 1) (default 0.5 = MSE; e.g. 0.9 = optimistic upper-expectile value,
@@ -176,6 +177,11 @@ awk -v k="$TARGET_KL" 'BEGIN { exit !(k + 0 == k && k >= 0) }' || { echo "TARGET
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$TARGET_KL"); RUN+="_tkl${TARGET_KL}"; }
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }
 [[ "$NUM_EPOCHS" != 4 ]] && RUN+="_ep${NUM_EPOCHS}"
+case "${OPTIMIZER:-adam}" in
+  adam) ;;
+  muon) ARM_FLAGS+=(--optimizer=muon); RUN+="_muon" ;;
+  *) echo "OPTIMIZER must be adam or muon, got $OPTIMIZER"; exit 1 ;;
+esac
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-100000000}"
 [[ "$NUM_TIMESTEPS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_TIMESTEPS must be a positive integer, got $NUM_TIMESTEPS"; exit 1; }
 if [[ "$NUM_TIMESTEPS" != 100000000 ]]; then
