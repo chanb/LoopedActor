@@ -73,6 +73,7 @@
 #   DYNAMIC_LOSS_SCALE=0|1  COMPUTE_DTYPE=float16: dynamic loss scaling against fp16 gradient underflow (default 1)
 #   NORMALIZE_OBS=0|1  running mean/std observation normalization (default 0 = raw observations; runs before this
 #                       option always normalized)
+#   LEARNING_RATE=lr   constant learning rate (default 1e-4; _lr<lr> otherwise)
 #   OPTIMIZER=adam|muon  muon: Muon on the 2-D kernels of the looped core (actor and critic), Adam(W) on the rest (_muon; default adam)
 #   WEIGHT_DECAY=w      decoupled weight decay (AdamW) on every param except the halting head's (default 0 = Adam; _wd<w>)
 #   TARGET_KL=k         stop a rollout's remaining minibatch updates once approx_kl_action > k (the action policy's KL only, not the
@@ -288,6 +289,8 @@ case "${OPTIMIZER:-adam}" in
   muon) ARM_FLAGS+=(--optimizer=muon); RUN+="_muon" ;;
   *) echo "OPTIMIZER must be adam or muon, got $OPTIMIZER"; exit 1 ;;
 esac
+awk -v r="${LEARNING_RATE:-1e-4}" 'BEGIN { exit !(r + 0 == r && r > 0) }' || { echo "LEARNING_RATE must be > 0, got $LEARNING_RATE"; exit 1; }
+[[ "${LEARNING_RATE:-1e-4}" != 1e-4 ]] && { ARM_FLAGS+=(--learning_rate="$LEARNING_RATE"); RUN+="_lr${LEARNING_RATE}"; }
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }
 [[ "$NUM_EPOCHS" != 4 ]] && RUN+="_ep${NUM_EPOCHS}"
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-100000000}"
