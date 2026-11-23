@@ -66,6 +66,7 @@
 #   ACTION_HEAD=blank   iso_mem / mem_halt: 4 Dense(1) on the blank's own cell latent, move i on its i-th quarter of
 #                       the features (rms-normed per quarter), unmasked (_ablank)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
+#   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
 #   MLP_ROUND_TO=r      MLP hidden width rounded up to a multiple of r (default 256; at d=128 swiglu: 256 -> 512,
@@ -233,6 +234,11 @@ case "$ACTION_HEAD" in
            || { echo "ACTION_HEAD=blank needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
          ARM_FLAGS+=(--action_head=blank); RUN+="_ablank" ;;
   *) echo "ACTION_HEAD must be readout, neighbour or blank, got $ACTION_HEAD"; exit 1 ;;
+esac
+case "${GRID_CONV:-1}" in
+  1) ;;
+  0) ARM_FLAGS+=(--no-use_grid_conv); RUN+="_nogconv" ;;
+  *) echo "GRID_CONV must be 0 or 1, got $GRID_CONV"; exit 1 ;;
 esac
 case "$CELL_GEOMETRY" in
   1) ;;

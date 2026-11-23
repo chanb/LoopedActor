@@ -128,6 +128,7 @@ class Args:
                                           # 'blank' (same archs and envs): Dense(4) on the blank's own cell latent, unmasked
                                           # 'action_tokens' (any env / arch): |A| learned action tokens in the input, logit a
                                           # read off action token a's latent
+    use_grid_conv: bool = True            # --no-use_grid_conv (fprm, fprm_mem): no depthwise grid convolution on the cell latents in the core
     cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-*): cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
@@ -491,6 +492,7 @@ def main(args: Args):
         mlp_type=args.mlp_type,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
+        use_grid_conv=args.use_grid_conv,
     )
     if args.architecture == 'fprm_mem':
         assert args.halt_clip in ('joint', 'path', 'each'), f"halt_clip must be joint, path or each, got {args.halt_clip}"

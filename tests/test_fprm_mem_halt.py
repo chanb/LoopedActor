@@ -411,3 +411,16 @@ def test_mixture_policy(min_iters):
     g = lambda n: jax.grad(lambda p: jnp.sum(jnp.sin(_intermediates(n, p, x, halt_steps=c)['logits'])))(params)['halt_linear']
     assert float(jnp.abs(g(net)['kernel']).sum()) > 0
     assert float(jnp.abs(g(sg)['kernel']).sum()) == 0
+
+
+def test_no_grid_conv():
+    # use_grid_conv=False: no depthwise grid convolution in the core (no params), the net still runs.
+    x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
+    nets = {g: FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=g), max_think_iters=4)
+            for g in (True, False)}
+    params = {g: net.init(jax.random.PRNGKey(0), x)['params'] for g, net in nets.items()}
+    names = {g: {'/'.join(k.key for k in path) for path, _ in jax.tree_util.tree_flatten_with_path(p)[0]} for g, p in params.items()}
+    assert any('grid_depthwise_conv' in n for n in names[True])
+    assert not any('grid_depthwise_conv' in n for n in names[False])
+    out = nets[False].apply({'params': params[False]}, x)
+    assert all(bool(jnp.all(jnp.isfinite(v))) for v in jax.tree_util.tree_leaves(out) if jnp.issubdtype(v.dtype, jnp.floating))
