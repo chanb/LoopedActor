@@ -6,6 +6,8 @@
 #   GRID=N              board size N x N (default 3 = 8-puzzle)
 #   EPISODE_LENGTH=N    steps per training episode (default 40; also used by the eval/train_* episodes)
 #   EVAL_EPISODE_LENGTH=N  steps per evaluation-scramble (eval/test_*) episode (default EPISODE_LENGTH)
+#   OPTIMAL_HORIZON=1   BANK only: an unsolved episode terminates (reward 0) once it has taken the board's optimal
+#                       number of moves, so only optimal solutions are rewarded (_opth; default 0)
 #   BANK=<train>-<eval>  draw training / evaluation boards from the level banks data/slidingpuzzle/<N>x<N>/<split>.npz
 #                       instead of scrambling (e.g. train-test; _bank<train>-<eval>; *_RANDOM_MOVES are then unused)
 #   NUM_RANDOM_MOVES=K  training scramble length (random walk of the blank; default 100)
@@ -245,6 +247,11 @@ esac
 [[ -n "$BANK" ]] && RUN+="_bank${BANK}"
 [[ "$EPISODE_LENGTH" != 40 ]] && RUN+="_el${EPISODE_LENGTH}"
 [[ "$EVAL_EPISODE_LENGTH" != "$EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
+case "${OPTIMAL_HORIZON:-0}" in
+  0) ;;
+  1) ARM_FLAGS+=(--slidingpuzzle_optimal_horizon); RUN+="_opth" ;;
+  *) echo "OPTIMAL_HORIZON must be 0 or 1, got $OPTIMAL_HORIZON"; exit 1 ;;
+esac
 [[ "$NUM_RANDOM_MOVES" != 100 ]] && RUN+="_rm${NUM_RANDOM_MOVES}"
 [[ "$MIN_RANDOM_MOVES" =~ ^[0-9]+$ ]] && (( MIN_RANDOM_MOVES <= NUM_RANDOM_MOVES )) \
   || { echo "MIN_RANDOM_MOVES must be an integer in [0, NUM_RANDOM_MOVES=$NUM_RANDOM_MOVES], got $MIN_RANDOM_MOVES"; exit 1; }

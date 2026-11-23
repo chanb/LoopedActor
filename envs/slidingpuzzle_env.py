@@ -15,7 +15,8 @@ With `train_split` / `eval_split` set (env id slidingpuzzle-<N>x<N>-<train>-<eva
 from a level bank <DATA_DIR>/<N>x<N>/<split>.npz (puzzle [L,N,N] int8, moves [L] int16 optimal length), built by
 data_scripts/build_slidingpuzzle_banks.py (3x3: train = optimal length <= 28, test = > 28). No scrambling is done then.
 Training resets draw the optimal length uniformly from the lengths in the bank, then a board of that length uniformly
-(short lengths have few boards, e.g. 4x4 d <= 14); evaluation resets draw a board uniformly from the bank.
+(short lengths have few boards, e.g. 4x4 d <= 14); evaluation resets draw a board uniformly from the bank. The solved board
+(length 0, in the train banks) is dropped when a bank is loaded, so no episode starts solved.
 
 Observation: per-cell one-hot of the tile id (channel k = tile k, channel 0 = blank), cell-major flat
 vector of size N*N*N^2 (obs_channels N^2; the actor reshapes it to [N*N, N^2] tokens). No goal vector
@@ -24,6 +25,8 @@ Actions (readout head, as in jumanji): move the blank 0 up, 1 right, 2 down, 3 l
 tile slides into the blank). A move off the board is a no-op.
 Reward (sparse, jumanji SparseRewardFn): 1 when the board is solved (episode ends), 0 otherwise.
 Episode length set in the config (Stoix time_limit 40).
+With `optimal_horizon` (level banks only), an unsolved episode also terminates (done, reward 0) once it has taken as
+many steps as the board's optimal solution length: only optimal solutions are rewarded.
 """
 
 import os
@@ -45,6 +48,8 @@ BLANK = 0
 class SlidingPuzzleData:
     puzzle: jax.Array  # [N, N] int32 tile ids, 0 = blank
     blank: jax.Array   # [2] int32 (row, col) of the blank
+    opt: jax.Array     # () int32 optimal solution length of the reset board (-1 = unknown: scrambles)
+    t: jax.Array       # () int32 steps taken
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -60,6 +65,7 @@ def default_config() -> config_dict.ConfigDict:
         eval_split='',             # non-empty: evaluation resets draw from this level bank instead of scrambling
         step_penalty=0.0,          # 0 = sparse reward (jumanji SparseRewardFn)
         solve_reward=1.0,
+        optimal_horizon=False,     # terminate unsolved episodes after the board's optimal length (needs the level banks)
     )
 
 
@@ -77,6 +83,8 @@ class SlidingPuzzleEnv:
         self.solved = solved_puzzle(self.m)
         self.train_bank = load_bank(self.m, config.train_split) if config.train_split else None
         self.eval_bank = load_bank(self.m, config.eval_split) if config.eval_split else None
+        assert not config.get('optimal_horizon', False) or (config.train_split and config.eval_split), \
+            'optimal_horizon needs the level banks (optimal lengths are unknown for scrambles)'
 
     @property
     def action_size(self): return 4
@@ -111,7 +119,7 @@ class SlidingPuzzleEnv:
             return (jnp.where(keep, new_puzzle, puzzle), jnp.where(keep, new_blank, blank)), None
         start = (self.solved, jnp.array([self.m - 1, self.m - 1], jnp.int32))
         (puzzle, blank), _ = jax.lax.scan(body, start, (jnp.arange(num_moves), jax.random.split(rng, num_moves)))
-        return SlidingPuzzleData(puzzle=puzzle, blank=blank)
+        return SlidingPuzzleData(puzzle=puzzle, blank=blank, opt=jnp.array(-1, jnp.int32), t=jnp.array(0, jnp.int32))
 
     def _make_state(self, rng, data: SlidingPuzzleData):
         return State(
@@ -130,7 +138,8 @@ class SlidingPuzzleEnv:
             idx = jax.random.randint(key, (), 0, bank['puzzle'].shape[0])
         puzzle = bank['puzzle'][idx]
         b = jnp.argmin(puzzle.reshape(-1))  # the blank (0) is the only zero
-        return self._make_state(rng, SlidingPuzzleData(puzzle=puzzle, blank=jnp.stack([b // self.m, b % self.m])))
+        return self._make_state(rng, SlidingPuzzleData(puzzle=puzzle, blank=jnp.stack([b // self.m, b % self.m]),
+                                                        opt=bank['moves'][idx], t=jnp.array(0, jnp.int32)))
 
     def reset(self, rng: jax.Array) -> State:
         if self.train_bank is not None:
@@ -156,9 +165,10 @@ class SlidingPuzzleEnv:
         success = jnp.all(puzzle == self.solved).astype(jnp.float32)
         cfg = self._config
         reward = cfg.solve_reward * success - cfg.step_penalty
-        new_data = SlidingPuzzleData(puzzle=puzzle, blank=blank)
+        new_data = SlidingPuzzleData(puzzle=puzzle, blank=blank, opt=d.opt, t=d.t + 1)
+        done = jnp.maximum(success, (new_data.t >= d.opt).astype(jnp.float32)) if cfg.get('optimal_horizon', False) else success
         return State(
-            data=new_data, obs=self._obs(new_data), reward=reward, done=success,
+            data=new_data, obs=self._obs(new_data), reward=reward, done=done,
             metrics={**state.metrics, 'success': success, 'reward': reward},
             info={**state.info, 'target_goal': state.info['target_goal']},
         )
@@ -167,6 +177,7 @@ class SlidingPuzzleEnv:
 def load_bank(grid_size, split):
     z = np.load(os.path.join(DATA_DIR, f'{grid_size}x{grid_size}', f'{split}.npz'))
     order = np.argsort(z['moves'], kind='stable')
+    order = order[z['moves'][order] > 0]  # drop the solved board (length 0): an episode must not start solved
     moves = z['moves'][order].astype(np.int32)
     _, start, count = np.unique(moves, return_index=True, return_counts=True)  # per-length slices of the sorted bank
     return dict(puzzle=jnp.asarray(z['puzzle'][order].astype(np.int32)), moves=jnp.asarray(moves),

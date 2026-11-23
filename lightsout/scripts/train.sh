@@ -9,6 +9,8 @@
 #                       used by the eval/train_* episodes; runs before this default used M*N)
 #   EVAL_EPISODE_LENGTH=N  steps per held-out (eval/test_*) episode (default M*N, one more than the hardest held-out goal needs)
 #   DIFFICULTY_THRESHOLD=f  training goals need < int(M*N*f) presses, evaluation goals >= it (default 0.5)
+#   OPTIMAL_HORIZON=1   an unsolved episode terminates (reward 0) after the optimal number of presses, so only optimal
+#                       solutions are rewarded (_opth; default 0; needs an invertible press matrix: not 4x4 / 5x5)
 #   DISCOUNT_ACT=g      per-decision discount (default 0.99)
 #   DISCOUNT_COMPUTE=g  per-extra-think-iteration discount (default 1.0 = standard return;
 #                       = DISCOUNT_ACT gives the RAMDP return)
@@ -150,6 +152,11 @@ esac
 [[ "$EPISODE_LENGTH" != "$DEFAULT_EPISODE_LENGTH" ]] && RUN+="_el${EPISODE_LENGTH}"
 [[ "$EVAL_EPISODE_LENGTH" != "$DEFAULT_EVAL_EPISODE_LENGTH" ]] && RUN+="_eel${EVAL_EPISODE_LENGTH}"
 [[ "$DIFFICULTY_THRESHOLD" != 0.5 ]] && RUN+="_dt${DIFFICULTY_THRESHOLD}"
+case "${OPTIMAL_HORIZON:-0}" in
+  0) ;;
+  1) ARM_FLAGS+=(--lightsout_optimal_horizon); RUN+="_opth" ;;
+  *) echo "OPTIMAL_HORIZON must be 0 or 1, got $OPTIMAL_HORIZON"; exit 1 ;;
+esac
 case "$MLP_TYPE" in
   swiglu) ;;
   gelu) ARM_FLAGS+=(--mlp_type=gelu); RUN+="_gelu" ;;
