@@ -424,3 +424,19 @@ def test_no_grid_conv():
     assert not any('grid_depthwise_conv' in n for n in names[False])
     out = nets[False].apply({'params': params[False]}, x)
     assert all(bool(jnp.all(jnp.isfinite(v))) for v in jax.tree_util.tree_leaves(out) if jnp.issubdtype(v.dtype, jnp.floating))
+
+
+@pytest.mark.parametrize('pos_embed', [False, True])
+def test_cell_pos_embed_breaks_cell_symmetry(pos_embed):
+    # No grid conv, no geometry: the actor sees the cells as a set, so every 3x3 board (each tile once) gives the same
+    # logits. cell_pos_embed adds a learned embedding per cell index, and the logits then depend on the board.
+    boards = jnp.array([[1, 2, 3, 4, 5, 6, 0, 7, 8], [6, 2, 0, 1, 8, 3, 5, 7, 4]])
+    x = jax.nn.one_hot(boards, 9).reshape(2, -1)
+    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=False), max_think_iters=2,
+                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='blank', cell_geometry=False,
+                                cell_pos_embed=pos_embed)
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    assert ('cell_pos_embed' in params) == pos_embed
+    params = jax.tree_util.tree_map(lambda a: a + 0.3 * jax.random.normal(jax.random.PRNGKey(1), a.shape), params)
+    logits = _intermediates(net, params, x)['logits']
+    assert jnp.allclose(logits[0], logits[1], atol=1e-5) != pos_embed  # equal up to float summation order

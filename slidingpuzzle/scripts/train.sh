@@ -66,6 +66,7 @@
 #   ACTION_HEAD=blank   iso_mem / mem_halt: 4 Dense(1) on the blank's own cell latent, move i on its i-th quarter of
 #                       the features (rms-normed per quarter), unmasked (_ablank)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
+#   POS_EMBED=1         iso_mem / mem_halt, TOKENIZER=cell: learned embedding per cell index on the actor's cell tokens (_pe; default 0)
 #   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
@@ -234,6 +235,12 @@ case "$ACTION_HEAD" in
            || { echo "ACTION_HEAD=blank needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
          ARM_FLAGS+=(--action_head=blank); RUN+="_ablank" ;;
   *) echo "ACTION_HEAD must be readout, neighbour or blank, got $ACTION_HEAD"; exit 1 ;;
+esac
+case "${POS_EMBED:-0}" in
+  0) ;;
+  1) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] || { echo "POS_EMBED=1 needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
+     ARM_FLAGS+=(--cell_pos_embed); RUN+="_pe" ;;
+  *) echo "POS_EMBED must be 0 or 1, got $POS_EMBED"; exit 1 ;;
 esac
 case "${GRID_CONV:-1}" in
   1) ;;

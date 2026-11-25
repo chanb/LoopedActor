@@ -293,6 +293,7 @@ class FPRMMemHaltActorValue(nn.Module):
     obs_channels: int = 0          # see FPRMThinkerActorValue
     action_head: str = 'per_cell'  # 'per_cell' | 'readout' (see FPRMThinkerActorValue) | 'neighbour' | 'blank' (see the module docstring)
     cell_geometry: bool = True     # tokenizer='cell': append the 6 geometry features to each cell token (see the module docstring)
+    cell_pos_embed: bool = False   # tokenizer='cell': add a learned embedding per cell index to the cell tokens (actor only)
     remat: bool = True             # rematerialize each pass in the backward pass
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
@@ -323,6 +324,9 @@ class FPRMMemHaltActorValue(nn.Module):
         self.bot = self.param('bot', nn.initializers.normal(stddev=0.02), (1, H))
         self.latent_embed = self.param('latent_embed', nn.initializers.normal(stddev=0.02), (1, H))
         self.sep = self.param('sep', nn.initializers.normal(stddev=0.02), (1, H))
+        if self.cell_pos_embed:
+            assert self.tokenizer == 'cell', 'cell_pos_embed needs tokenizer=cell'
+            self.cell_pos = self.param('cell_pos_embed', nn.initializers.normal(stddev=0.02), (self.m * self.n, H))
         if self.action_head == 'action_tokens':
             self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, H))
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
@@ -366,6 +370,8 @@ class FPRMMemHaltActorValue(nn.Module):
 
         if self.tokenizer == 'cell':
             cells = self.cell_projection(tokenize(x_flat, self.m, self.n, self.obs_channels, self.cell_geometry))
+            if self.cell_pos_embed:
+                cells = cells + self.cell_pos.astype(cells.dtype)
         else:
             cells = self.obs_tokenizer(x_flat)  # [B, P, H]
         P = cells.shape[1]

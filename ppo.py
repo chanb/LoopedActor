@@ -130,6 +130,7 @@ class Args:
                                           # read off action token a's latent
     use_grid_conv: bool = True            # --no-use_grid_conv (fprm, fprm_mem): no depthwise grid convolution on the cell latents in the core
     cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-*): cell tokens
+    cell_pos_embed: bool = False          # fprm_mem, tokenizer=cell: learned embedding per cell index added to the actor's cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
@@ -519,6 +520,7 @@ def main(args: Args):
             obs_channels=obs_channels,
             action_head=action_head,
             cell_geometry=args.cell_geometry,
+            cell_pos_embed=args.cell_pos_embed,
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,
