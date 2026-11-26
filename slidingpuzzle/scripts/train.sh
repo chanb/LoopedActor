@@ -65,6 +65,8 @@
 #                       would slide (off-board moves masked) instead of the readout token's Dense(4) (_anbr; default: readout)
 #   ACTION_HEAD=blank   iso_mem / mem_halt: 4 Dense(1) on the blank's own cell latent, move i on its i-th quarter of
 #                       the features (rms-normed per quarter), unmasked (_ablank)
+#   ACTION_HEAD=action_tokens  iso_mem / mem_halt: A learned action tokens after SEP, logit a = Dense(1) on token a's
+#                       latent (_aact)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   POS_EMBED=1         iso_mem / mem_halt, TOKENIZER=cell: learned embedding per cell index on the actor's cell tokens (_pe; default 0)
 #   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
@@ -234,7 +236,9 @@ case "$ACTION_HEAD" in
   blank) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] \
            || { echo "ACTION_HEAD=blank needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
          ARM_FLAGS+=(--action_head=blank); RUN+="_ablank" ;;
-  *) echo "ACTION_HEAD must be readout, neighbour or blank, got $ACTION_HEAD"; exit 1 ;;
+  action_tokens) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] || { echo "ACTION_HEAD=action_tokens needs arm iso_mem or mem_halt"; exit 1; }
+                 ARM_FLAGS+=(--action_head=action_tokens); RUN+="_aact" ;;
+  *) echo "ACTION_HEAD must be readout, neighbour, blank or action_tokens, got $ACTION_HEAD"; exit 1 ;;
 esac
 case "${POS_EMBED:-0}" in
   0) ;;
