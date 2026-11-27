@@ -46,13 +46,13 @@ from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_
 PREFIX_LEN = 1  # [READOUT]
 
 
-def flat_grid_cell_features(grid, goal, m, n):
+def flat_grid_cell_features(grid, goal, m, n, geometry=True):
     """Per-cell feature tensor [B, m*n, 11] from flat binary grid and goal.
 
     Features per cell: current one-hot (2), target one-hot (2), mismatch (1),
-    normalized row/col in [-1, 1] (2), boundary flags (4).
+    normalized row/col in [-1, 1] (2), boundary flags (4); geometry=False: the first 5 alone [B, m*n, 5].
     """
-    B = grid.shape[0]
+    B, geometry_on = grid.shape[0], geometry
     cur = grid.reshape(B, m * n, 1)
     tgt = goal.reshape(B, m * n, 1)
     cur_onehot = jnp.concatenate([1.0 - cur, cur], axis=-1)
@@ -71,7 +71,7 @@ def flat_grid_cell_features(grid, goal, m, n):
     geometry = jnp.broadcast_to(geometry[None], (B, m * n, 6))
 
     return jnp.concatenate(
-        [cur_onehot, tgt_onehot, mismatch, geometry], axis=-1
+        [cur_onehot, tgt_onehot, mismatch] + ([geometry] if geometry_on else []), axis=-1
     )
 
 
@@ -95,15 +95,14 @@ def grid_channel_features(x_flat, m, n, channels, geometry=True):
 
 
 def tokenize(x_flat, m, n, obs_channels, geometry=True):
-    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes, without the 6
-    geometry features if geometry=False)."""
+    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes), without the 6
+    geometry features if geometry=False."""
     if obs_channels > 0:
         assert x_flat.shape[-1] == m * n * obs_channels, (x_flat.shape, m, n, obs_channels)
         return grid_channel_features(x_flat, m, n, obs_channels, geometry)
-    assert geometry, 'geometry=False needs a plane observation (obs_channels > 0)'
     grid_size = m * n
     assert x_flat.shape[-1] == 2 * grid_size, (x_flat.shape, m, n)
-    return flat_grid_cell_features(x_flat[:, :grid_size], x_flat[:, grid_size:], m, n)
+    return flat_grid_cell_features(x_flat[:, :grid_size], x_flat[:, grid_size:], m, n, geometry)
 
 
 class FPRMThinkerActorValue(nn.Module):

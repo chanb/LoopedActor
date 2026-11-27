@@ -129,7 +129,7 @@ class Args:
                                           # 'action_tokens' (any env / arch): |A| learned action tokens in the input, logit a
                                           # read off action token a's latent
     use_grid_conv: bool = True            # --no-use_grid_conv (fprm, fprm_mem): no depthwise grid convolution on the cell latents in the core
-    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-*): cell tokens
+    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-* / lightsout-*): cell tokens
     cell_pos_embed: bool = False          # fprm_mem, tokenizer=cell: learned embedding per cell index added to the actor's cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
@@ -472,9 +472,9 @@ def main(args: Args):
                                                    and args.architecture == 'fprm_mem'), \
             f"action_head={args.action_head!r} needs a slidingpuzzle-* env and architecture fprm_mem"
         action_head = args.action_head
-    assert args.cell_geometry or (args.env_id.startswith('slidingpuzzle-') and args.tokenizer == 'cell'
+    assert args.cell_geometry or (args.env_id.startswith(('slidingpuzzle-', 'lightsout-')) and args.tokenizer == 'cell'
                                   and args.architecture == 'fprm_mem'), \
-        '--no-cell_geometry needs a slidingpuzzle-* env, tokenizer=cell and architecture fprm_mem'
+        '--no-cell_geometry needs a slidingpuzzle-* or lightsout-* env, tokenizer=cell and architecture fprm_mem'
     stochastic_halt = args.variable_budget and args.halt_criterion == 'sigmoid'
     assert args.halt_update_period == 1 or (stochastic_halt and not args.freeze_except_halt), \
         'halt_update_period needs act_iters=C:v with halt_criterion=sigmoid, no freeze_except_halt'

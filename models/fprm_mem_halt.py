@@ -303,8 +303,7 @@ class FPRMMemHaltActorValue(nn.Module):
         assert self.action_head in ('per_cell', 'readout', 'neighbour', 'blank', 'action_tokens'), self.action_head
         assert self.action_head not in ('neighbour', 'blank') or (self.output_dim_1 == 4 and self.obs_channels > 0), \
             f"{self.action_head!r} needs 4 actions and a plane observation whose channel 0 marks the blank"
-        assert self.cell_geometry or (self.tokenizer == 'cell' and self.obs_channels > 0), \
-            'cell_geometry=False needs tokenizer=cell and a plane observation'
+        assert self.cell_geometry or self.tokenizer == 'cell', 'cell_geometry=False needs tokenizer=cell'
 
         assert self.max_think_iters >= 1 and self.value_iters >= 1, (self.max_think_iters, self.value_iters)
         assert self.halt_criterion in ('kl', 'l2', 'sigmoid'), self.halt_criterion

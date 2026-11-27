@@ -44,6 +44,13 @@
 #                       think time's; default 0 = off; skipped updates
 #                       are not computed, so this also saves time; training/kl_stop_frac = fraction skipped)
 #   OPTIMIZER=adam|muon  muon: Muon on the 2-D kernels of the looped core (actor and critic), Adam on the rest (_muon; default adam)
+#   LEARNING_RATE=lr   constant learning rate (default 1e-4; _lr<lr> otherwise)
+#   ACTION_HEAD=per_cell|readout|action_tokens  iso_mem / mem_halt: one press logit per cell latent (per_cell, default), Dense(A)
+#                       on the readout token (readout, _aro) or A learned action tokens (action_tokens, _aact)
+#   STABLE_SOFTMAX=1    iso_mem / mem_halt: collapse-free log-softmax for the action policy (_ssm; default 0)
+#   POS_EMBED=1         iso_mem / mem_halt: learned embedding per cell index on the actor's cell tokens (_pe; default 0)
+#   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
+#   CELL_GEOMETRY=0     iso_mem / mem_halt: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
 #   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
 #   VALUE_EXPECTILE=tau  value loss expectile in (0, 1) (default 0.5 = MSE; e.g. 0.9 = optimistic upper-expectile value,
@@ -184,11 +191,40 @@ awk -v k="$TARGET_KL" 'BEGIN { exit !(k + 0 == k && k >= 0) }' || { echo "TARGET
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$TARGET_KL"); RUN+="_tkl${TARGET_KL}"; }
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }
 [[ "$NUM_EPOCHS" != 4 ]] && RUN+="_ep${NUM_EPOCHS}"
+need_mem() { [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] || { echo "$1 needs arm iso_mem or mem_halt"; exit 1; }; }
+case "${ACTION_HEAD:-per_cell}" in
+  per_cell) ;;
+  readout) need_mem ACTION_HEAD=readout; ARM_FLAGS+=(--action_head=readout); RUN+="_aro" ;;
+  action_tokens) need_mem ACTION_HEAD=action_tokens; ARM_FLAGS+=(--action_head=action_tokens); RUN+="_aact" ;;
+  *) echo "ACTION_HEAD must be per_cell, readout or action_tokens, got $ACTION_HEAD"; exit 1 ;;
+esac
+case "${STABLE_SOFTMAX:-0}" in
+  0) ;;
+  1) need_mem STABLE_SOFTMAX=1; ARM_FLAGS+=(--stable_softmax); RUN+="_ssm" ;;
+  *) echo "STABLE_SOFTMAX must be 0 or 1, got $STABLE_SOFTMAX"; exit 1 ;;
+esac
+case "${POS_EMBED:-0}" in
+  0) ;;
+  1) need_mem POS_EMBED=1; ARM_FLAGS+=(--cell_pos_embed); RUN+="_pe" ;;
+  *) echo "POS_EMBED must be 0 or 1, got $POS_EMBED"; exit 1 ;;
+esac
+case "${GRID_CONV:-1}" in
+  1) ;;
+  0) ARM_FLAGS+=(--no-use_grid_conv); RUN+="_nogconv" ;;
+  *) echo "GRID_CONV must be 0 or 1, got $GRID_CONV"; exit 1 ;;
+esac
+case "${CELL_GEOMETRY:-1}" in
+  1) ;;
+  0) need_mem CELL_GEOMETRY=0; ARM_FLAGS+=(--no-cell_geometry); RUN+="_nogeo" ;;
+  *) echo "CELL_GEOMETRY must be 0 or 1, got $CELL_GEOMETRY"; exit 1 ;;
+esac
 case "${OPTIMIZER:-adam}" in
   adam) ;;
   muon) ARM_FLAGS+=(--optimizer=muon); RUN+="_muon" ;;
   *) echo "OPTIMIZER must be adam or muon, got $OPTIMIZER"; exit 1 ;;
 esac
+awk -v r="${LEARNING_RATE:-1e-4}" 'BEGIN { exit !(r + 0 == r && r > 0) }' || { echo "LEARNING_RATE must be > 0, got $LEARNING_RATE"; exit 1; }
+[[ "${LEARNING_RATE:-1e-4}" != 1e-4 ]] && { ARM_FLAGS+=(--learning_rate="$LEARNING_RATE"); RUN+="_lr${LEARNING_RATE}"; }
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-100000000}"
 [[ "$NUM_TIMESTEPS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_TIMESTEPS must be a positive integer, got $NUM_TIMESTEPS"; exit 1; }
 if [[ "$NUM_TIMESTEPS" != 100000000 ]]; then

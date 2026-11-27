@@ -315,6 +315,22 @@ def test_no_cell_geometry_drops_the_geometry_features(action_head):
     assert jnp.allclose(got, want, atol=1e-5)
 
 
+
+def test_no_cell_geometry_flat_grid_goal():
+    # Lights Out input (obs_channels=0: flat grid + goal): cell_geometry=False = cell_geometry=True with the cell
+    # projection's 6 geometry rows zeroed, leaving the 5 per-cell features (current / target one-hots, mismatch).
+    obs = jax.random.bernoulli(jax.random.PRNGKey(0), 0.5, (2, 18)).astype(jnp.float32)
+    kw = dict(halting=False, obs_channels=0, action_head='readout', output_dim_1=9, cell_pos_embed=True)
+    geo, nogeo = _net(**kw), _net(cell_geometry=False, **kw)
+    params = nogeo.init(jax.random.PRNGKey(1), obs)['params']
+    k = params['cell_projection']['kernel']
+    assert k.shape[0] == 5
+    params_geo = {**params, 'cell_projection': {**params['cell_projection'],
+                                                'kernel': jnp.concatenate([k, jnp.zeros((6, k.shape[1]), k.dtype)])}}
+    got = _intermediates(nogeo, params, obs)['logits']
+    want = _intermediates(geo, params_geo, obs)['logits']
+    assert jnp.allclose(got, want, atol=1e-5)
+
 def test_critic_is_a_separate_fixed_budget_fprm():
     # The value is the plain FPRM critic's (own 'critic' params, value_iters core calls), whatever the actor's budget.
     from models.fprm_thinker import FPRMThinkerActorValue
