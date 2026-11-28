@@ -25,18 +25,29 @@ def log_softmax(z):
 
 
 def kl(z_q, z_p):
-    """KL(softmax(z_q) || softmax(z_p)) over the last axis, via s = log(q / p) from the paper's eq. 9."""
-    p = jnp.exp(log_softmax(z_p))
+    """KL(softmax(z_q) || softmax(z_p)) over the last axis, via s = log(q / p) from the paper's eq. 9.
+
+    Falls back to sum q * (log_q - log_p) (using collapse-free log_softmax) on rows where |d| > 30 so
+    expm1(d) / expm1(s) never overflow fp32 (e.g. masked -1e9 logits or large separations).
+    """
+    log_q = log_softmax(z_q)
+    log_p = log_softmax(z_p)
+    p = jnp.exp(log_p)
     delta = z_q - z_p
     d = delta - jnp.sum(p * delta, axis=-1, keepdims=True)  # center under p
-    s = d - jnp.log1p(jnp.sum(p * jnp.expm1(d), axis=-1, keepdims=True))  # log(q / p)
+    use_stable = jnp.all(jnp.abs(d) <= 30.0, axis=-1, keepdims=True)
+    d_safe = jnp.where(use_stable, d, 0.0)
+    s = d_safe - jnp.log1p(jnp.sum(p * jnp.expm1(d_safe), axis=-1, keepdims=True))  # log(q / p)
     # sum q s would cancel first-order terms into a second-order KL; with sum p e^s = 1 it equals
     # sum p (s e^s - expm1(s)) = sum p (s expm1(s) - (expm1(s) - s)), every term >= 0 (~ s^2 / 2).
     em1 = jnp.expm1(s)
     small = jnp.abs(s) < 0.1
     sm = jnp.where(small, s, 0.0)
     em1_minus_s = jnp.where(small, sm * sm / 2 * (1 + sm / 3 * (1 + sm / 4 * (1 + sm / 5 * (1 + sm / 6)))), em1 - s)
-    return jnp.sum(p * (s * em1 - em1_minus_s), axis=-1)
+    kl_stable = jnp.sum(p * (s * em1 - em1_minus_s), axis=-1)
+    q = jnp.exp(log_q)
+    kl_direct = jnp.sum(jnp.where(q > 0.0, q * (log_q - log_p), 0.0), axis=-1)
+    return jnp.where(use_stable[..., 0], kl_stable, kl_direct)
 
 
 class Categorical(distrax.Categorical):

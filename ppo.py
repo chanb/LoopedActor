@@ -98,12 +98,8 @@ class Args:
     entropy_cost: float = 0.01
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
-    value_expectile: float = 0.5          # value loss |tau - 1(u < 0)| u^2 with u = target - V: 0.5 = MSE (mean return),
-                                          # > 0.5 = an upper expectile of the return (optimistic V, as Stoix --expectile)
     clipping_epsilon: float = 0.3
     normalize_advantage: bool = True
-    normalize_observations: bool = False  # running mean/std normalization of the observations (per input feature, so tied to the
-                                          # board size); off: the models see raw observations and checkpoints store an identity normalizer
     # stabilization (all off by default)
     max_grad_norm: float = 0.0            # 0 = no gradient clipping
     weight_decay: float = 0.0             # decoupled weight decay (AdamW) on every param except the halting head's; 0 = Adam
@@ -190,8 +186,6 @@ class Args:
     freeze_except_halt: bool = False      # 'sigmoid' halting: zero the optimizer update for every param group except
                                            # halt_linear - trains only the halting head, typically paired
                                            # with init_checkpoint pointed at a halting=False checkpoint
-    halt_update_period: int = 1           # 'sigmoid' halting: the trunk updates at every grad step, the halting head
-                                           # (halt_linear) only at every p-th; its Adam state pauses in between
 
 
 @flax.struct.dataclass
@@ -264,14 +258,61 @@ def score_halt_loss(lp_a, log_p_c, G, c, d):
     return -jnp.mean(jnp.where(c < T, w * log_p_c, 0.0))
 
 
-def value_loss(values, targets, expectile, mask=None):
-    """Expectile regression (tau = 0.5 gives the MSE 0.25 * mean(v_error^2)). values [T, B] with mask [T, B]: each
+def value_loss(values, targets, mask=None):
+    """MSE value loss (0.25 * mean((targets - values)^2)). values [T, B] with mask [T, B]: each
     state's loss is the mean over its masked passes."""
     v_error = targets - values
-    loss = jnp.abs(expectile - (v_error < 0).astype(v_error.dtype)) * v_error * v_error * 0.5
+    loss = v_error * v_error * 0.25
     if mask is None:
         return jnp.mean(loss)
     return jnp.mean(jnp.sum(jnp.where(mask, loss, 0.0), axis=0) / jnp.sum(mask, axis=0))
+
+
+def compute_gae(
+    truncation: jnp.ndarray,
+    termination: jnp.ndarray,
+    rewards: jnp.ndarray,
+    values: jnp.ndarray,
+    bootstrap_value: jnp.ndarray,
+    lambda_: float = 1.0,
+    discount=0.99,
+    truncation_values: Optional[jnp.ndarray] = None,
+):
+    """Standard RAMDP GAE: A_t = delta_t + lambda * discount_t * (1 - term_t) * (1 - trunc_t) * A_{t+1}.
+
+    `discount` is a scalar or a per-step [T, B] array (discount_act * discount_compute^(c_t - 1)).
+    `truncation_values` (optional [T, B]): V(final_obs_t) for truncated steps; when provided, truncated steps
+    keep their reward and bootstrap from V(final_obs_t) while still resetting the GAE carry at episode boundaries.
+    """
+    discount = jnp.broadcast_to(discount, termination.shape)
+    truncation_mask = 1 - truncation
+    values_t_plus_1 = jnp.concatenate(
+        [values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0
+    )
+    if truncation_values is not None:
+        values_t_plus_1 = jnp.where(truncation > 0.5, truncation_values, values_t_plus_1)
+    deltas = rewards + discount * (1 - termination) * values_t_plus_1 - values
+    if truncation_values is None:
+        deltas *= truncation_mask
+
+    acc = jnp.zeros_like(bootstrap_value)
+
+    def compute_vs_minus_v_xs(carry, target_t):
+        lambda_, acc = carry
+        truncation_mask, delta, termination, discount = target_t
+        acc = delta + discount * (1 - termination) * truncation_mask * lambda_ * acc
+        return (lambda_, acc), acc
+
+    (_, _), vs_minus_v_xs = jax.lax.scan(
+        compute_vs_minus_v_xs,
+        (lambda_, acc),
+        (truncation_mask, deltas, termination, discount),
+        length=int(truncation_mask.shape[0]),
+        reverse=True,
+    )
+    vs = jnp.add(vs_minus_v_xs, values)
+    advantages = vs_minus_v_xs
+    return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
 
 def count_parameters(params):
@@ -338,26 +379,12 @@ def make_inference_fn(actor_critic_network, stochastic_halt: bool = False):
 HALT_PARAMS = ('halt_linear',)  # the halting head's param groups
 
 
-def gated(tx, active):
-    """tx while active(count) (count = updates so far), else a zero update with tx's state left as it was."""
-    def init(params):
-        return tx.init(params), jnp.zeros((), jnp.int32)
-
-    def update(updates, state, params=None):
-        inner, count = state
-        new_updates, new_inner = tx.update(updates, inner, params)
-        on = active(count)
-        new_updates = jax.tree_util.tree_map(lambda u: jnp.where(on, u, jnp.zeros_like(u)), new_updates)
-        new_inner = jax.tree_util.tree_map(lambda n, o: jnp.where(on, n, o), new_inner, inner)
-        return new_updates, (new_inner, count + 1)
-    return optax.GradientTransformation(init, update)
-
-
 def muon_labels(params):
-    """'muon' for the 2-D kernels under a 'core' (the looped blocks of the actor and the critic), 'adam' elsewhere."""
+    """'muon' for the 2-D kernels under a 'core' / 'core_*' (actor, critic, and transformer baselines), 'adam' elsewhere."""
     def label(path, x):
         keys = [getattr(k, 'key', None) for k in path]
-        return 'muon' if 'core' in keys and keys[-1] == 'kernel' and x.ndim == 2 else 'adam'
+        in_core = any(k == 'core' or (isinstance(k, str) and k.startswith('core_')) for k in keys)
+        return 'muon' if in_core and keys[-1] == 'kernel' and x.ndim == 2 else 'adam'
     return jax.tree_util.tree_map_with_path(label, params)
 
 
@@ -392,12 +419,6 @@ def make_optimizer(args, init_params=None):
         return {'params': {k: jax.tree_util.tree_map(lambda _: 'train' if k in HALT_PARAMS else other, v)
                            for k, v in init_params['params'].items()}}
 
-    if args.halt_update_period > 1:
-        assert init_params is not None, "halt_update_period needs init_params to label the halting head"
-        p = args.halt_update_period
-        return optax.multi_transform({'train': gated(clip(halt_tx), lambda c: c % p == p - 1),
-                                      'rest': clip(trunk_tx)}, labels('rest'))
-
     if args.freeze_except_halt:
         assert init_params is not None, "freeze_except_halt needs init_params to build the freeze mask"
         # optax.masked() passes ungated gradients through unchanged for mask=False leaves - not a freeze. Use
@@ -411,7 +432,6 @@ def make_optimizer(args, init_params=None):
 
 def main(args: Args):
 
-    assert 0.0 < args.value_expectile < 1.0, args.value_expectile
     args.num_training_step = args.num_timesteps // (args.num_envs * args.rollout_length)
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
     args.num_training_steps_per_real_reset = args.num_training_step // max(1, args.num_reset_steps)
@@ -476,8 +496,6 @@ def main(args: Args):
                                   and args.architecture == 'fprm_mem'), \
         '--no-cell_geometry needs a slidingpuzzle-* or lightsout-* env, tokenizer=cell and architecture fprm_mem'
     stochastic_halt = args.variable_budget and args.halt_criterion == 'sigmoid'
-    assert args.halt_update_period == 1 or (stochastic_halt and not args.freeze_except_halt), \
-        'halt_update_period needs act_iters=C:v with halt_criterion=sigmoid, no freeze_except_halt'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
     assert args.policy_param != 'mix' or (stochastic_halt and args.halt_objective == 'pg'), \
@@ -556,7 +574,7 @@ def main(args: Args):
         params=init_params,
         tx=make_optimizer(args, init_params),
         normalizer_params=init_normalizer,
-        env_steps=np.zeros((), dtype=np.float64),
+        env_steps=jnp.zeros((), dtype=jnp.float32),
         loss_scale=jnp.asarray(args.loss_scale_init, jnp.float32),
         loss_scale_good_steps=jnp.zeros((), jnp.int32),
     )
@@ -589,7 +607,7 @@ def main(args: Args):
                 value=policy_extras['value'],
                 reward=next_env_state.reward,
                 discount=1 - next_env_state.done,
-                next_observation=jnp.concatenate([next_env_state.obs, next_env_state.info['target_goal']], axis=-1),
+                next_observation=jnp.concatenate([next_env_state.info['final_obs'], next_env_state.info['final_target_goal']], axis=-1),
                 extras={'policy_extras': policy_extras, 'state_extras': state_extras},
             )
 
@@ -600,15 +618,11 @@ def main(args: Args):
         )
         return final_env_state, data
 
-    def obs_normalizer(training_state):
-        """The normalizer passed to the network (None = raw observations)."""
-        return training_state.normalizer_params if args.normalize_observations else None
-
     @jax.jit
     def data_collect_step(training_state, env_state, key_generate_rollout):
         policy = make_policy({
             'policy': training_state.params,
-            'normalizer': obs_normalizer(training_state),
+            'normalizer': None,
         })
 
         env_state, data = generate_unroll(
@@ -620,66 +634,11 @@ def main(args: Args):
             extra_fields=('truncation',),
         )
 
-        # Update normalization params (left at the identity init when observations are not normalized).
-        if args.normalize_observations:
-            normalizer_params = running_statistics.update(
-                training_state.normalizer_params,
-                data.observation,
-            )
-        else:
-            normalizer_params = training_state.normalizer_params
-
         training_state = training_state.replace(
-            normalizer_params=normalizer_params,
             env_steps=training_state.env_steps + args.rollout_length * args.num_envs,
         )
 
         return training_state, env_state, data
-
-    def compute_gae(
-        truncation: jnp.ndarray,
-        termination: jnp.ndarray,
-        rewards: jnp.ndarray,
-        values: jnp.ndarray,
-        bootstrap_value: jnp.ndarray,
-        lambda_: float = 1.0,
-        discount=0.99,
-    ):
-        # `discount` is a scalar or a per-step [T, B] array (discount_act * discount_compute^(c_t - 1)).
-        discount = jnp.broadcast_to(discount, termination.shape)
-        truncation_mask = 1 - truncation
-        # Append bootstrapped value to get [v1, ..., v_t+1]
-        values_t_plus_1 = jnp.concatenate(
-            [values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0
-        )
-        deltas = rewards + discount * (1 - termination) * values_t_plus_1 - values
-        deltas *= truncation_mask
-
-        acc = jnp.zeros_like(bootstrap_value)
-
-        def compute_vs_minus_v_xs(carry, target_t):
-            lambda_, acc = carry
-            truncation_mask, delta, termination, discount = target_t
-            acc = delta + discount * (1 - termination) * truncation_mask * lambda_ * acc
-            return (lambda_, acc), (acc)
-
-        (_, _), (vs_minus_v_xs) = jax.lax.scan(
-            compute_vs_minus_v_xs,
-            (lambda_, acc),
-            (truncation_mask, deltas, termination, discount),
-            length=int(truncation_mask.shape[0]),
-            reverse=True,
-        )
-        # Add V(x_s) to get v_s.
-        vs = jnp.add(vs_minus_v_xs, values)
-
-        vs_t_plus_1 = jnp.concatenate(
-            [vs[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0
-        )
-        advantages = (
-            rewards + discount * (1 - termination) * vs_t_plus_1 - values
-        ) * truncation_mask
-        return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
     def compute_ppo_loss(params, normalizer_params, data, rng, progress):
         data, value_targets, advantages = data
@@ -707,11 +666,11 @@ def main(args: Args):
                     policy_loss -= jnp.mean(surrogate(halt_log_prob - (behaviour_action_log_probs - mu_pi)))
                 else:
                     mu_dec = data.extras['policy_extras']['halt_decision_log_probs']  # [B, T]
-                    dec = (data.extras['policy_extras']['halt_path'][:, None] >> jnp.arange(mu_dec.shape[-1])) & 1
+                    dec = data.extras['policy_extras']['halt_path']  # [B, T] bool
                     s_dec = jax.vmap(surrogate, in_axes=1, out_axes=1)(halt_decision_log_probs - mu_dec)
-                    policy_loss -= jnp.mean(jnp.sum(jnp.where(dec == 1, s_dec, 0.0), axis=-1))
+                    policy_loss -= jnp.mean(jnp.sum(jnp.where(dec, s_dec, 0.0), axis=-1))
 
-            v_loss = value_loss(baseline, value_targets, args.value_expectile)
+            v_loss = value_loss(baseline, value_targets)
 
             # Entropy loss
             entropy = jnp.mean(policy_dist.entropy())
@@ -729,13 +688,11 @@ def main(args: Args):
         # inside the network, so their readout is the one they halted at.
         # Stochastic halting: replay the rollout's think time c.
         halt_kw = {'halt_steps': data.extras['policy_extras']['compute_time']} if args.variable_budget else {}  # replay c
-        _, inter = actor_critic_network.apply(
+        (policy_dist, values), inter = actor_critic_network.apply(
             params, data.observation, normalizer_params,
             mutable=['intermediates'],
             **halt_kw,
         )
-        logits = inter['intermediates']['logits'][0]
-        values = inter['intermediates']['value'][0]
         halt_metrics = {}
         if stochastic_halt:
             halt_log_prob = inter['intermediates']['halt_log_prob'][0]
@@ -749,7 +706,7 @@ def main(args: Args):
             p_k = jnp.mean(inter['intermediates']['halt_step_probs'][0], axis=(0, 1))
             halt_metrics.update({f'halt_step_prob/k{k}': p_k[k] for k in range(p_k.shape[0])})
             path = data.extras['policy_extras']['halt_path']
-            halt_metrics['halt_decisions'] = jnp.mean(jnp.sum((path[..., None] >> jnp.arange(32)) & 1, axis=-1).astype(jnp.float32))
+            halt_metrics['halt_decisions'] = jnp.mean(jnp.sum(path, axis=-1).astype(jnp.float32))
             # Per-pass mean p_i(k = 0), the halting probability at a decision at pass i, in its own wandb section.
             mean_h = jnp.mean(inter['intermediates']['halt_prob'][0], axis=-1)
             halt_metrics.update({f'halt_prob/pass_{i + 1:02d}': mean_h[i] for i in range(mean_h.shape[0])})
@@ -852,7 +809,7 @@ def main(args: Args):
             mean_res = jnp.mean(inter['intermediates']['latent_residual_t'][0], axis=-1)
             halt_metrics.update({f'latent_res/pass_{i + 1:02d}': mean_res[i] for i in range(mean_res.shape[0])})
         policy_loss, v_loss, entropy_loss, approx_kl, approx_kl_action = ppo_terms(
-            distrax.Categorical(logits=logits), values, halt_log_prob,
+            policy_dist, values, halt_log_prob,
             inter['intermediates']['halt_decision_log_probs'][0] if halt_clip == 'each' else None,
         )
         entropy_loss = entropy_loss - args.halt_entropy_cost * halt_entropy
@@ -870,7 +827,7 @@ def main(args: Args):
             'approx_kl': approx_kl,
             'approx_kl_action': approx_kl_action,
             'think_iters': jnp.mean(think_iters.astype(jnp.float32)),
-            # Mean predicted value vs. mean (lambda-return) target: a growing gap shows expectile optimism.
+            # Mean predicted value vs. mean (lambda-return) target.
             'value_mean': jnp.mean(values),
             'value_target_mean': jnp.mean(value_targets),
         }
@@ -892,7 +849,7 @@ def main(args: Args):
                     return loss * scale, aux
 
                 (_, metrics), grads = jax.value_and_grad(scaled_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
+                    training_state.params, None, data, key_loss, progress(training_state)
                 )
                 grads = jax.tree_util.tree_map(lambda g: g / scale, grads)
                 finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]))
@@ -900,7 +857,7 @@ def main(args: Args):
                 grads = jax.tree_util.tree_map(lambda g: jnp.where(finite, g, 0.0), grads)
             else:
                 (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(
-                    training_state.params, obs_normalizer(training_state), data, key_loss, progress(training_state)
+                    training_state.params, None, data, key_loss, progress(training_state)
                 )
             grad_norm = optax.global_norm(grads)  # pre-clip
             metrics['grad_norm'] = grad_norm
@@ -926,7 +883,7 @@ def main(args: Args):
         # calculate gae
         terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
         _, bootstrap_value = actor_critic_network.apply(
-            training_state.params, terminal_obs, obs_normalizer(training_state)
+            training_state.params, terminal_obs, None
         )
 
         rewards = data.reward * args.reward_scaling
@@ -942,6 +899,24 @@ def main(args: Args):
         rewards = rewards * compute_discount
         discount = args.discount_act * compute_discount
 
+        # True pre-reset next-state values on truncated steps (t = T - 1 already uses bootstrap_value).
+        def _trunc_val(_, inp):
+            obs_next, v_next, trunc = inp
+            v_trunc = jax.lax.cond(
+                jnp.any(trunc > 0.5),
+                lambda _: actor_critic_network.apply(
+                    training_state.params, obs_next, None
+                )[1],
+                lambda _: v_next,
+                operand=None,
+            )
+            return None, jnp.where(trunc > 0.5, v_trunc, v_next)
+
+        _, prev_trunc_vals = jax.lax.scan(
+            _trunc_val, None, (data.next_observation[:-1], data.value[1:], truncation[:-1])
+        )
+        truncation_values = jnp.concatenate([prev_trunc_vals, jnp.expand_dims(bootstrap_value, 0)], axis=0)
+
         value_targets, advantages = compute_gae(
             truncation=truncation,
             termination=termination,
@@ -950,6 +925,7 @@ def main(args: Args):
             bootstrap_value=bootstrap_value,
             lambda_=args.gae_lambda,
             discount=discount,
+            truncation_values=truncation_values,
         )
         if args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -968,8 +944,9 @@ def main(args: Args):
             training_state, key, kl_stop, epoch, n, metric_sum = carry
             key, key_perm, key_grad = jax.random.split(key, 3)
             shuffled_batch_data = jax.tree_util.tree_map(
-                lambda x: jax.random.permutation(key_perm, x).reshape(
-                    (args.num_minibatches_per_rollout, -1) + x.shape[2:]),
+                lambda x: jax.random.permutation(
+                    key_perm, x.reshape((-1,) + x.shape[2:])
+                ).reshape((args.num_minibatches_per_rollout, -1) + x.shape[2:]),
                 batch_data)
 
             def _minibatch(carry):
@@ -1005,10 +982,12 @@ def main(args: Args):
 
         data_collect_start = time.time()
         training_state, env_state, training_data = data_collect_step(training_state, env_state, key_generate_unroll)
+        jax.block_until_ready(training_data)
         data_collect_step_time += time.time() - data_collect_start
 
         learn_step_start = time.time()
         training_state, training_metrics = learn_step(training_state, training_data, key_sgd)
+        jax.block_until_ready(training_metrics)
         learn_step_time += time.time() - learn_step_start
 
         if metrics is None:
@@ -1050,7 +1029,7 @@ def main(args: Args):
                 **singular_value_stats(training_state.params),
             }
 
-            eval_params = {'policy': training_state.params, 'normalizer': obs_normalizer(training_state)}
+            eval_params = {'policy': training_state.params, 'normalizer': None}
             metrics = evaluator.run_evaluation(policy_params=eval_params, training_metrics=metrics)
             metrics = sample_evaluator.run_evaluation(policy_params=eval_params, training_metrics=metrics)
 

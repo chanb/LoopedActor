@@ -41,8 +41,8 @@ def _eager(params):
 
 
 def _k1_path(c, min_iters, T):
-    """K = 1: the decision-pass mask of the path ending at c (a decision at every pass from min_iters on)."""
-    return sum(1 << (n - 1) for n in range(min_iters, min(c, T - 1) + 1))
+    """K = 1: the decision-pass bool mask [T] of the path ending at c (a decision at every pass from min_iters on)."""
+    return jnp.array([min_iters <= n <= min(c, T - 1) for n in range(1, T + 1)], jnp.bool_)
 
 
 def test_latent_residual_sown():
@@ -72,7 +72,7 @@ def test_log_p_c_is_sigmoid_halting():
     log_pc = []
     for c in range(min_iters, T + 1):
         replay = _intermediates(net, params, x, halt_steps=jnp.full((3,), c))
-        assert jnp.array_equal(replay['halt_path'], jnp.full((3,), _k1_path(c, min_iters, T)))
+        assert jnp.array_equal(replay['halt_path'], jnp.broadcast_to(_k1_path(c, min_iters, T), (3, T)))
         want = jnp.sum(jnp.log(1 - h[min_iters - 1:c - 1]), axis=0) + (jnp.log(h[c - 1]) if c < T else 0.0)
         assert jnp.allclose(replay['halt_log_prob'], want, atol=1e-5)
         log_pc.append(want)
@@ -98,11 +98,22 @@ def test_c_distribution_by_hand(min_iters):
         cs = jnp.full((B,), c)
         d = decision_log_probs(lp, cs, min_iters)
         assert jnp.allclose(jnp.sum(d, axis=0), lp_c[c - 1], atol=1e-6)
-        assert jnp.array_equal(decision_mask(cs, T, min_iters), jnp.full((B,), _k1_path(c, m, T)))
+        assert jnp.array_equal(decision_mask(cs, T, min_iters), jnp.broadcast_to(_k1_path(c, m, T), (B, T)))
     n = 20000
     c = jax.vmap(lambda k: sample_c(lp, min_iters, k))(jax.random.split(jax.random.PRNGKey(1), n))  # [n, B]
     freq = jnp.stack([jnp.mean(c == k, axis=0) for k in range(1, T + 1)])
     assert jnp.allclose(freq, jnp.exp(lp_c), atol=0.015)
+
+
+def test_decision_mask_large_T():
+    # T >= 32 must not overflow a 32-bit bitmask: returns [B, T] bool mask of decision passes.
+    T, min_iters = 40, 2
+    cs = jnp.array([2, 32, 39, 40], jnp.int32)
+    mask = decision_mask(cs, T, min_iters)
+    assert mask.shape == (4, T) and mask.dtype == jnp.bool_
+    for b, c in enumerate([2, 32, 39, 40]):
+        want = [min_iters <= n <= min(c, T - 1) for n in range(1, T + 1)]
+        assert jnp.array_equal(mask[b], jnp.array(want, jnp.bool_))
 
 
 @pytest.mark.parametrize('head_grad', [False, True])

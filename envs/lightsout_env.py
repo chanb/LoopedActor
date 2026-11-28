@@ -106,14 +106,27 @@ class LightsOutEnv:
         )
 
     def reset_with_dist(self, rng: jax.Array, dist: jax.Array) -> State:
-        """Reset to a random instance whose goal is `dist` distinct presses away from the initial grid."""
+        """Reset to a random instance whose goal is `dist` distinct presses away from the initial grid.
+
+        Resamples the press subset if a non-invertible grid hits its GF(2) null space so initial != goal whenever dist > 0.
+        """
         key_init, key_press = jax.random.split(rng)
         initial = jax.random.bernoulli(key_init, shape=(self.grid_size,)).astype(jnp.int32)
-        order = jax.random.permutation(key_press, self.grid_size)
-        pressed = jnp.zeros(self.grid_size, jnp.int32).at[order].set(jnp.arange(self.grid_size) < dist)
-        goal = (initial + pressed @ self.press) % 2
+        dist = jnp.asarray(dist, jnp.int32)
+
+        def sample_goal(key):
+            key, sub = jax.random.split(key)
+            order = jax.random.permutation(sub, self.grid_size)
+            pressed = jnp.zeros(self.grid_size, jnp.int32).at[order].set(jnp.arange(self.grid_size) < dist)
+            return key, (initial + pressed @ self.press) % 2
+
+        key_press, goal = jax.lax.while_loop(
+            lambda carry: (dist > 0) & jnp.all(carry[1] == initial),
+            lambda carry: sample_goal(carry[0]),
+            sample_goal(key_press),
+        )
         data = LightsOutData(grid=initial.astype(jnp.float32), goal=goal.astype(jnp.float32),
-                             dist=jnp.asarray(dist, jnp.int32), t=jnp.array(0, jnp.int32))
+                             dist=dist, t=jnp.array(0, jnp.int32))
         return self._make_state(rng, data)
 
     def reset(self, rng: jax.Array) -> State:

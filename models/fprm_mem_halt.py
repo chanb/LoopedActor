@@ -47,7 +47,7 @@ then only feed the memory and the next thought, so they need not be decodable as
 
 'sigmoid': the PPO ratio scores log p(c | s) = sum_{n < c} log(1 - h_n) + log h_c (no h_T term: c = T is the cap);
 `halt_sg_survival` keeps its value but passes no gradient through the continue terms log(1 - h_n), n < c. The rollout
-also stores the decision passes (`halt_path`, a bitmask: bit n-1 = a decision at pass n), a function of c. Evaluation
+also stores the decision passes (`halt_path`, a `[B, T]` bool mask: col n-1 = a decision at pass n), a function of c. Evaluation
 takes the most likely c, and 'halt_entropy' is H(c).
 
 `halt_kl_reverse`: KL_i = KL(pi_{i-1} || pi_i) instead, the expectation under pi_{i-1}, i.e. under pi_c, the policy that
@@ -254,9 +254,9 @@ def mix_log_weights(lp, c, min_iters):
 
 
 def decision_mask(c, T, min_iters):
-    """The decision passes of the path ending at c as a bitmask [B] (bit n - 1 = a decision at pass n)."""
+    """The decision passes of the path ending at c as a bool mask [B, T] (col n - 1 = a decision at pass n)."""
     n, dec = _decision_passes(T, min_iters)
-    return jnp.sum(jnp.where(dec & (n <= c), 1 << (n - 1), 0), axis=0).astype(jnp.int32)
+    return (dec & (n <= c)).T
 
 
 def sample_c(lp, min_iters, key):
@@ -538,7 +538,7 @@ class FPRMMemHaltActorValue(nn.Module):
             c = (jnp.argmax(lp_c, axis=0) + 1).astype(jnp.int32)
         halt_decision_log_probs = decision_log_probs(lp_t, c, min_iters, self.halt_sg_survival)
         p_c = jnp.exp(lp_c)
-        self.sow('intermediates', 'halt_path', decision_mask(c, T, min_iters))
+        self.sow('intermediates', 'halt_path', decision_mask(c, T, min_iters).reshape(batch_shape + (T,)))
         self.sow('intermediates', 'halt_step_probs', jnp.exp(lp_t))
         self.sow('intermediates', 'halt_log_prob', jnp.sum(halt_decision_log_probs, axis=0).reshape(batch_shape))
         self.sow('intermediates', 'halt_decision_log_probs', halt_decision_log_probs.T.reshape(batch_shape + (T,)))

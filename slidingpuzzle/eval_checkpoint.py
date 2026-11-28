@@ -66,7 +66,8 @@ def evaluate(env, mod, policy_vars, norm, K, n_levels, T, B, seed):
             steps += int(alive.sum())
             st = step_v(st, a)
             d_now = np.asarray(st.done) > 0.5; newly = d_now & ~done
-            succ[s0 + np.flatnonzero(newly)] = True; length[s0 + np.flatnonzero(newly)] = t + 1; done |= d_now
+            s_now = np.asarray(st.metrics['success']) > 0.5
+            succ[s0 + np.flatnonzero(newly & s_now)] = True; length[s0 + np.flatnonzero(newly)] = t + 1; done |= d_now
     keep = ~pre_solved
     s, L = succ[keep], length[keep]
     return dict(levels=int(keep.sum()), already_solved=int(pre_solved.sum()), success=float(s.mean()) if keep.any() else None,

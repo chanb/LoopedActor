@@ -92,6 +92,14 @@ class EpisodeWrapper(Wrapper):
 
 
 class AutoResetWrapper(Wrapper):
+    def reset(self, rng: jax.Array) -> State:
+        state = self.env.reset(rng)
+        return state.replace(info={**state.info, 'final_obs': state.obs, 'final_target_goal': state.info['target_goal']})
+
+    def eval_reset(self, rng: jax.Array) -> State:
+        state = self.env.eval_reset(rng)
+        return state.replace(info={**state.info, 'final_obs': state.obs, 'final_target_goal': state.info['target_goal']})
+
     def step(self, state: State, action: jax.Array) -> State:
         # 1. Update the RNG in the info dict before the step
         # This ensures the step itself and any subsequent reset have fresh keys
@@ -100,20 +108,20 @@ class AutoResetWrapper(Wrapper):
 
         # 2. Take the step
         next_state = self.env.step(state, action)
+        final_info = {'final_obs': next_state.obs, 'final_target_goal': next_state.info['target_goal']}
 
         # 3. If the result of that step is 'done', trigger reset
         # Otherwise, keep the next_state
         return jax.lax.cond(
             next_state.done.astype(bool),
             lambda _: (lambda r: r.replace(
-                # We preserve the terminal reward and done signal (and the time-limit truncation flag, which GAE and
-                # steps_to_go need) so the Learner/Logger sees the final outcome
+                # Preserve terminal reward, done, truncation, and pre-reset obs/goal (for truncated GAE bootstrapping)
                 reward=next_state.reward,
                 done=next_state.done,
                 metrics=next_state.metrics,
-                info={**r.info, **{k: next_state.info[k] for k in ('truncation',) if k in next_state.info}},
+                info={**r.info, **final_info, **{k: next_state.info[k] for k in ('truncation',) if k in next_state.info}},
             ))(self.env.reset(step_rng)),
-            lambda _: next_state,
+            lambda _: next_state.replace(info={**next_state.info, **final_info}),
             operand=None,
         )
 

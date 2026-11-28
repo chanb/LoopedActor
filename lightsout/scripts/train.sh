@@ -53,8 +53,6 @@
 #   CELL_GEOMETRY=0     iso_mem / mem_halt: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
 #   NUM_TIMESTEPS=n     total environment steps (default 100000000; _ts<n/1e6>M in the run name when changed)
-#   VALUE_EXPECTILE=tau  value loss expectile in (0, 1) (default 0.5 = MSE; e.g. 0.9 = optimistic upper-expectile value,
-#                       as Stoix --expectile)
 # The wandb group is <arm>_<uuid>, where the uuid is derived from every hyperparameter flag except the seed,
 # so seeds of the same setting are grouped together.
 # WANDB_PROJECT=name sets the wandb project (default looped_actor; not part of the run directory name).
@@ -84,7 +82,7 @@ EPISODE_LENGTH="${EPISODE_LENGTH:-$DEFAULT_EPISODE_LENGTH}"
 EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$DEFAULT_EVAL_EPISODE_LENGTH}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; MIX_WEIGHT_STOP_GRAD="${MIX_WEIGHT_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
+MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_CRITERION="${HALT_CRITERION:-sigmoid}"; HALT_THRESHOLD="${HALT_THRESHOLD:-1e-3}"; HALT_SG_SURVIVAL="${HALT_SG_SURVIVAL:-0}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 RUN="$ARM"
@@ -179,14 +177,6 @@ case "$COMPUTE_DTYPE" in
 esac
 [[ "$DYNAMIC_LOSS_SCALE" == 0 || "$DYNAMIC_LOSS_SCALE" == 1 ]] || { echo "DYNAMIC_LOSS_SCALE must be 0 or 1, got $DYNAMIC_LOSS_SCALE"; exit 1; }
 [[ "$COMPUTE_DTYPE" == float16 && "$DYNAMIC_LOSS_SCALE" == 0 ]] && { ARM_FLAGS+=(--no-dynamic_loss_scale); RUN+="_nols"; }
-case "$NORMALIZE_OBS" in
-  0) ARM_FLAGS+=(--no-normalize_observations) ;;
-  1) ARM_FLAGS+=(--normalize_observations); RUN+="_obsnorm" ;;
-  *) echo "NORMALIZE_OBS must be 0 or 1, got $NORMALIZE_OBS"; exit 1 ;;
-esac
-awk -v t="$VALUE_EXPECTILE" 'BEGIN { exit !(t + 0 == t && t > 0 && t < 1) }' \
-  || { echo "VALUE_EXPECTILE must be in (0, 1), got $VALUE_EXPECTILE"; exit 1; }
-[[ "$VALUE_EXPECTILE" != 0.5 ]] && { ARM_FLAGS+=(--value_expectile="$VALUE_EXPECTILE"); RUN+="_ve${VALUE_EXPECTILE}"; }
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k + 0 == k && k >= 0) }' || { echo "TARGET_KL must be >= 0, got $TARGET_KL"; exit 1; }
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$TARGET_KL"); RUN+="_tkl${TARGET_KL}"; }
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }

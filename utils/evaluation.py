@@ -82,14 +82,15 @@ class Evaluator:
         # Helper to define the unroll logic for either reset or eval_reset
         def make_unroll_fn(env, reset_type: str, unroll_length: int):
             def generate_unroll_logic(policy_params, key):
-                reset_keys = jax.random.split(key, num_eval_envs)
+                reset_key, unroll_key = jax.random.split(key)
+                reset_keys = jax.random.split(reset_key, num_eval_envs)
                 reset_fn = getattr(env, reset_type)
                 eval_first_state = reset_fn(reset_keys)
                 return generate_unroll(
                     env,
                     eval_first_state,
                     eval_policy_fn(policy_params),
-                    key,
+                    unroll_key,
                     unroll_length=unroll_length,
                     discount_act=discount_act,
                     discount_compute=discount_compute,

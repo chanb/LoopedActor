@@ -115,7 +115,7 @@ GRID="${GRID:-3}"; BANK="${BANK:-}"; EPISODE_LENGTH="${EPISODE_LENGTH:-40}"; EVA
 NUM_RANDOM_MOVES="${NUM_RANDOM_MOVES:-100}"; MIN_RANDOM_MOVES="${MIN_RANDOM_MOVES:-0}"; RANDOM_MOVES_ZIPF="${RANDOM_MOVES_ZIPF:-0}"; EVAL_NUM_RANDOM_MOVES="${EVAL_NUM_RANDOM_MOVES:-200}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-0.999}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; MIX_WEIGHT_STOP_GRAD="${MIX_WEIGHT_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; NORMALIZE_OBS="${NORMALIZE_OBS:-0}"; VALUE_EXPECTILE="${VALUE_EXPECTILE:-0.5}"; TARGET_KL="${TARGET_KL:-0}"; WEIGHT_DECAY="${WEIGHT_DECAY:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
+MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; EXPANSION="${EXPANSION:-4}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; TARGET_KL="${TARGET_KL:-0}"; WEIGHT_DECAY="${WEIGHT_DECAY:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_CRITERION="${HALT_CRITERION:-sigmoid}"; HALT_THRESHOLD="${HALT_THRESHOLD:-1e-3}"; HALT_SG_SURVIVAL="${HALT_SG_SURVIVAL:-0}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_ADAM_B1="${HALT_ADAM_B1:-0.9}"; HALT_ADAM_B2="${HALT_ADAM_B2:-0.999}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; STABLE_KL="${STABLE_KL:-0}"; STABLE_SOFTMAX="${STABLE_SOFTMAX:-0}"; READOUT="${READOUT:-thought}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 TOKENIZER="${TOKENIZER:-cell}"; TOKENIZER_CONV_FEATURES="${TOKENIZER_CONV_FEATURES:-64}"; ACTION_HEAD="${ACTION_HEAD:-readout}"; CELL_GEOMETRY="${CELL_GEOMETRY:-1}"
@@ -159,9 +159,6 @@ if [[ "$ARM" == mem_halt && "$HALT_CRITERION" == sigmoid ]]; then
   if awk -v b="${HALT_PRIOR_COEF:-0}" 'BEGIN { exit !(b > 0) }'; then
     ARM_FLAGS+=(--halt_prior_coef="$HALT_PRIOR_COEF"); RUN+="_hprior${HALT_PRIOR_COEF}"
     [[ "${HALT_PRIOR_HALT:-0.1}" != 0.1 ]] && { ARM_FLAGS+=(--halt_prior_halt="$HALT_PRIOR_HALT"); RUN+="_q${HALT_PRIOR_HALT}"; }
-  fi
-  if [[ "${HALT_UPDATE_PERIOD:-1}" != 1 ]]; then
-    ARM_FLAGS+=(--halt_update_period="$HALT_UPDATE_PERIOD"); RUN+="_hup${HALT_UPDATE_PERIOD}"
   fi
   if [[ "$HALT_ADAM_B1" != 0.9 || "$HALT_ADAM_B2" != 0.999 ]]; then
     ARM_FLAGS+=(--halt_adam_b1="$HALT_ADAM_B1" --halt_adam_b2="$HALT_ADAM_B2"); RUN+="_hadam${HALT_ADAM_B1}_${HALT_ADAM_B2}"
@@ -296,14 +293,6 @@ case "$COMPUTE_DTYPE" in
 esac
 [[ "$DYNAMIC_LOSS_SCALE" == 0 || "$DYNAMIC_LOSS_SCALE" == 1 ]] || { echo "DYNAMIC_LOSS_SCALE must be 0 or 1, got $DYNAMIC_LOSS_SCALE"; exit 1; }
 [[ "$COMPUTE_DTYPE" == float16 && "$DYNAMIC_LOSS_SCALE" == 0 ]] && { ARM_FLAGS+=(--no-dynamic_loss_scale); RUN+="_nols"; }
-case "$NORMALIZE_OBS" in
-  0) ARM_FLAGS+=(--no-normalize_observations) ;;
-  1) ARM_FLAGS+=(--normalize_observations); RUN+="_obsnorm" ;;
-  *) echo "NORMALIZE_OBS must be 0 or 1, got $NORMALIZE_OBS"; exit 1 ;;
-esac
-awk -v t="$VALUE_EXPECTILE" 'BEGIN { exit !(t + 0 == t && t > 0 && t < 1) }' \
-  || { echo "VALUE_EXPECTILE must be in (0, 1), got $VALUE_EXPECTILE"; exit 1; }
-[[ "$VALUE_EXPECTILE" != 0.5 ]] && { ARM_FLAGS+=(--value_expectile="$VALUE_EXPECTILE"); RUN+="_ve${VALUE_EXPECTILE}"; }
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k + 0 == k && k >= 0) }' || { echo "TARGET_KL must be >= 0, got $TARGET_KL"; exit 1; }
 awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$TARGET_KL"); RUN+="_tkl${TARGET_KL}"; }
 awk -v w="$WEIGHT_DECAY" 'BEGIN { exit !(w + 0 == w && w >= 0) }' || { echo "WEIGHT_DECAY must be >= 0, got $WEIGHT_DECAY"; exit 1; }

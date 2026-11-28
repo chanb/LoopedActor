@@ -37,13 +37,11 @@ fi
 # "<config name>|<env vars> <arm>"
 MEM_STUDY_CONFIGS=()
 for _gc in ${DISCOUNT_COMPUTES:-${DISCOUNT_COMPUTE:-0.999}}; do
-for _ve in ${VALUE_EXPECTILES:-0.5}; do
-  _sfx=""; [[ "$_ve" != 0.5 ]] && _sfx+="_ve${_ve}"; [[ "$_gc" != 0.999 ]] && _sfx+="_gc${_gc}"
-  for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} iso_mem"); done
-  for _t in ${MEM_HALT_ITERS-}; do MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} VALUE_EXPECTILE=${_ve} DISCOUNT_COMPUTE=${_gc} mem_halt"); done
+  _sfx=""; [[ "$_gc" != 0.999 ]] && _sfx+="_gc${_gc}"
+  for _t in ${ISO_ITERS-1 2 3 4}; do MEM_STUDY_CONFIGS+=("iso_mem_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} DISCOUNT_COMPUTE=${_gc} iso_mem"); done
+  for _t in ${MEM_HALT_ITERS-}; do MEM_STUDY_CONFIGS+=("mem_halt_it${_t}${_sfx}|MAX_THINK_ITERS=${_t} DISCOUNT_COMPUTE=${_gc} mem_halt"); done
 done
-done
-unset _t _ve _gc _sfx
+unset _t _gc _sfx
 
 # Measured cost of one run alone (bf16, GELU, each env's train.sh settings: 1024 envs x 64 steps, 64 minibatches x 4
 # epochs, 100M steps; RTX A4500 - the L40S should be at least as fast):

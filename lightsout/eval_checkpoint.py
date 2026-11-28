@@ -70,7 +70,8 @@ def evaluate(env, mod, policy_vars, norm, dist, n_levels, T, B, seed, halt_mode=
             steps += int(alive.sum())
             st = step_v(st, a)
             d_now = np.asarray(st.done) > 0.5; newly = d_now & ~done
-            succ[s0 + np.flatnonzero(newly)] = True; length[s0 + np.flatnonzero(newly)] = t + 1; done |= d_now
+            s_now = np.asarray(st.metrics['success']) > 0.5
+            succ[s0 + np.flatnonzero(newly & s_now)] = True; length[s0 + np.flatnonzero(newly)] = t + 1; done |= d_now
             if done.all():
                 break
     return dict(levels=int(n_levels), success=float(succ.mean()), mean_len=float(length.mean()),

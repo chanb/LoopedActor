@@ -9,7 +9,9 @@ import optax
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ppo import Args, make_optimizer  # noqa: E402
+from ppo import Args, make_optimizer, muon_labels  # noqa: E402
+from models.fprm import FPRMConfig  # noqa: E402
+from models.transformer_baseline import TransformerActorValue  # noqa: E402
 
 LR = 1e-2
 SHAPES = {  # as the fprm_mem actor-critic (d = 128 cut to 16)
@@ -50,3 +52,17 @@ def test_adam_unchanged():
     tx = make_optimizer(Args(learning_rate=LR, anneal_lr=False, max_grad_norm=0.0), params)
     u = tx.update({'params': {'core': {'k': {'kernel': jnp.arange(16.0).reshape(4, 4) - 7.5}}}}, tx.init(params), params)[0]
     assert np.allclose(np.abs(np.asarray(u['params']['core']['k']['kernel'])), LR, rtol=1e-2)  # Adam, not Muon
+
+
+@pytest.mark.parametrize('num_blocks', [1, 3])
+def test_muon_on_transformer_baselines(num_blocks):
+    # single_block (num_blocks=1) and multi_block (num_blocks>1) name their cores core_0, core_1, ...
+    net = TransformerActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2), num_blocks=num_blocks, output_dim_1=9)
+    params = net.init(jax.random.PRNGKey(0), jnp.zeros((1, 18)))
+    lbls = _flat(muon_labels(params)['params'])
+    core_2d = [k for k, v in _flat(params['params']).items()
+               if any(p.startswith('core_') for p in k.split('/')) and k.endswith('/kernel') and v.ndim == 2]
+    assert len(core_2d) == 4 * num_blocks  # qkv_proj, o_proj, gate_up_proj, down_proj per block
+    assert all(lbls[k] == 'muon' for k in core_2d)
+    assert all(lbls[k] == 'adam' for k in lbls if k not in core_2d)
+
