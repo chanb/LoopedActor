@@ -62,7 +62,7 @@ def test_muon_on_transformer_baselines(num_blocks):
     lbls = _flat(muon_labels(params)['params'])
     core_2d = [k for k, v in _flat(params['params']).items()
                if any(p.startswith('core_') for p in k.split('/')) and k.endswith('/kernel') and v.ndim == 2]
-    assert len(core_2d) == 4 * num_blocks  # qkv_proj, o_proj, gate_up_proj, down_proj per block
+    assert len(core_2d) == 4 * num_blocks  # qkv_proj, o_proj, up_proj, down_proj per block
     assert all(lbls[k] == 'muon' for k in core_2d)
     assert all(lbls[k] == 'adam' for k in lbls if k not in core_2d)
 

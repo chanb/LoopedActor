@@ -53,11 +53,7 @@ class FPRMConfig:
     num_heads: int = 4
     num_layers: int = 1
     expansion: float = 4.0
-    # MLP of every block: 'swiglu' (silu(gate) * up, hidden = expansion * d * 2/3) or 'gelu' (hidden = expansion * d),
-    # the hidden width rounded up to a multiple of mlp_round_to. The defaults (swiglu, 256) reproduce the public FPRM
-    # implementation; at d_model = 128 they round 341 up to 512 (1.5x the intended MLP size) - mlp_round_to = 64
-    # gives 384, 1 gives the intended 341.
-    mlp_type: str = 'swiglu'
+    # GELU MLP hidden width = round(expansion * d_model), rounded up to a multiple of mlp_round_to.
     mlp_round_to: int = 256
     softmax_temp: float = 1.0
     # Exclusive self attention (XSA, Zhai 2026, arXiv:2603.09078): per head, remove from each token's attention output
@@ -75,10 +71,6 @@ class FPRMConfig:
     # False -> plain pre-norm residuals (h = h + f(h); h = z + input_tokens):
     # no contractivity, intended for the non-looped baselines only.
     residual_scaling: bool = True
-
-    use_grid_conv: bool = True
-    conv_kernel: Tuple[int, int] = (3, 3)
-    conv_bias: bool = False
 
     fp_thresh: float = 0.1
     eps: float = 1e-8
@@ -132,17 +124,6 @@ def trunc_normal_init(stddev):
     at +-2 sigma), so Flax's `truncated_normal` is the exact counterpart.
     """
     return nn.initializers.truncated_normal(stddev=stddev)
-
-
-def pytorch_depthwise_conv_init(key, shape, dtype=jnp.float32):
-    """PyTorch nn.Conv2d default (Kaiming-uniform, a=sqrt(5)) for a bias-free
-    depthwise kernel: bound = 1/sqrt(fan_in) with fan_in = kH*kW*(in/groups).
-
-    Flax depthwise kernel shape: [kH, kW, in_channels/groups(=1), features].
-    """
-    fan_in = shape[0] * shape[1] * shape[2]
-    bound = 1.0 / math.sqrt(fan_in)
-    return jax.random.uniform(key, shape, dtype, -bound, bound)
 
 
 class FPRMAttention(nn.Module):
@@ -202,22 +183,18 @@ class FPRMAttention(nn.Module):
 
 
 def mlp_hidden_dim(cfg: FPRMConfig) -> int:
-    """Hidden width of the block MLP (see FPRMConfig.mlp_type / mlp_round_to)."""
-    assert cfg.mlp_type in ('swiglu', 'gelu'), cfg.mlp_type
+    """Hidden width of the block GELU MLP."""
     assert cfg.mlp_round_to >= 1, cfg.mlp_round_to
-    width = cfg.expansion * cfg.d_model * (2 / 3 if cfg.mlp_type == 'swiglu' else 1)
-    width = round_up_to_multiple(round(width), cfg.mlp_round_to)
-    return width
+    return round_up_to_multiple(round(cfg.expansion * cfg.d_model), cfg.mlp_round_to)
 
 
 def mlp_activation(y, cfg: FPRMConfig):
-    """The non-gated MLP's activation (GELU)."""
+    """The block MLP's activation (GELU)."""
     return jax.nn.gelu(y)
 
 
-class FPRMSwiGLU(nn.Module):
-    """The block MLP: SwiGLU matching the public implementation (default), or a GELU MLP (config.mlp_type).
-    Parameters: SwiGLU 'gate_up_proj' + 'down_proj'; GELU 'up_proj' + 'down_proj'."""
+class FPRMMLP(nn.Module):
+    """The block GELU MLP ('up_proj' + 'down_proj')."""
 
     config: FPRMConfig
 
@@ -227,36 +204,16 @@ class FPRMSwiGLU(nn.Module):
         H = cfg.d_model
         inter = mlp_hidden_dim(cfg)
         cdt = jnp.dtype(cfg.compute_dtype)
-
-        if cfg.mlp_type == 'gelu':
-            y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), dtype=cdt, name='up_proj')(x)
-            y = mlp_activation(y, cfg)
-            return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), dtype=cdt, name='down_proj')(y)
-
-        gate_up = nn.Dense(
-            2 * inter,
-            use_bias=False,
-            kernel_init=trunc_normal_init(1.0 / math.sqrt(H)),
-            dtype=cdt,
-            name='gate_up_proj',
-        )(x)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
-        y = jax.nn.silu(gate) * up
-        y = nn.Dense(
-            H,
-            use_bias=False,
-            kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)),
-            dtype=cdt,
-            name='down_proj',
-        )(y)
-        return y
+        y = nn.Dense(inter, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(H)), dtype=cdt, name='up_proj')(x)
+        y = mlp_activation(y, cfg)
+        return nn.Dense(H, use_bias=False, kernel_init=trunc_normal_init(1.0 / math.sqrt(inter)), dtype=cdt, name='down_proj')(y)
 
 
 class FPRMBlock(nn.Module):
     """Pre-norm Transformer block with coupled residual scaling.
 
     h = a1 * h + b1 * attn(rms_norm(h))
-    h = a1 * h + b1 * swiglu(rms_norm(h))
+    h = a1 * h + b1 * mlp(rms_norm(h))
     """
 
     config: FPRMConfig
@@ -268,32 +225,13 @@ class FPRMBlock(nn.Module):
             rms_norm(h, cfg.rms_norm_eps), token_mask, attn_mask
         )
         h = alpha_1 * h + beta_1 * out.astype(h.dtype)
-        out = FPRMSwiGLU(cfg, name='mlp')(rms_norm(h, cfg.rms_norm_eps))
+        out = FPRMMLP(cfg, name='mlp')(rms_norm(h, cfg.rms_norm_eps))
         h = alpha_1 * h + beta_1 * out.astype(h.dtype)
         return h
 
 
-def grid_conv_tokens(conv: nn.Module, z, grid_shape, prefix_len, suffix_len=0):
-    """Apply a 2-D convolution to the grid tokens of a token sequence.
-
-    Splits the prefix (and `suffix_len` trailing) tokens, reshapes the cell tokens to the explicit
-    rectangular [B, R, C, H] grid, applies the convolution, and reassembles.
-    Never infers the grid from sqrt(sequence_length): the public code does and
-    therefore fails for rectangular boards. A 1-D convolution over flattened
-    cells would create false row-wrap adjacency; this preserves 2-D topology.
-    """
-    B, L, H = z.shape
-    R, C = grid_shape
-    assert L == prefix_len + R * C + suffix_len, (L, prefix_len, R, C, suffix_len)
-    prefix = z[:, :prefix_len]
-    grid = z[:, prefix_len:prefix_len + R * C].reshape(B, R, C, H)
-    suffix = z[:, prefix_len + R * C:]
-    grid = conv(grid)
-    return jnp.concatenate([prefix, grid.reshape(B, R * C, H), suffix], axis=1)
-
-
 class FPRMCore(nn.Module):
-    """One recurrent FPRM core call: grid conv + input mixing + L blocks.
+    """One recurrent FPRM core call: input mixing + L blocks.
 
     Maps (hidden_states [B, L, H], input_tokens [B, L, H]) -> [B, L, H], where the
     sequence is [prefix_len tokens, R*C cell tokens, suffix_len tokens] and the
@@ -312,19 +250,6 @@ class FPRMCore(nn.Module):
         B, L, H = z.shape
         R, C = grid_shape
         assert L == prefix_len + R * C + suffix_len, (L, prefix_len, R, C, suffix_len)
-
-        # Rectangular depthwise grid convolution on the cell tokens.
-        if cfg.use_grid_conv:
-            conv = nn.Conv(
-                features=H,
-                kernel_size=cfg.conv_kernel,
-                padding='SAME',
-                feature_group_count=H,
-                use_bias=cfg.conv_bias,
-                kernel_init=pytorch_depthwise_conv_init,
-                name='grid_depthwise_conv',
-            )
-            z = grid_conv_tokens(conv, z, grid_shape, prefix_len, suffix_len)
 
         if cfg.residual_scaling:
             # Input-independent residual scaling (public 'input-independent').

@@ -81,7 +81,7 @@ class LightsOutEnv:
         self.m, self.n = config.m, config.n
         self.grid_size = self.m * self.n
         self.obs_channels = 0  # flat grid + goal vector
-        self.action_head = 'per_cell'
+        self.action_head = 'readout'
         self.threshold = int(self.grid_size * config.difficulty_threshold)
         assert 1 < self.threshold < self.grid_size, (self.threshold, self.grid_size)
         self.press = press_matrix(self.m, self.n)

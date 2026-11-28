@@ -20,7 +20,7 @@
 #   RANDOM_MOVES_ZIPF  with MIN_RANDOM_MOVES: length k drawn with p(k) ∝ k^-s (default 0 = uniform; _rzipf<s>)
 MEM_STUDY_ENVS="sokoban rushhour lightsout slidingpuzzle"
 MEM_STUDY_SEEDS="1 2 3 4 5 6 7 8 9 10"
-MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 MLP_TYPE=gelu DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
+MEM_STUDY_COMMON="COMPUTE_DTYPE=bfloat16 DISCOUNT_ACT=0.99"   # DISCOUNT_COMPUTE: per config
 MEM_STUDY_TAG="${MEM_STUDY_TAG:-}"   # appended to slurm job names (preserves a caller-set prefix/salt, if any)
 [[ -n "${MIN_RANDOM_MOVES:-}" ]] && { MEM_STUDY_COMMON+=" MIN_RANDOM_MOVES=${MIN_RANDOM_MOVES}"; MEM_STUDY_TAG+="_rmin${MIN_RANDOM_MOVES}"; }
 [[ -n "${RANDOM_MOVES_ZIPF:-}" ]] && { MEM_STUDY_COMMON+=" RANDOM_MOVES_ZIPF=${RANDOM_MOVES_ZIPF}"; MEM_STUDY_TAG+="_rzipf${RANDOM_MOVES_ZIPF}"; }

@@ -100,7 +100,7 @@ class RushHourEnv:
         self.m, self.n = config.m, config.n
         self.grid_size = self.m * self.n
         self.obs_channels = OBS_CHANNELS
-        self.action_head = 'per_cell'
+        self.action_head = 'readout'
         self.train_bank = load_bank(config.train_split, config.max_train_levels)
         self.eval_bank = load_bank(config.eval_split, config.max_eval_levels)
         self.num_train_levels = int(self.train_bank['grid'].shape[0])

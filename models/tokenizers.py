@@ -31,15 +31,13 @@ TOKENIZERS = ('cell', 'flat', 'conv')
 
 def check_tokenizer(tokenizer, action_head, obs_channels):
     assert tokenizer in TOKENIZERS, f'tokenizer must be one of {TOKENIZERS}, got {tokenizer!r}'
-    if action_head in ('per_cell', 'neighbour', 'blank'):
-        assert tokenizer == 'cell', f"the {action_head!r} action head needs tokenizer='cell'"
     if tokenizer == 'conv':
         assert obs_channels > 0, "tokenizer='conv' needs a cell-major plane observation (obs_channels > 0)"
 
 
 def core_config(config: FPRMConfig, tokenizer) -> FPRMConfig:
-    """The core's config: no grid convolution unless the tokens are grid cells."""
-    return config if tokenizer == 'cell' else dataclasses.replace(config, use_grid_conv=False)
+    """The core's config."""
+    return config
 
 
 def num_tokens(tokenizer, m, n, obs_dim, conv_features):

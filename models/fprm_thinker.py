@@ -46,63 +46,33 @@ from models.tokenizers import ObsTokenizer, check_tokenizer, core_config, token_
 PREFIX_LEN = 1  # [READOUT]
 
 
-def flat_grid_cell_features(grid, goal, m, n, geometry=True):
-    """Per-cell feature tensor [B, m*n, 11] from flat binary grid and goal.
+def flat_grid_cell_features(grid, goal, m, n):
+    """Per-cell feature tensor [B, m*n, 5] from flat binary grid and goal.
 
-    Features per cell: current one-hot (2), target one-hot (2), mismatch (1),
-    normalized row/col in [-1, 1] (2), boundary flags (4); geometry=False: the first 5 alone [B, m*n, 5].
+    Features per cell: current one-hot (2), target one-hot (2), mismatch (1).
     """
-    B, geometry_on = grid.shape[0], geometry
+    B = grid.shape[0]
     cur = grid.reshape(B, m * n, 1)
     tgt = goal.reshape(B, m * n, 1)
     cur_onehot = jnp.concatenate([1.0 - cur, cur], axis=-1)
     tgt_onehot = jnp.concatenate([1.0 - tgt, tgt], axis=-1)
     mismatch = jnp.abs(cur - tgt)
-
-    rows = jnp.arange(m * n) // n
-    cols = jnp.arange(m * n) % n
-    norm_row = jnp.where(m > 1, 2.0 * rows / jnp.maximum(m - 1, 1) - 1.0, 0.0)
-    norm_col = jnp.where(n > 1, 2.0 * cols / jnp.maximum(n - 1, 1) - 1.0, 0.0)
-    top = (rows == 0).astype(jnp.float32)
-    bottom = (rows == m - 1).astype(jnp.float32)
-    left = (cols == 0).astype(jnp.float32)
-    right = (cols == n - 1).astype(jnp.float32)
-    geometry = jnp.stack([norm_row, norm_col, top, bottom, left, right], axis=-1)
-    geometry = jnp.broadcast_to(geometry[None], (B, m * n, 6))
-
-    return jnp.concatenate(
-        [cur_onehot, tgt_onehot, mismatch] + ([geometry] if geometry_on else []), axis=-1
-    )
+    return jnp.concatenate([cur_onehot, tgt_onehot, mismatch], axis=-1)
 
 
-def grid_geometry(m, n, B):
-    rows = jnp.arange(m * n) // n
-    cols = jnp.arange(m * n) % n
-    norm_row = jnp.where(m > 1, 2.0 * rows / jnp.maximum(m - 1, 1) - 1.0, 0.0)
-    norm_col = jnp.where(n > 1, 2.0 * cols / jnp.maximum(n - 1, 1) - 1.0, 0.0)
-    top = (rows == 0).astype(jnp.float32); bottom = (rows == m - 1).astype(jnp.float32)
-    left = (cols == 0).astype(jnp.float32); right = (cols == n - 1).astype(jnp.float32)
-    geometry = jnp.stack([norm_row, norm_col, top, bottom, left, right], axis=-1)
-    return jnp.broadcast_to(geometry[None], (B, m * n, 6))
+def grid_channel_features(x_flat, m, n, channels):
+    """Per-cell features [B, m*n, channels] from a cell-major flat observation of m*n*channels values."""
+    return x_flat.reshape(x_flat.shape[0], m * n, channels)
 
 
-def grid_channel_features(x_flat, m, n, channels, geometry=True):
-    """Per-cell features [B, m*n, channels + 6] from a cell-major flat observation
-    of m*n*channels values (e.g. Sokoban wall/box/target/player planes); geometry=False: the planes alone [B, m*n, channels]."""
-    B = x_flat.shape[0]
-    cells = x_flat.reshape(B, m * n, channels)
-    return jnp.concatenate([cells, grid_geometry(m, n, B)], axis=-1) if geometry else cells
-
-
-def tokenize(x_flat, m, n, obs_channels, geometry=True):
-    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes), without the 6
-    geometry features if geometry=False."""
+def tokenize(x_flat, m, n, obs_channels):
+    """Cell feature tensor for either input mode (0 = flat grid + goal; > 0 = cell-major planes)."""
     if obs_channels > 0:
         assert x_flat.shape[-1] == m * n * obs_channels, (x_flat.shape, m, n, obs_channels)
-        return grid_channel_features(x_flat, m, n, obs_channels, geometry)
+        return grid_channel_features(x_flat, m, n, obs_channels)
     grid_size = m * n
     assert x_flat.shape[-1] == 2 * grid_size, (x_flat.shape, m, n)
-    return flat_grid_cell_features(x_flat[:, :grid_size], x_flat[:, grid_size:], m, n, geometry)
+    return flat_grid_cell_features(x_flat[:, :grid_size], x_flat[:, grid_size:], m, n)
 
 
 class FPRMThinkerActorValue(nn.Module):
@@ -128,9 +98,10 @@ class FPRMThinkerActorValue(nn.Module):
     output_dim_2: int = 1   # value
     # Input mode: 0 = flat grid + goal (2*m*n features); >0 = cell-major planes (m*n*obs_channels), used by Boxoban / Rush Hour.
     obs_channels: int = 0
-    # 'per_cell': one logit per cell token (one action per cell); 'readout': Dense(output_dim_1) on the readout token (Sokoban moves);
+    # 'readout': Dense(output_dim_1) on the readout token;
     # 'action_tokens': output_dim_1 learned action tokens after the readout token, logit a = Dense(1) on action token a's latent.
-    action_head: str = 'per_cell'
+    action_head: str = 'readout'
+    cell_pos_embed: bool = False   # tokenizer='cell': learned embedding per cell index added to cell tokens
     # Observation tokenization: 'cell' | 'flat' | 'conv' (see models/tokenizers.py).
     tokenizer: str = 'cell'
     tokenizer_conv_features: int = 64  # tokenizer='conv': conv output channels (= number of tokens)
@@ -138,6 +109,9 @@ class FPRMThinkerActorValue(nn.Module):
     def setup(self):
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         self.cell_projection = nn.Dense(self.config.d_model)
+        if self.cell_pos_embed:
+            assert self.tokenizer == 'cell', 'cell_pos_embed needs tokenizer=cell'
+            self.cell_pos = self.param('cell_pos_embed', nn.initializers.normal(stddev=0.02), (self.m * self.n, self.config.d_model))
         if self.tokenizer != 'cell':
             self.obs_tokenizer = ObsTokenizer(
                 self.tokenizer, self.m, self.n, self.obs_channels, self.config.d_model,
@@ -149,13 +123,9 @@ class FPRMThinkerActorValue(nn.Module):
             (1, 1, self.config.d_model),
         )
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
-        assert self.action_head in ('per_cell', 'readout', 'action_tokens'), self.action_head
+        assert self.action_head in ('readout', 'action_tokens'), self.action_head
         if self.action_head == 'action_tokens':
             self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, self.config.d_model))
-        # per_cell: shared per-cell logit head (no parameter depends on m * n); readout: logits from the readout token.
-        if self.action_head == 'per_cell':
-            assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
-        # per_cell: k = output_dim_1 // (m*n) logits per cell token (k logits per cell), flattened cell-major.
         self.actor_head = nn.Dense(actor_head_width(self.action_head, self.output_dim_1, self.m, self.n), bias_init=nn.initializers.zeros)
         self.value_head = nn.Dense(
             self.output_dim_2, bias_init=nn.initializers.zeros
@@ -173,6 +143,8 @@ class FPRMThinkerActorValue(nn.Module):
         if self.tokenizer == 'cell':
             cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
             cell_tokens = self.cell_projection(cell_features)
+            if self.cell_pos_embed:
+                cell_tokens = cell_tokens + self.cell_pos.astype(cell_tokens.dtype)
         else:
             cell_tokens = self.obs_tokenizer(x_flat)
         grid_shape = token_grid_shape(
@@ -184,7 +156,7 @@ class FPRMThinkerActorValue(nn.Module):
         )
         tokens = jnp.concatenate([readout_token, *action_tokens(self, B), cell_tokens], axis=1)
         token_mask = jnp.ones(tokens.shape[:2], bool)
-        per_token = self.action_head in ('per_cell', 'action_tokens')
+        per_token = self.action_head == 'action_tokens'
         prefix_len, tok = prefix_and_actor_tokens(self.action_head, self.output_dim_1)
 
         def heads(z):
@@ -286,5 +258,5 @@ def prefix_and_actor_tokens(action_head, num_actions):
 
 
 def actor_head_width(action_head, num_actions, m, n):
-    """Logits per token the actor head reads: k per cell (per_cell), 1 per action token, or all on the readout."""
-    return {'per_cell': num_actions // (m * n), 'action_tokens': 1}.get(action_head, num_actions)
+    """Logits per token the actor head reads: 1 per action token, or all on the readout."""
+    return 1 if action_head == 'action_tokens' else num_actions

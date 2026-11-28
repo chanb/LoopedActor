@@ -145,13 +145,10 @@ def _qkv(params, x, cfg: FPRMConfig):
     return q, k, v
 
 
-def _swiglu(params, x, cfg: FPRMConfig):
-    """The block MLP (FPRMSwiGLU) as a pure function: SwiGLU, or GELU (mlp_type='gelu')."""
-    if 'up_proj' in params:  # mlp_type='gelu'
-        y = mlp_activation(x @ params['up_proj']['kernel'].astype(x.dtype), cfg)
-        return y @ params['down_proj']['kernel'].astype(x.dtype)
-    gate, up = jnp.split(x @ params['gate_up_proj']['kernel'].astype(x.dtype), 2, axis=-1)
-    return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel'].astype(x.dtype)
+def _mlp(params, x, cfg: FPRMConfig):
+    """The block GELU MLP (FPRMMLP) as a pure function."""
+    y = mlp_activation(x @ params['up_proj']['kernel'].astype(x.dtype), cfg)
+    return y @ params['down_proj']['kernel'].astype(x.dtype)
 
 
 def rope_2d(x, grid_shape, num_cells, base=100.0):
@@ -178,15 +175,6 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
     rotated, so the memory keys are unchanged). Returns (h [B, N, H], per-layer [(k, v)] of the last (thought) token, each [B, nh, hd]).
     """
     B, N, H = x.shape
-    if cfg.use_grid_conv:
-        R, C = grid_shape
-        grid = jax.lax.conv_general_dilated(
-            z[:, :num_cells].reshape(B, R, C, H), params['grid_depthwise_conv']['kernel'], window_strides=(1, 1),
-            padding='SAME', dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=H,
-        )
-        if cfg.conv_bias:
-            grid = grid + params['grid_depthwise_conv']['bias']
-        z = jnp.concatenate([grid.reshape(B, num_cells, H), z[:, num_cells:]], axis=1)
     a1, b1, a2, b2 = _residual_scales(params, cfg)
     h, a1, b1 = _mixed_precision_input(a2 * z + b2 * x, a1, b1, cfg)
     scale = 1.0 / (math.sqrt(H // cfg.num_heads) * cfg.softmax_temp)
@@ -203,42 +191,12 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
             out = exclusive_self_attention(out, v)
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
-        h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg)
+        h = a1 * h + b1 * _mlp(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg)
         thought_kv.append((k[:, -1], v[:, -1]))
     return h.astype(x.dtype), thought_kv
 
 
 _NEG = -1e9  # log of a forced-zero probability (finite: keeps p log p and the gradients NaN-free)
-_BLANK_MOVES = ((-1, 0), (0, 1), (1, 0), (0, -1))  # action_head='neighbour': up, right, down, left (envs/slidingpuzzle_env.MOVES)
-
-
-def neighbour_table(m, n):
-    """action_head='neighbour': for every blank cell, the cell index of its neighbour in each move [m*n, 4] (the blank
-    itself off the board) and whether that move stays on the board [m*n, 4]."""
-    r, c = np.divmod(np.arange(m * n), n)
-    tr = r[:, None] + np.array([dr for dr, _ in _BLANK_MOVES])
-    tc = c[:, None] + np.array([dc for _, dc in _BLANK_MOVES])
-    ok = (tr >= 0) & (tr < m) & (tc >= 0) & (tc < n)
-    return np.where(ok, tr * n + tc, np.arange(m * n)[:, None]), ok
-
-
-class SplitDense(nn.Module):
-    """action_head='blank': `features` Dense(1), the i-th reading only the i-th of `features` equal chunks of the input,
-    each chunk rms-normed on its own (kernel [in / features, features]: column i is head i's weights)."""
-    features: int
-    eps: float = 1e-6
-
-    @nn.compact
-    def __call__(self, x):
-        assert x.shape[-1] % self.features == 0, (x.shape, self.features)
-        kernel = self.param('kernel', nn.initializers.lecun_normal(), (x.shape[-1] // self.features, self.features))
-        bias = self.param('bias', nn.initializers.zeros, (self.features,))
-        return split_dense(x, kernel, bias, self.eps)
-
-
-def split_dense(x, kernel, bias, eps):
-    x = rms_norm(x.reshape(x.shape[:-1] + (kernel.shape[1], -1)), eps)
-    return jnp.einsum('...gd,dg->...g', x, kernel) + bias
 _KL_EPS = 1e-10  # floor inside log KL (KL may round to 0 or slightly below)
 
 
@@ -312,8 +270,7 @@ class FPRMMemHaltActorValue(nn.Module):
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
-    action_head: str = 'per_cell'  # 'per_cell' | 'readout' (see FPRMThinkerActorValue) | 'neighbour' | 'blank' (see the module docstring)
-    cell_geometry: bool = True     # tokenizer='cell': append the 6 geometry features to each cell token (see the module docstring)
+    action_head: str = 'readout'   # 'readout' | 'action_tokens'
     cell_pos_embed: bool = False   # tokenizer='cell': add a learned embedding per cell index to the cell tokens (actor only)
     cell_rope: bool = False        # 2-D RoPE on the cells' attention queries / keys by (row, col) (actor only; see rope_2d)
     remat: bool = True             # rematerialize each pass in the backward pass
@@ -322,10 +279,7 @@ class FPRMMemHaltActorValue(nn.Module):
     tokenizer_conv_features: int = 64
 
     def setup(self):
-        assert self.action_head in ('per_cell', 'readout', 'neighbour', 'blank', 'action_tokens'), self.action_head
-        assert self.action_head not in ('neighbour', 'blank') or (self.output_dim_1 == 4 and self.obs_channels > 0), \
-            f"{self.action_head!r} needs 4 actions and a plane observation whose channel 0 marks the blank"
-        assert self.cell_geometry or self.tokenizer == 'cell', 'cell_geometry=False needs tokenizer=cell'
+        assert self.action_head in ('readout', 'action_tokens'), self.action_head
 
         assert self.max_think_iters >= 1 and self.value_iters >= 1, (self.max_think_iters, self.value_iters)
         assert self.halt_criterion in ('kl', 'l2', 'sigmoid'), self.halt_criterion
@@ -351,31 +305,22 @@ class FPRMMemHaltActorValue(nn.Module):
         if self.action_head == 'action_tokens':
             self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, H))
         self.core = FPRMCore(core_config(self.config, self.tokenizer))
-        if self.action_head == 'per_cell':
-            assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
-        if self.action_head == 'blank':
-            assert H % self.output_dim_1 == 0, (H, self.output_dim_1)
-            self.actor_head = SplitDense(self.output_dim_1)
-        else:
-            self.actor_head = nn.Dense(
-                {'per_cell': self.output_dim_1 // (self.m * self.n), 'neighbour': 1, 'action_tokens': 1}.get(self.action_head, self.output_dim_1),
-                bias_init=nn.initializers.zeros,
-            )
+        self.actor_head = nn.Dense(
+            1 if self.action_head == 'action_tokens' else self.output_dim_1,
+            bias_init=nn.initializers.zeros,
+        )
         self.latent_init = make_latent_init(self.config)
         # The critic: the plain FPRM model (own parameters) for a fixed value_iters core calls; only its value is used.
         self.critic = FPRMThinkerActorValue(
             m=self.m, n=self.n, config=self.config, max_think_iters=self.value_iters, min_think_iters=self.value_iters,
             halt_criterion='latent_residual', halt_residual_thresh=-1.0, output_dim_1=1,  # its logits are unused
             output_dim_2=self.output_dim_2, obs_channels=self.obs_channels, action_head='readout',
+            cell_pos_embed=self.cell_pos_embed,
             tokenizer=self.tokenizer, tokenizer_conv_features=self.tokenizer_conv_features,
         )
 
     def __call__(self, x, normalizer_params=None, halt_key=None, halt_steps=None):
         _, value = self.critic(x, normalizer_params)
-        if self.action_head in ('neighbour', 'blank'):  # the blank from the raw observation, before normalization
-            blank = jnp.argmax(x.reshape(-1, self.m * self.n, self.obs_channels)[..., 0], axis=-1)  # [B]
-        if self.action_head == 'neighbour':
-            nbr_idx, nbr_ok = (jnp.asarray(t)[blank] for t in neighbour_table(self.m, self.n))  # [B, 4] each
         if normalizer_params is not None:
             x = (x - normalizer_params.mean) / (normalizer_params.std)
 
@@ -386,11 +331,10 @@ class FPRMMemHaltActorValue(nn.Module):
         H = cfg.d_model
         T = self.max_think_iters
         S = max(T - 1, 1)
-        per_cell = self.action_head in ('per_cell', 'neighbour')
         sigmoid_head = self.halting and self.halt_criterion == 'sigmoid'
 
         if self.tokenizer == 'cell':
-            cells = self.cell_projection(tokenize(x_flat, self.m, self.n, self.obs_channels, self.cell_geometry))
+            cells = self.cell_projection(tokenize(x_flat, self.m, self.n, self.obs_channels))
             if self.cell_pos_embed:
                 cells = cells + self.cell_pos.astype(cells.dtype)
         else:
@@ -417,17 +361,8 @@ class FPRMMemHaltActorValue(nn.Module):
             return rms_norm(h, eps=cfg.rms_norm_eps)
 
         def readout(z_carried, act_latent):  # z_carried: cells + SEP (+ action tokens)
-            z_cells = z_carried[:, :P]
             if act_tokens:
                 logits = (feat(z_carried[:, P + 1:]) @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
-            elif per_cell:
-                cell_latents = feat(z_cells)
-                logits = (cell_latents @ actor_p['kernel'] + actor_p['bias']).reshape(B, -1)
-                if self.action_head == 'neighbour':
-                    logits = jnp.where(nbr_ok, jnp.take_along_axis(logits, nbr_idx, axis=-1), _NEG)
-            elif self.action_head == 'blank':
-                act_latent = jnp.take_along_axis(z_cells, blank[:, None, None], axis=1)[:, 0]
-                logits = split_dense(act_latent, actor_p['kernel'], actor_p['bias'], cfg.rms_norm_eps)
             else:
                 logits = feat(act_latent) @ actor_p['kernel'] + actor_p['bias']
             assert logits.shape[-1] == self.output_dim_1, (logits.shape, self.output_dim_1)

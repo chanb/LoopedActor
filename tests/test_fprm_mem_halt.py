@@ -237,111 +237,6 @@ def test_readout_latent_sown(readout):
     assert jnp.allclose(jnp.linalg.norm(rn(h[1:]) - rn(h[:-1]), axis=-1), inter['halt_signal_t'][1:], rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize('N', [3, 4])
-def test_neighbour_table_matches_env_moves(N):
-    # action_head='neighbour' must index the tile each of the env's 4 blank moves slides, and mask the no-op moves.
-    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
-    from models.fprm_mem_halt import neighbour_table
-    env = SlidingPuzzleEnv(config=default_config().copy_and_resolve_references())
-    env.m = env.n = N
-    idx, ok = neighbour_table(N, N)
-    puzzle = jnp.arange(N * N, dtype=jnp.int32).reshape(N, N)
-    for b in range(N * N):
-        for a in range(4):
-            _, target, moved = env.move(puzzle, jnp.array([b // N, b % N]), a)
-            assert bool(moved) == ok[b, a] and int(target[0] * N + target[1]) == idx[b, a], (b, a)
-
-
-@pytest.mark.parametrize('halting', [False, True])
-def test_neighbour_head_gathers_the_cell_logits(halting):
-    # 'neighbour' logits = the per-cell logits (same params) of the blank's neighbours, off-board moves at _NEG, also
-    # with observation normalization (the blank is read from the raw observation).
-    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
-    from models.fprm_mem_halt import _NEG, neighbour_table
-    from utils import running_statistics
-    N = 3
-    env = SlidingPuzzleEnv(config=default_config())
-    obs = jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), 16))
-    kw = dict(halting=halting, min_think_iters=1, obs_channels=N * N, stable_softmax=True)
-    nbr, cell = _net(action_head='neighbour', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=N * N, **kw)
-    params = nbr.init(jax.random.PRNGKey(1), obs)['params']
-    norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
-    blank = jnp.argmax(obs.reshape(16, N * N, N * N)[..., 0], axis=-1)
-    idx, ok = (jnp.asarray(t)[blank] for t in neighbour_table(N, N))
-    assert int(ok.sum(-1).min()) >= 2 and int(ok.sum(-1).max()) <= 4
-    key = 'policy_log_probs_t' if halting else 'logits'  # by pass [T, B, A]; without halting the last pass's [B, A]
-    for n in (None, norm):
-        got = jax.nn.log_softmax(_intermediates(nbr, params, obs, normalizer_params=n)[key])
-        logits = _intermediates(cell, params, obs, normalizer_params=n)[key]
-        want = jax.nn.log_softmax(jnp.where(ok, jnp.take_along_axis(logits, jnp.broadcast_to(idx, logits.shape[:-1] + (4,)), -1), _NEG))
-        assert jnp.allclose(got, want, atol=1e-5)
-        assert bool(jnp.all(jnp.where(ok, True, jnp.exp(got) == 0.0)))
-
-
-def _puzzle_obs(n_boards=16):
-    from envs.slidingpuzzle_env import SlidingPuzzleEnv, default_config
-    env = SlidingPuzzleEnv(config=default_config())
-    return jax.vmap(lambda k: env._make_state(k, env.scramble(k, 20)).obs)(jax.random.split(jax.random.PRNGKey(0), n_boards))
-
-
-def test_blank_head_reads_the_blank_cell():
-    # 'blank' logits = move i's Dense(1) on the i-th quarter of the blank cell's latent, each quarter rms-normed on its
-    # own, unmasked, also with observation normalization (the blank is read from the raw observation). The cell latents
-    # come from a per_cell net with an identity kernel (rms_norm is scale-invariant, so its full-latent norm drops out).
-    from models.fprm import rms_norm
-    from utils import running_statistics
-    N, H = 3, CFG.d_model
-    obs = _puzzle_obs()
-    kw = dict(halting=False, obs_channels=N * N)
-    blk, cell = _net(action_head='blank', output_dim_1=4, **kw), _net(action_head='per_cell', output_dim_1=H * N * N, **kw)
-    params = blk.init(jax.random.PRNGKey(1), obs)['params']
-    k, b = params['actor_head']['kernel'], jax.random.normal(jax.random.PRNGKey(2), (4,))  # k: [H / 4, 4]
-    assert k.shape == (H // 4, 4)
-    params = _with(params, 'actor_head', bias=b)
-    cell_params = _with(params, 'actor_head', kernel=jnp.eye(H), bias=jnp.zeros(H))
-    norm = running_statistics.update(running_statistics.init_state(obs.shape[-1:]), obs)
-    blank = jnp.argmax(obs.reshape(16, N * N, N * N)[..., 0], axis=-1)
-    for n in (None, norm):
-        got = _intermediates(blk, params, obs, normalizer_params=n)['logits']
-        latents = _intermediates(cell, cell_params, obs, normalizer_params=n)['logits'].reshape(16, N * N, H)
-        quarters = latents[jnp.arange(16), blank].reshape(16, 4, H // 4)
-        want = jnp.stack([rms_norm(quarters[:, i], CFG.rms_norm_eps) @ k[:, i] + b[i] for i in range(4)], axis=-1)
-        assert jnp.allclose(got, want, atol=1e-4)
-
-
-@pytest.mark.parametrize('action_head', ['neighbour', 'blank'])
-def test_no_cell_geometry_drops_the_geometry_features(action_head):
-    # cell_geometry=False = cell_geometry=True with the cell projection's 6 geometry rows zeroed.
-    N = 3
-    obs = _puzzle_obs()
-    kw = dict(halting=False, obs_channels=N * N, action_head=action_head, output_dim_1=4)
-    geo, nogeo = _net(**kw), _net(cell_geometry=False, **kw)
-    params = nogeo.init(jax.random.PRNGKey(1), obs)['params']
-    assert params['cell_projection']['kernel'].shape[0] == N * N
-    k = params['cell_projection']['kernel']
-    params_geo = {**params, 'cell_projection': {**params['cell_projection'],
-                                                'kernel': jnp.concatenate([k, jnp.zeros((6, k.shape[1]), k.dtype)])}}
-    got = _intermediates(nogeo, params, obs)['logits']
-    want = _intermediates(geo, params_geo, obs)['logits']
-    assert jnp.allclose(got, want, atol=1e-5)
-
-
-
-def test_no_cell_geometry_flat_grid_goal():
-    # Lights Out input (obs_channels=0: flat grid + goal): cell_geometry=False = cell_geometry=True with the cell
-    # projection's 6 geometry rows zeroed, leaving the 5 per-cell features (current / target one-hots, mismatch).
-    obs = jax.random.bernoulli(jax.random.PRNGKey(0), 0.5, (2, 18)).astype(jnp.float32)
-    kw = dict(halting=False, obs_channels=0, action_head='readout', output_dim_1=9, cell_pos_embed=True)
-    geo, nogeo = _net(**kw), _net(cell_geometry=False, **kw)
-    params = nogeo.init(jax.random.PRNGKey(1), obs)['params']
-    k = params['cell_projection']['kernel']
-    assert k.shape[0] == 5
-    params_geo = {**params, 'cell_projection': {**params['cell_projection'],
-                                                'kernel': jnp.concatenate([k, jnp.zeros((6, k.shape[1]), k.dtype)])}}
-    got = _intermediates(nogeo, params, obs)['logits']
-    want = _intermediates(geo, params_geo, obs)['logits']
-    assert jnp.allclose(got, want, atol=1e-5)
-
 def test_critic_is_a_separate_fixed_budget_fprm():
     # The value is the plain FPRM critic's (own 'critic' params, value_iters core calls), whatever the actor's budget.
     from models.fprm_thinker import FPRMThinkerActorValue
@@ -440,43 +335,33 @@ def test_mixture_policy(min_iters):
     assert float(jnp.abs(g(sg)['kernel']).sum()) == 0
 
 
-def test_no_grid_conv():
-    # use_grid_conv=False: no depthwise grid convolution in the core (no params), the net still runs.
-    x = jax.random.normal(jax.random.PRNGKey(1), (2, 18))
-    nets = {g: FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=g), max_think_iters=4)
-            for g in (True, False)}
-    params = {g: net.init(jax.random.PRNGKey(0), x)['params'] for g, net in nets.items()}
-    names = {g: {'/'.join(k.key for k in path) for path, _ in jax.tree_util.tree_flatten_with_path(p)[0]} for g, p in params.items()}
-    assert any('grid_depthwise_conv' in n for n in names[True])
-    assert not any('grid_depthwise_conv' in n for n in names[False])
-    out = nets[False].apply({'params': params[False]}, x)
-    assert all(bool(jnp.all(jnp.isfinite(v))) for v in jax.tree_util.tree_leaves(out) if jnp.issubdtype(v.dtype, jnp.floating))
-
-
 @pytest.mark.parametrize('pos_embed', [False, True])
 def test_cell_pos_embed_breaks_cell_symmetry(pos_embed):
-    # No grid conv, no geometry: the actor sees the cells as a set, so every 3x3 board (each tile once) gives the same
+    # No geometry: the actor sees the cells as a set, so every 3x3 board (each tile once) gives the same
     # logits. cell_pos_embed adds a learned embedding per cell index, and the logits then depend on the board.
     boards = jnp.array([[1, 2, 3, 4, 5, 6, 0, 7, 8], [6, 2, 0, 1, 8, 3, 5, 7, 4]])
     x = jax.nn.one_hot(boards, 9).reshape(2, -1)
-    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=False), max_think_iters=2,
-                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='blank', cell_geometry=False,
+    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2), max_think_iters=2,
+                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='readout',
                                 cell_pos_embed=pos_embed)
     params = net.init(jax.random.PRNGKey(0), x)['params']
     assert ('cell_pos_embed' in params) == pos_embed
+    assert ('cell_pos_embed' in params['critic']) == pos_embed
     params = jax.tree_util.tree_map(lambda a: a + 0.3 * jax.random.normal(jax.random.PRNGKey(1), a.shape), params)
-    logits = _intermediates(net, params, x)['logits']
+    inter = _intermediates(net, params, x)
+    logits, value = inter['logits'], inter['value']
     assert jnp.allclose(logits[0], logits[1], atol=1e-5) != pos_embed  # equal up to float summation order
+    assert jnp.allclose(value[0], value[1], atol=1e-5) != pos_embed
 
 
 @pytest.mark.parametrize('rope', [False, True])
 def test_cell_rope_breaks_cell_symmetry(rope):
-    # No grid conv, no geometry: without a position signal the actor sees the board as a set (same logits for two boards
+    # No geometry: without a position signal the actor sees the board as a set (same logits for two boards
     # with the same tiles in other places); 2-D RoPE gives it the positions.
     boards = jnp.array([[1, 2, 3, 4, 5, 6, 0, 7, 8], [6, 2, 0, 1, 8, 3, 5, 7, 4]])
     x = jax.nn.one_hot(boards, 9).reshape(2, -1)
-    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=False), max_think_iters=2,
-                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='blank', cell_geometry=False,
+    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2), max_think_iters=2,
+                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='readout',
                                 cell_rope=rope)
     params = net.init(jax.random.PRNGKey(0), x)['params']
     params = jax.tree_util.tree_map(lambda a: a + 0.3 * jax.random.normal(jax.random.PRNGKey(1), a.shape), params)

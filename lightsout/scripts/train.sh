@@ -84,7 +84,7 @@ EPISODE_LENGTH="${EPISODE_LENGTH:-$DEFAULT_EPISODE_LENGTH}"
 EVAL_EPISODE_LENGTH="${EVAL_EPISODE_LENGTH:-$DEFAULT_EVAL_EPISODE_LENGTH}"
 DISCOUNT_ACT="${DISCOUNT_ACT:-0.99}"; DISCOUNT_COMPUTE="${DISCOUNT_COMPUTE:-1.0}"
 MAX_THINK_ITERS="${MAX_THINK_ITERS:-16}"; VALUE_ITERS="${VALUE_ITERS:-$MAX_THINK_ITERS}"; POLICY_PARAM="${POLICY_PARAM:-last}"; LOGIT_SUM_STOP_GRAD="${LOGIT_SUM_STOP_GRAD:-0}"; MIX_WEIGHT_STOP_GRAD="${MIX_WEIGHT_STOP_GRAD:-0}"; NUM_BLOCKS="${NUM_BLOCKS:-16}"; THOUGHT_NORM="${THOUGHT_NORM:-0}"
-MLP_TYPE="${MLP_TYPE:-swiglu}"; MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
+MLP_ROUND_TO="${MLP_ROUND_TO:-256}"; COMPUTE_DTYPE="${COMPUTE_DTYPE:-float32}"; DYNAMIC_LOSS_SCALE="${DYNAMIC_LOSS_SCALE:-1}"; TARGET_KL="${TARGET_KL:-0}"; NUM_EPOCHS="${NUM_EPOCHS:-4}"
 HALT_CRITERION="${HALT_CRITERION:-sigmoid}"; HALT_THRESHOLD="${HALT_THRESHOLD:-1e-3}"; HALT_SG_SURVIVAL="${HALT_SG_SURVIVAL:-0}"
 HALT_ENTROPY_COST="${HALT_ENTROPY_COST:-0}"; HALT_HEAD_GRAD="${HALT_HEAD_GRAD:-0}"; HALT_KL_REVERSE="${HALT_KL_REVERSE:-0}"; MIN_THINK_ITERS="${MIN_THINK_ITERS:-2}"
 RUN="$ARM"
@@ -164,11 +164,6 @@ case "${OPTIMAL_HORIZON:-0}" in
   1) ARM_FLAGS+=(--lightsout_optimal_horizon); RUN+="_opth" ;;
   *) echo "OPTIMAL_HORIZON must be 0 or 1, got $OPTIMAL_HORIZON"; exit 1 ;;
 esac
-case "$MLP_TYPE" in
-  swiglu) ;;
-  gelu) ARM_FLAGS+=(--mlp_type=gelu); RUN+="_gelu" ;;
-  *) echo "MLP_TYPE must be swiglu or gelu, got $MLP_TYPE"; exit 1 ;;
-esac
 [[ "$MLP_ROUND_TO" =~ ^[1-9][0-9]*$ ]] || { echo "MLP_ROUND_TO must be a positive integer, got $MLP_ROUND_TO"; exit 1; }
 [[ "$MLP_ROUND_TO" != 256 ]] && { ARM_FLAGS+=(--mlp_round_to="$MLP_ROUND_TO"); RUN+="_mr${MLP_ROUND_TO}"; }
 case "$COMPUTE_DTYPE" in
@@ -184,11 +179,10 @@ awk -v k="$TARGET_KL" 'BEGIN { exit !(k > 0) }' && { ARM_FLAGS+=(--target_kl="$T
 [[ "$NUM_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_EPOCHS must be a positive integer, got $NUM_EPOCHS"; exit 1; }
 [[ "$NUM_EPOCHS" != 4 ]] && RUN+="_ep${NUM_EPOCHS}"
 need_mem() { [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] || { echo "$1 needs arm iso_mem or mem_halt"; exit 1; }; }
-case "${ACTION_HEAD:-per_cell}" in
-  per_cell) ;;
-  readout) need_mem ACTION_HEAD=readout; ARM_FLAGS+=(--action_head=readout); RUN+="_aro" ;;
+case "${ACTION_HEAD:-readout}" in
+  readout) ;;
   action_tokens) need_mem ACTION_HEAD=action_tokens; ARM_FLAGS+=(--action_head=action_tokens); RUN+="_aact" ;;
-  *) echo "ACTION_HEAD must be per_cell, readout or action_tokens, got $ACTION_HEAD"; exit 1 ;;
+  *) echo "ACTION_HEAD must be readout or action_tokens, got $ACTION_HEAD"; exit 1 ;;
 esac
 case "${STABLE_SOFTMAX:-0}" in
   0) ;;
@@ -209,16 +203,6 @@ case "${XSA:-0}" in
   0) ;;
   1) ARM_FLAGS+=(--xsa); RUN+="_xsa" ;;
   *) echo "XSA must be 0 or 1, got $XSA"; exit 1 ;;
-esac
-case "${GRID_CONV:-1}" in
-  1) ;;
-  0) ARM_FLAGS+=(--no-use_grid_conv); RUN+="_nogconv" ;;
-  *) echo "GRID_CONV must be 0 or 1, got $GRID_CONV"; exit 1 ;;
-esac
-case "${CELL_GEOMETRY:-1}" in
-  1) ;;
-  0) need_mem CELL_GEOMETRY=0; ARM_FLAGS+=(--no-cell_geometry); RUN+="_nogeo" ;;
-  *) echo "CELL_GEOMETRY must be 0 or 1, got $CELL_GEOMETRY"; exit 1 ;;
 esac
 case "${OPTIMIZER:-adam}" in
   adam) ;;

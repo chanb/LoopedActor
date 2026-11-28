@@ -119,21 +119,13 @@ class Args:
     # geometry; 'flat' = one token per observation dimension; 'conv' = 3x3 conv, one token per output channel
     tokenizer: str = 'cell'
     tokenizer_conv_features: int = 64     # tokenizer='conv': conv output channels (= number of tokens)
-    action_head: str = ''                 # '' = the env's own ('per_cell' / 'readout'); 'neighbour' (fprm_mem,
-                                          # slidingpuzzle-*): the blank's 4 moves read from its neighbours' cell latents;
-                                          # 'blank' (same archs and envs): Dense(4) on the blank's own cell latent, unmasked
-                                          # 'action_tokens' (any env / arch): |A| learned action tokens in the input, logit a
-                                          # read off action token a's latent
-    use_grid_conv: bool = True            # --no-use_grid_conv (fprm, fprm_mem): no depthwise grid convolution on the cell latents in the core
-    cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-* / lightsout-*): cell tokens
+    action_head: str = 'readout'          # 'readout' (Dense(A) on readout token) | 'action_tokens' (|A| learned action tokens)
     cell_pos_embed: bool = False          # fprm_mem, tokenizer=cell: learned embedding per cell index added to the actor's cell tokens
-                                          # without the 6 row/col/edge features, just the tile one-hot
     cell_rope: bool = False               # fprm_mem: 2-D RoPE by cell (row, col) on the actor's attention queries / keys
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
     xsa: bool = False                     # exclusive self attention (arXiv:2603.09078) in every FPRM attention layer: drop each token's
                                           # output component along its own value vector (per head, before o_proj)
-    mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
-    mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
+    mlp_round_to: int = 256               # GELU MLP hidden width rounded up to a multiple of this
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
                                           # bfloat16 is the safe choice: float16 activations can overflow (inf -> NaN), which loss scaling cannot fix
     dynamic_loss_scale: bool = True       # compute_dtype=float16 only: scale the loss by S so small fp16 gradients do not underflow; a minibatch
@@ -489,15 +481,8 @@ def main(args: Args):
     action_size = env.action_size
     goal_size = env.goal_size
     obs_channels = getattr(env, 'obs_channels', 0)          # > 0 = plane-tokenized grid observation (Boxoban, Rush Hour)
-    action_head = getattr(env, 'action_head', 'readout' if obs_channels > 0 else 'per_cell')  # plane-tokenized envs use the readout head by default
-    if args.action_head:
-        assert args.action_head not in ('neighbour', 'blank') or (args.env_id.startswith('slidingpuzzle-')
-                                                   and args.architecture == 'fprm_mem'), \
-            f"action_head={args.action_head!r} needs a slidingpuzzle-* env and architecture fprm_mem"
-        action_head = args.action_head
-    assert args.cell_geometry or (args.env_id.startswith(('slidingpuzzle-', 'lightsout-')) and args.tokenizer == 'cell'
-                                  and args.architecture == 'fprm_mem'), \
-        '--no-cell_geometry needs a slidingpuzzle-* or lightsout-* env, tokenizer=cell and architecture fprm_mem'
+    action_head = args.action_head or getattr(env, 'action_head', 'readout')
+    assert action_head in ('readout', 'action_tokens'), f"action_head must be 'readout' or 'action_tokens', got {action_head!r}"
     stochastic_halt = args.variable_budget and args.halt_criterion == 'sigmoid'
     assert args.halt_objective != 'sac' or args.halt_soft_backup in ('sampled', 'full'), \
         "halt_objective='sac' needs halt_soft_backup sampled / full"
@@ -511,11 +496,9 @@ def main(args: Args):
         num_heads=args.fprm_num_heads,
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
-        mlp_type=args.mlp_type,
         xsa=args.xsa,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
-        use_grid_conv=args.use_grid_conv,
     )
     if args.architecture == 'fprm_mem':
         assert args.halt_clip in ('joint', 'path', 'each'), f"halt_clip must be joint, path or each, got {args.halt_clip}"
@@ -541,7 +524,6 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
-            cell_geometry=args.cell_geometry,
             cell_pos_embed=args.cell_pos_embed,
             cell_rope=args.cell_rope,
             tokenizer=args.tokenizer,
@@ -557,6 +539,7 @@ def main(args: Args):
             output_dim_1=action_size,
             obs_channels=obs_channels,
             action_head=action_head,
+            cell_pos_embed=args.cell_pos_embed,
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
         )

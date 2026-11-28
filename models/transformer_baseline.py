@@ -39,13 +39,17 @@ class TransformerActorValue(nn.Module):
     output_dim_1: int = 9   # action logits (= m * n buttons)
     output_dim_2: int = 1   # value
     obs_channels: int = 0          # see FPRMThinkerActorValue
-    action_head: str = 'per_cell'  # see FPRMThinkerActorValue
+    action_head: str = 'readout'   # see FPRMThinkerActorValue
+    cell_pos_embed: bool = False   # tokenizer='cell': learned embedding per cell index added to cell tokens
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
     tokenizer_conv_features: int = 64
 
     def setup(self):
         check_tokenizer(self.tokenizer, self.action_head, self.obs_channels)
         self.cell_projection = nn.Dense(self.config.d_model)
+        if self.cell_pos_embed:
+            assert self.tokenizer == 'cell', 'cell_pos_embed needs tokenizer=cell'
+            self.cell_pos = self.param('cell_pos_embed', nn.initializers.normal(stddev=0.02), (self.m * self.n, self.config.d_model))
         if self.tokenizer != 'cell':
             self.obs_tokenizer = ObsTokenizer(
                 self.tokenizer, self.m, self.n, self.obs_channels, self.config.d_model,
@@ -61,12 +65,9 @@ class TransformerActorValue(nn.Module):
             FPRMCore(core_config(self.config, self.tokenizer), name=f'core_{i}')
             for i in range(self.num_blocks)
         ]
-        assert self.action_head in ('per_cell', 'readout', 'action_tokens'), self.action_head
+        assert self.action_head in ('readout', 'action_tokens'), self.action_head
         if self.action_head == 'action_tokens':
             self.action_embed = self.param('action_embed', nn.initializers.normal(stddev=0.02), (self.output_dim_1, self.config.d_model))
-        if self.action_head == 'per_cell':
-            assert self.output_dim_1 % (self.m * self.n) == 0, (self.output_dim_1, self.m, self.n)
-        # per_cell: k = output_dim_1 // (m*n) logits per cell token (k=1 for one logit per cell, k=2 for Rush Hour), flattened cell-major.
         self.actor_head = nn.Dense(actor_head_width(self.action_head, self.output_dim_1, self.m, self.n), bias_init=nn.initializers.zeros)
         self.value_head = nn.Dense(
             self.output_dim_2, bias_init=nn.initializers.zeros
@@ -84,6 +85,8 @@ class TransformerActorValue(nn.Module):
         if self.tokenizer == 'cell':
             cell_features = tokenize(x_flat, self.m, self.n, self.obs_channels)
             cell_tokens = self.cell_projection(cell_features)
+            if self.cell_pos_embed:
+                cell_tokens = cell_tokens + self.cell_pos.astype(cell_tokens.dtype)
         else:
             cell_tokens = self.obs_tokenizer(x_flat)
         grid_shape = token_grid_shape(
@@ -98,7 +101,7 @@ class TransformerActorValue(nn.Module):
 
         def readout(z):
             readout_latent = rms_norm(z[:, 0], eps=self.config.rms_norm_eps)
-            if self.action_head in ('per_cell', 'action_tokens'):
+            if self.action_head == 'action_tokens':
                 latents = rms_norm(z[:, tok], eps=self.config.rms_norm_eps)
                 logits = self.actor_head(latents).reshape(latents.shape[0], -1)  # [B, m*n*k] / [B, A]
             else:
