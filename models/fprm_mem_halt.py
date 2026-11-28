@@ -101,7 +101,6 @@ from models.fprm import (
     STOP_NONFINITE,
     compute_residuals,
     exclusive_self_attention,
-    fused_attention,
     make_latent_init,
     rms_norm,
     mlp_activation,
@@ -184,9 +183,14 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
         q, k, v = _qkv(p['self_attn'], rms_norm(h, cfg.rms_norm_eps), cfg)  # [B, N, nh, hd]
         if rope:
             q, k = rope_2d(q, grid_shape, num_cells), rope_2d(k, grid_shape, num_cells)
-        # keys [current tokens, memory]: the written memory slots are a prefix, so the valid keys are the first N + #written
-        out = fused_attention(q, jnp.concatenate([k, mem_k[i]], axis=1), jnp.concatenate([v, mem_v[i]], axis=1),
-                              scale, N + jnp.sum(mem_valid))
+        # keys [current tokens, memory]: current tokens are always valid, memory slots according to mem_valid
+        all_k = jnp.concatenate([k, mem_k[i]], axis=1)
+        all_v = jnp.concatenate([v, mem_v[i]], axis=1)
+        key_valid = jnp.concatenate([jnp.ones((N,), bool), mem_valid])
+        logits = jnp.einsum('bqhd,bkhd->bhqk', q, all_k) * scale
+        logits = jnp.where(key_valid[None, None, None, :], logits, -jnp.inf)
+        probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(h.dtype)
+        out = jnp.einsum('bhqk,bkhd->bqhd', probs, all_v)
         if cfg.xsa:  # the projection uses each current token's own value, not the memory's
             out = exclusive_self_attention(out, v)
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
