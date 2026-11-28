@@ -49,6 +49,8 @@
 #                       on the readout token (readout, _aro) or A learned action tokens (action_tokens, _aact)
 #   STABLE_SOFTMAX=1    iso_mem / mem_halt: collapse-free log-softmax for the action policy (_ssm; default 0)
 #   POS_EMBED=1         iso_mem / mem_halt: learned embedding per cell index on the actor's cell tokens (_pe; default 0)
+#   ROPE=1              iso_mem / mem_halt: 2-D RoPE by cell (row, col) on the actor's attention queries / keys (_rope; default 0)
+#   XSA=1               exclusive self attention in every FPRM attention layer (_xsa; default 0)
 #   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   NUM_EPOCHS=n        PPO epochs per rollout (default 4; fewer = smaller policy change per rollout and proportionally faster)
@@ -197,6 +199,16 @@ case "${POS_EMBED:-0}" in
   0) ;;
   1) need_mem POS_EMBED=1; ARM_FLAGS+=(--cell_pos_embed); RUN+="_pe" ;;
   *) echo "POS_EMBED must be 0 or 1, got $POS_EMBED"; exit 1 ;;
+esac
+case "${ROPE:-0}" in
+  0) ;;
+  1) need_mem ROPE=1; ARM_FLAGS+=(--cell_rope); RUN+="_rope" ;;
+  *) echo "ROPE must be 0 or 1, got $ROPE"; exit 1 ;;
+esac
+case "${XSA:-0}" in
+  0) ;;
+  1) ARM_FLAGS+=(--xsa); RUN+="_xsa" ;;
+  *) echo "XSA must be 0 or 1, got $XSA"; exit 1 ;;
 esac
 case "${GRID_CONV:-1}" in
   1) ;;

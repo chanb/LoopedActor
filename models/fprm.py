@@ -60,6 +60,9 @@ class FPRMConfig:
     mlp_type: str = 'swiglu'
     mlp_round_to: int = 256
     softmax_temp: float = 1.0
+    # Exclusive self attention (XSA, Zhai 2026, arXiv:2603.09078): per head, remove from each token's attention output
+    # its component along the token's own value vector, before the output projection. No parameters.
+    xsa: bool = False
     rms_norm_eps: float = 1e-5
     # Mixed precision: dtype of the block computation ('float32' | 'float16' | 'bfloat16'). Parameters stay float32,
     # and so does the latent carried between core calls (FPRMCore casts its result back), so rounding error does not
@@ -108,6 +111,14 @@ def fused_attention(q, k, v, scale, kv_len):
     out = jax.nn.dot_product_attention(q, k, v, scale=scale, key_value_seq_lengths=kv_len,
                                        implementation='cudnn' if cudnn else 'xla')
     return out[:, :T]
+
+
+def exclusive_self_attention(out, v, eps=1e-6):
+    """XSA (arXiv:2603.09078): z_i = y_i - (y_i . v_i) v_i / ||v_i||^2 per head, out / v [B, T, nh, hd] (v: each query
+    token's own value). In float32, cast back to out.dtype; eps guards a zero v_i (as F.normalize does)."""
+    y, v = out.astype(jnp.float32), v.astype(jnp.float32)
+    vn = v * jax.lax.rsqrt(jnp.maximum(jnp.sum(v * v, axis=-1, keepdims=True), eps * eps))
+    return (y - jnp.sum(y * vn, axis=-1, keepdims=True) * vn).astype(out.dtype)
 
 
 def round_up_to_multiple(value, multiple):
@@ -174,6 +185,8 @@ class FPRMAttention(nn.Module):
             logits = jnp.where(token_mask[:, None, None, :] & attn_mask[:, None], logits, -jnp.inf)
             probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(cdt)
             out = jnp.einsum('bhqk,bkhd->bqhd', probs, value)
+        if cfg.xsa:
+            out = exclusive_self_attention(out, value)
         out = out.reshape(B, L, H)
 
         out = nn.Dense(

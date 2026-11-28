@@ -69,6 +69,8 @@
 #                       latent (_aact)
 #   CELL_GEOMETRY=0     iso_mem / mem_halt, TOKENIZER=cell: cell tokens without the 6 row/col/edge features (_nogeo; default 1)
 #   POS_EMBED=1         iso_mem / mem_halt, TOKENIZER=cell: learned embedding per cell index on the actor's cell tokens (_pe; default 0)
+#   ROPE=1              iso_mem / mem_halt: 2-D RoPE by cell (row, col) on the actor's attention queries / keys (_rope; default 0)
+#   XSA=1               exclusive self attention in every FPRM attention layer (_xsa; default 0)
 #   GRID_CONV=0         no depthwise grid convolution on the cell latents in the core (_nogconv; default 1)
 #   MLP_TYPE=swiglu|gelu  block MLP of every architecture (default swiglu)
 #   EXPANSION=x         MLP hidden width = x * d (* 2/3 for swiglu) before rounding to MLP_ROUND_TO (default 4)
@@ -242,6 +244,17 @@ case "${POS_EMBED:-0}" in
   1) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ && "$TOKENIZER" == cell ]] || { echo "POS_EMBED=1 needs arm iso_mem or mem_halt and TOKENIZER=cell"; exit 1; }
      ARM_FLAGS+=(--cell_pos_embed); RUN+="_pe" ;;
   *) echo "POS_EMBED must be 0 or 1, got $POS_EMBED"; exit 1 ;;
+esac
+case "${ROPE:-0}" in
+  0) ;;
+  1) [[ "$ARM" =~ ^(iso_mem|mem_halt)$ ]] || { echo "ROPE=1 needs arm iso_mem or mem_halt"; exit 1; }
+     ARM_FLAGS+=(--cell_rope); RUN+="_rope" ;;
+  *) echo "ROPE must be 0 or 1, got $ROPE"; exit 1 ;;
+esac
+case "${XSA:-0}" in
+  0) ;;
+  1) ARM_FLAGS+=(--xsa); RUN+="_xsa" ;;
+  *) echo "XSA must be 0 or 1, got $XSA"; exit 1 ;;
 esac
 case "${GRID_CONV:-1}" in
   1) ;;

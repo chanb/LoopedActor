@@ -100,6 +100,7 @@ from models.fprm import (
     STOP_ITERATION_CAP,
     STOP_NONFINITE,
     compute_residuals,
+    exclusive_self_attention,
     fused_attention,
     make_latent_init,
     rms_norm,
@@ -153,12 +154,28 @@ def _swiglu(params, x, cfg: FPRMConfig):
     return (jax.nn.silu(gate) * up) @ params['down_proj']['kernel'].astype(x.dtype)
 
 
-def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: FPRMConfig):
+def rope_2d(x, grid_shape, num_cells, base=100.0):
+    """2-D rotary position embedding on x [B, N, nh, hd]: token i < num_cells (cell (r, c) = divmod(i, C)) is rotated
+    by position (r + 1, c + 1), the first half of the rotated pairs by the row and the second half by the column; the
+    other tokens (SEP, action tokens, thought) sit at (0, 0), i.e. are not rotated."""
+    N, hd = x.shape[1], x.shape[-1]
+    assert hd % 4 == 0, hd
+    freqs = base ** (-jnp.arange(hd // 4) / (hd // 4))
+    r, c = jnp.divmod(jnp.arange(num_cells), grid_shape[1])
+    ang = jnp.concatenate([(r + 1)[:, None] * freqs, (c + 1)[:, None] * freqs], axis=-1)  # [P, hd / 2]
+    ang = jnp.pad(ang, ((0, N - num_cells), (0, 0)))[:, None]  # [N, 1, hd / 2]
+    cos, sin = jnp.cos(ang), jnp.sin(ang)
+    x1, x2 = jnp.split(x.astype(jnp.float32), 2, axis=-1)
+    return jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1).astype(x.dtype)
+
+
+def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: FPRMConfig, rope=False):
     """One FPRM core call over the current tokens [cells, SEP, thought] that also attend to the thought memory.
 
     z: [B, N, H] latents (cells, SEP: carried latent; thought: latent_init); x: [B, N, H] inputs (cell embeddings, SEP,
     thought input). mem_k / mem_v: [L, B, S, nh, hd]; mem_valid: [S] bool (written slots). The grid convolution acts
-    on the cells' latent only. Returns (h [B, N, H], per-layer [(k, v)] of the last (thought) token, each [B, nh, hd]).
+    on the cells' latent only; `rope`: 2-D RoPE (rope_2d) on the current tokens' q and k (the thought, at (0, 0), is not
+    rotated, so the memory keys are unchanged). Returns (h [B, N, H], per-layer [(k, v)] of the last (thought) token, each [B, nh, hd]).
     """
     B, N, H = x.shape
     if cfg.use_grid_conv:
@@ -177,9 +194,13 @@ def mem_core(params, z, x, mem_k, mem_v, mem_valid, grid_shape, num_cells, cfg: 
     for i in range(cfg.num_layers):
         p = params[f'block_{i}']
         q, k, v = _qkv(p['self_attn'], rms_norm(h, cfg.rms_norm_eps), cfg)  # [B, N, nh, hd]
+        if rope:
+            q, k = rope_2d(q, grid_shape, num_cells), rope_2d(k, grid_shape, num_cells)
         # keys [current tokens, memory]: the written memory slots are a prefix, so the valid keys are the first N + #written
         out = fused_attention(q, jnp.concatenate([k, mem_k[i]], axis=1), jnp.concatenate([v, mem_v[i]], axis=1),
                               scale, N + jnp.sum(mem_valid))
+        if cfg.xsa:  # the projection uses each current token's own value, not the memory's
+            out = exclusive_self_attention(out, v)
         out = out.reshape(B, N, H) @ p['self_attn']['o_proj']['kernel'].astype(h.dtype)
         h = a1 * h + b1 * out
         h = a1 * h + b1 * _swiglu(p['mlp'], rms_norm(h, cfg.rms_norm_eps), cfg)
@@ -294,6 +315,7 @@ class FPRMMemHaltActorValue(nn.Module):
     action_head: str = 'per_cell'  # 'per_cell' | 'readout' (see FPRMThinkerActorValue) | 'neighbour' | 'blank' (see the module docstring)
     cell_geometry: bool = True     # tokenizer='cell': append the 6 geometry features to each cell token (see the module docstring)
     cell_pos_embed: bool = False   # tokenizer='cell': add a learned embedding per cell index to the cell tokens (actor only)
+    cell_rope: bool = False        # 2-D RoPE on the cells' attention queries / keys by (row, col) (actor only; see rope_2d)
     remat: bool = True             # rematerialize each pass in the backward pass
     thought_norm: bool = False     # rms_norm each thought output before adding the modal embedding
     tokenizer: str = 'cell'        # see FPRMThinkerActorValue
@@ -433,7 +455,8 @@ class FPRMMemHaltActorValue(nn.Module):
             thought = jnp.where(i == 0, bot, fed_back + self.latent_embed)
             z_in = jnp.concatenate([z, z0_thought], axis=1)
             x_in = jnp.concatenate([cells, sep_in, act_in, thought[:, None]], axis=1)
-            h, thought_kv = mem_core(core_p, z_in, x_in, mem_k, mem_v, jnp.arange(S) < i, grid_shape, P, cfg)
+            h, thought_kv = mem_core(core_p, z_in, x_in, mem_k, mem_v, jnp.arange(S) < i, grid_shape, P, cfg,
+                                     rope=self.cell_rope)
             write = jnp.arange(S) == i
             mem_k = jnp.where(write[None, None, :, None, None], jnp.stack([k for k, _ in thought_kv])[:, :, None], mem_k)
             mem_v = jnp.where(write[None, None, :, None, None], jnp.stack([v for _, v in thought_kv])[:, :, None], mem_v)

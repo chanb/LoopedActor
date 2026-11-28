@@ -128,7 +128,10 @@ class Args:
     cell_geometry: bool = True            # --no-cell_geometry (fprm_mem, slidingpuzzle-* / lightsout-*): cell tokens
     cell_pos_embed: bool = False          # fprm_mem, tokenizer=cell: learned embedding per cell index added to the actor's cell tokens
                                           # without the 6 row/col/edge features, just the tile one-hot
+    cell_rope: bool = False               # fprm_mem: 2-D RoPE by cell (row, col) on the actor's attention queries / keys
     residual_scaling: bool = True         # --no-residual_scaling: plain pre-norm residuals in the FPRM core (no a1/b1 block scaling, no a2/b2 input mixing) — only sensible for non-looped baselines (no contractivity needed)
+    xsa: bool = False                     # exclusive self attention (arXiv:2603.09078) in every FPRM attention layer: drop each token's
+                                          # output component along its own value vector (per head, before o_proj)
     mlp_type: str = 'swiglu'              # block MLP: 'swiglu' (default) | 'gelu'
     mlp_round_to: int = 256               # MLP hidden width rounded up to a multiple of this (256 = default; at d=128: swiglu 512, 64 -> 384, 1 -> 341)
     compute_dtype: str = 'float32'        # block computation dtype: 'float32' | 'float16' | 'bfloat16' (params, carried latent, heads stay float32);
@@ -509,6 +512,7 @@ def main(args: Args):
         num_layers=args.fprm_num_layers,
         residual_scaling=args.residual_scaling,
         mlp_type=args.mlp_type,
+        xsa=args.xsa,
         mlp_round_to=args.mlp_round_to,
         compute_dtype=args.compute_dtype,
         use_grid_conv=args.use_grid_conv,
@@ -539,6 +543,7 @@ def main(args: Args):
             action_head=action_head,
             cell_geometry=args.cell_geometry,
             cell_pos_embed=args.cell_pos_embed,
+            cell_rope=args.cell_rope,
             tokenizer=args.tokenizer,
             tokenizer_conv_features=args.tokenizer_conv_features,
             thought_norm=args.cot_thought_norm,

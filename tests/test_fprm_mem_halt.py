@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fprm import FPRMConfig, rms_norm  # noqa: E402
 from models.fprm_mem_halt import (  # noqa: E402
-    FPRMMemHaltActorValue, c_log_probs, decision_log_probs, decision_mask, sample_c,
+    FPRMMemHaltActorValue, c_log_probs, decision_log_probs, decision_mask, rope_2d, sample_c,
 )
 
 CFG = FPRMConfig(d_model=16, num_heads=2)
@@ -467,3 +467,29 @@ def test_cell_pos_embed_breaks_cell_symmetry(pos_embed):
     params = jax.tree_util.tree_map(lambda a: a + 0.3 * jax.random.normal(jax.random.PRNGKey(1), a.shape), params)
     logits = _intermediates(net, params, x)['logits']
     assert jnp.allclose(logits[0], logits[1], atol=1e-5) != pos_embed  # equal up to float summation order
+
+
+@pytest.mark.parametrize('rope', [False, True])
+def test_cell_rope_breaks_cell_symmetry(rope):
+    # No grid conv, no geometry: without a position signal the actor sees the board as a set (same logits for two boards
+    # with the same tiles in other places); 2-D RoPE gives it the positions.
+    boards = jnp.array([[1, 2, 3, 4, 5, 6, 0, 7, 8], [6, 2, 0, 1, 8, 3, 5, 7, 4]])
+    x = jax.nn.one_hot(boards, 9).reshape(2, -1)
+    net = FPRMMemHaltActorValue(m=3, n=3, config=FPRMConfig(d_model=16, num_heads=2, use_grid_conv=False), max_think_iters=2,
+                                value_iters=2, output_dim_1=4, obs_channels=9, action_head='blank', cell_geometry=False,
+                                cell_rope=rope)
+    params = net.init(jax.random.PRNGKey(0), x)['params']
+    params = jax.tree_util.tree_map(lambda a: a + 0.3 * jax.random.normal(jax.random.PRNGKey(1), a.shape), params)
+    logits = _intermediates(net, params, x)['logits']
+    assert jnp.allclose(logits[0], logits[1], atol=1e-5) != rope  # equal up to float summation order
+
+
+def test_rope_2d_relative():
+    # q_i . k_j depends only on the (row, col) offset of cells i and j; the non-cell tokens (here the last) are not rotated.
+    q, k = jax.random.normal(jax.random.PRNGKey(0), (2, 1, 1, 1, 8))
+    rq, rk = (rope_2d(jnp.broadcast_to(v, (1, 13, 1, 8)), (3, 4), 12)[0, :, 0] for v in (q, k))
+    s = rq @ rk.T
+    assert jnp.allclose(s[0, 5], s[6, 11], atol=1e-5)   # (0,0)->(1,1) and (1,2)->(2,3)
+    assert not jnp.allclose(s[0, 5], s[0, 6], atol=1e-3)
+    assert jnp.allclose(rq[12], q[0, 0, 0])
+
